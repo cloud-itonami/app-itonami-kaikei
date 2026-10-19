@@ -87,3 +87,15 @@ dapp の「動く」は itonami agent の分散実行モデルの上に乗る:
    決めて `kaikei.app-test` を gate に戻す。
 4. MST/IPFS 永続と L2 anchor、USDC/ERC-4337/TitheRouter（MIGRATION-TODO の
    codemod と同時）。
+
+
+## 実行 host と ABI（訂正: 2026-10-19、JUN-125）
+
+guest は vector パラメータを使うため **KIR v4 / `kotoba.typed/externref-v1`**
+（typed-value ABI）で、「平坦 i64」はレイアウトの話であって ABI の話ではない。
+実行 host は契約どおり **kototama-browser-host-v1**（amu selfhost、
+`amu/runtime/browser-host.mjs` の typed ホスト）。aiueos の Chicory kernel
+ホストは typed ホストを持たず、kernel 経路では名前付き link 拒否
+（kotoba-lang/aiueos の itonami-dapp-bundle-test に pin 済み）。L2 の証拠
+（admission → selfhost 実行）は同 repo の itonami-dapp-selfhost-test。
+なお credits の guest はスカラーのみのため KIR v3 / `kotoba.i64/direct-v1`。
