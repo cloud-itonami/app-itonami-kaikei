@@ -3,8 +3,10 @@
 
   journal-entry（仕訳検証）と trial-balance（試算表照合）の判定だけを持つ。
   I/O・署名・複製・L2 anchor はこの guest の外（design 正本: docs/aiueos-dapp.md）。
-  すべて i64 平坦バッファで受ける——aiueos の境界規約（C/host が flat record を
-  積み、kotoba が判定する）に合わせた形。金額は最小通貨単位（JPY は 1 円）の整数。
+  入力は i64 ベクトルの平坦布局（[debit credit] × n 等）。vector 型を
+  使うため KIR v4 / kotoba.typed/externref-v1（typed-value ABI）であり、実行
+  host は kototama-browser-host-v1（amu selfhost の typed ホスト）。
+  金額は最小通貨単位（JPY は 1 円）の整数。
 
   バッファ布局:
   - 仕訳 1 件: [debit credit] × n 行
