@@ -1,0 +1,18 @@
+(ns run-tests
+  "kbb 実行のテスト runner（npm test から呼ばれる）。
+
+  なぜ shadow-cljs の :test ビルドではないか（実測 2026-10-19）:
+  package.json の旧 test スクリプトは `amu compile --target wasm32-browser test`
+  （shadow-cljs の build-id を渡す amu の旧モード）だったが、今日の amu CLI は
+  ファイル入力のみで build-id を受け付けず（\"source input must use .kotoba,
+  .cljk, or .cljc\"）、shadow-cljs 直叩きの :test ビルドは .cljk を 1 つも
+  解決できず「Ran 0 tests」になる。kbb は .cljk を読むので、pure な判断コアの
+  テストはここで回す。kaikei.app-test（re-frame 依存）はビルドチェーンの
+  再配線が未決（README「XRPC の実装」セクションと同じ未決事項）で、この
+  runner には含めない。"
+  (:require [cljs.test :refer [run-tests]]
+            [kaikei.journal-test]))
+
+(let [{:keys [fail error]} (run-tests 'kaikei.journal-test)]
+  (when (pos? (+ fail error))
+    (set! (.-exitCode js/process) 1)))
