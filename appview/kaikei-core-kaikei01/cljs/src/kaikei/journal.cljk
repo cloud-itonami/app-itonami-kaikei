@@ -1,0 +1,77 @@
+(ns kaikei.journal
+  "会計判断コア — journal-entry（仕訳検証）/ trial-balance（試算表照合）の判定。
+
+  セマンティクスの正本は aiueos/kaikei_journal.cljk（aiueos guest。`amu test` が
+  jvm-kir / js / wasm の 3 ターゲットで同じ fixture を実行する）。この namespace は
+  appview（re-frame SPA）用の map API アダプタで、fixture の数値は guest の
+  test-* と一致させている（parity fixture）。判定は pure、副作用なし。
+
+  validate-entry のエラービット（0 = 正常。条件は重複しうる）:
+    1 :empty       行が無い
+    2 :odd-buffer  行数が壊れている（guest ではバッファ長が 2 の倍数でない）
+    4 :negative    金額が負
+    8 :zero-line   借方・貸方がともに 0 の行
+   16 :both-sides  1 行で借方・貸方がともに正
+   32 :unbalanced  借方合計 ≠ 貸方合計
+
+  金額は最小通貨単位（JPY は 1 円）の整数。")
+
+(def error-bits
+  {:empty 1
+   :odd-buffer 2
+   :negative 4
+   :zero-line 8
+   :both-sides 16
+   :unbalanced 32})
+
+(defn- line-bits
+  "1 行ぶんのエラービット。"
+  [{:keys [debit credit]}]
+  (cond
+    (or (neg? debit) (neg? credit)) (:negative error-bits)
+    (and (zero? debit) (zero? credit)) (:zero-line error-bits)
+    (and (pos? debit) (pos? credit)) (:both-sides error-bits)
+    :else 0))
+
+(defn validate-entry
+  "仕訳（行のシーケンス、各行 {:debit d :credit c}）を検証しエラービットを返す。"
+  [lines]
+  (if (empty? lines)
+    (:empty error-bits)
+    (let [bits (reduce + 0 (map line-bits lines))
+          total-d (reduce + 0 (map :debit lines))
+          total-c (reduce + 0 (map :credit lines))]
+      (if (= total-d total-c)
+        bits
+        (+ bits (:unbalanced error-bits))))))
+
+(defn entry-balanced?
+  "仕訳が完全に正当なら 1、そうでなければ 0（guest と同じ戻り）。"
+  [lines]
+  (if (zero? (validate-entry lines)) 1 0))
+
+(defn trial-balance
+  "行のシーケンスから試算表を作る。戻りは
+  {:accounts {account-id {:debit d :credit c}} :debit-total :credit-total :balanced?}。"
+  [lines]
+  (let [accounts
+        (reduce (fn [acc {:keys [account debit credit]}]
+                  (update acc account
+                          (fn [m]
+                            (-> (or m {:debit 0 :credit 0})
+                                (update :debit + debit)
+                                (update :credit + credit)))))
+                {}
+                lines)
+        total-d (reduce + 0 (map :debit lines))
+        total-c (reduce + 0 (map :credit lines))]
+    {:accounts accounts
+     :debit-total total-d
+     :credit-total total-c
+     :balanced? (= total-d total-c)}))
+
+(defn account-net
+  "1 口座の純額（借方 − 貸方）。guest の account-net と同じ意味。"
+  [tb account]
+  (let [{:keys [debit credit]} (get-in tb [:accounts account] {:debit 0 :credit 0})]
+    (- debit credit)))

@@ -1,0 +1,21 @@
+;; kaikei 会計 dapp — aiueos アプリ記述子（形は examples/apps/notes.edn に準拠）。
+;; 実装の正本: kaikei_journal.cljk / docs/aiueos-dapp.md。
+;;
+;; 判断コア guest（:effects #{}）を指す。imports は今のところ無し——
+;; journal-entry / trial-balance は計算だけで、I/O はこの外の層が持つ。
+;; aiueos session/grant への配線は未実装（docs/aiueos-dapp.md の未実装境界を参照）。
+{:aiueos/component :app/kaikei
+ :aiueos/kind :app
+ :aiueos/trust :untrusted
+ :aiueos/source "kaikei_journal.cljk"
+ :aiueos/wasm "kaikei_journal.wasm"
+ :aiueos/entry "main"
+ :aiueos/args []
+ :aiueos/imports #{}
+ :aiueos/exports #{:app/main
+                   :app/validate-entry
+                   :app/entry-balanced?
+                   :app/ledger-balanced?
+                   :app/account-net}
+ :aiueos/effects #{}
+ :aiueos/limits {:memory-pages 16 :fuel 5000000}}

@@ -1,0 +1,125 @@
+(ns kaikei.journal
+  "kaikei 会計判断コア — aiueos guest（pure judgment, :effects #{}）。
+
+  journal-entry（仕訳検証）と trial-balance（試算表照合）の判定だけを持つ。
+  I/O・署名・複製・L2 anchor はこの guest の外（design 正本: docs/aiueos-dapp.md）。
+  すべて i64 平坦バッファで受ける——aiueos の境界規約（C/host が flat record を
+  積み、kotoba が判定する）に合わせた形。金額は最小通貨単位（JPY は 1 円）の整数。
+
+  バッファ布局:
+  - 仕訳 1 件: [debit credit] × n 行
+  - 帳簿:      [account debit credit] × n 行
+
+  validate-entry のエラービット（0 = 正常。条件は重複しうる）:
+    1 :empty       行が無い
+    2 :odd-buffer  長さが 2 の倍数でない（壊れた入力）
+    4 :negative    金額が負
+    8 :zero-line   借方・貸方がともに 0 の行
+   16 :both-sides  1 行で借方・貸方がともに正
+   32 :unbalanced  借方合計 ≠ 貸方合計
+
+  テストは export されたゼロ引数 `test-*`（戻り 1/0。実測で true 返しは
+  通らない — and/or/= は整数を返す）。実行:
+  <superproject>/orgs/kotoba-lang/amu/bin/amu test aiueos/kaikei_journal.cljk"
+  (:export [main validate-entry entry-balanced? ledger-balanced? account-net
+            test-valid-entry test-empty test-odd-buffer test-negative
+            test-zero-line test-both-sides test-unbalanced
+            test-entry-balanced test-ledger-balanced test-account-net]))
+
+(defn main [] :i64
+  0)
+
+;; --- 仕訳 1 件の検証: [debit credit] × n ---------------------------------
+
+(defn validate-entry [buf :vector-i64] :i64
+  (let [n (vector-count buf)]
+    (if (= n 0)
+      1
+      (if (= n (* 2 (quot n 2)))
+        (validate-entry-lines buf n 0 0 0 0)
+        2))))
+
+(defn- validate-entry-lines [buf :vector-i64 n :i64 i :i64 bad :i64 total-d :i64 total-c :i64] :i64
+  (if (< i n)
+    (let [d (vector-at buf i)
+          c (vector-at buf (+ i 1))]
+      (validate-entry-lines buf n (+ i 2)
+                            (if (or (< d 0) (< c 0))
+                              (+ bad 4)
+                              (if (and (= d 0) (= c 0))
+                                (+ bad 8)
+                                (if (and (> d 0) (> c 0))
+                                  (+ bad 16)
+                                  bad)))
+                            (+ total-d d)
+                            (+ total-c c)))
+    (if (= total-d total-c)
+      bad
+      (+ bad 32))))
+
+(defn entry-balanced? [buf :vector-i64] :i64
+  (if (= (validate-entry buf) 0) 1 0))
+
+;; --- 帳簿: [account debit credit] × n ------------------------------------
+
+(defn ledger-balanced? [buf :vector-i64] :i64
+  (let [n (vector-count buf)]
+    (if (= n (* 3 (quot n 3)))
+      (ledger-totals buf n 0 0 0)
+      0)))
+
+(defn- ledger-totals [buf :vector-i64 n :i64 i :i64 total-d :i64 total-c :i64] :i64
+  (if (< i n)
+    (ledger-totals buf n (+ i 3)
+                   (+ total-d (vector-at buf (+ i 1)))
+                   (+ total-c (vector-at buf (+ i 2))))
+    (if (= total-d total-c) 1 0)))
+
+(defn account-net [buf :vector-i64 account :i64] :i64
+  (account-net-at buf (vector-count buf) account 0 0))
+
+(defn- account-net-at [buf :vector-i64 n :i64 account :i64 i :i64 net :i64] :i64
+  (if (< i n)
+    (account-net-at buf n account (+ i 3)
+                    (if (= (vector-at buf i) account)
+                      (+ net (- (vector-at buf (+ i 1)) (vector-at buf (+ i 2))))
+                      net))
+    net))
+
+;; --- tests（戻り 1 = pass） ----------------------------------------------
+
+(defn test-valid-entry [] :i64
+  (if (= (validate-entry [100 0 0 100]) 0) 1 0))
+
+(defn test-empty [] :i64
+  (if (= (validate-entry []) 1) 1 0))
+
+(defn test-odd-buffer [] :i64
+  (if (= (validate-entry [100 0 50]) 2) 1 0))
+
+(defn test-negative [] :i64
+  (if (= (validate-entry [100 0 -100 0]) 4) 1 0))
+
+(defn test-zero-line [] :i64
+  (if (= (validate-entry [100 0 0 100 0 0]) 8) 1 0))
+
+(defn test-both-sides [] :i64
+  (if (= (validate-entry [100 0 50 100 0 50]) 16) 1 0))
+
+(defn test-unbalanced [] :i64
+  (if (= (validate-entry [100 0 0 90]) 32) 1 0))
+
+(defn test-entry-balanced [] :i64
+  (if (= (+ (entry-balanced? [300 0 0 200 0 100])
+            (entry-balanced? [100 0 0 90]))
+         1)
+    1 0))
+
+(defn test-ledger-balanced [] :i64
+  (if (= (+ (ledger-balanced? [1 300 0 2 0 300])
+            (ledger-balanced? [1 300 0 2 0 200]))
+         1)
+    1 0))
+
+(defn test-account-net [] :i64
+  (if (= (account-net [1 300 0 2 0 300 1 0 50] 1) 250) 1 0))

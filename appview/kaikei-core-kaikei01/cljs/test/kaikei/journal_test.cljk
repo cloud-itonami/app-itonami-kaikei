@@ -1,0 +1,50 @@
+(ns kaikei.journal-test
+  "kaikei.journal の parity fixture。数値は aiueos/kaikei_journal.cljk の
+  test-* と一致させている（guest 側が 3 ターゲットで同じ期待を通す）。"
+  (:require [cljs.test :refer [deftest is testing]]
+            [kaikei.journal :as j]))
+
+(deftest validate-entry-bits
+  (testing "正常な仕訳は 0"
+    (is (= 0 (j/validate-entry [{:debit 100 :credit 0} {:debit 0 :credit 100}]))))
+  (testing "空の仕訳は :empty"
+    (is (= 1 (j/validate-entry []))))
+  (testing "負の金額は :negative"
+    (is (= 4 (j/validate-entry [{:debit 100 :credit 0} {:debit -100 :credit 0}]))))
+  (testing "ゼロ行は :zero-line"
+    (is (= 8 (j/validate-entry [{:debit 100 :credit 0}
+                                {:debit 0 :credit 100}
+                                {:debit 0 :credit 0}]))))
+  (testing "1 行で借方・貸方両方は :both-sides"
+    (is (= 16 (j/validate-entry [{:debit 100 :credit 0}
+                                 {:debit 50 :credit 100}
+                                 {:debit 0 :credit 50}]))))
+  (testing "不一致は :unbalanced"
+    (is (= 32 (j/validate-entry [{:debit 100 :credit 0} {:debit 0 :credit 90}])))))
+
+(deftest entry-balanced-parity
+  (testing "guest の test-entry-balanced と同じ 1"
+    (is (= 1 (+ (j/entry-balanced? [{:debit 300 :credit 0}
+                                    {:debit 0 :credit 200}
+                                    {:debit 0 :credit 100}])
+                (j/entry-balanced? [{:debit 100 :credit 0}
+                                    {:debit 0 :credit 90}]))))))
+
+(deftest trial-balance-parity
+  (testing "guest の test-ledger-balanced と同じ集計"
+    (let [tb (j/trial-balance [{:account 1 :debit 300 :credit 0}
+                               {:account 2 :debit 0 :credit 300}])]
+      (is (true? (:balanced? tb)))
+      (is (= 300 (:debit-total tb)))
+      (is (= 300 (:credit-total tb)))))
+  (testing "不一致の帳簿は :balanced? false"
+    (is (false? (:balanced? (j/trial-balance [{:account 1 :debit 300 :credit 0}
+                                              {:account 2 :debit 0 :credit 200}]))))))
+
+(deftest account-net-parity
+  (testing "guest の test-account-net と同じ 250"
+    (let [tb (j/trial-balance [{:account 1 :debit 300 :credit 0}
+                               {:account 2 :debit 0 :credit 300}
+                               {:account 1 :debit 0 :credit 50}])]
+      (is (= 250 (j/account-net tb 1)))
+      (is (= -300 (j/account-net tb 2))))))

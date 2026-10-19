@@ -112,3 +112,11 @@ Compliance Rider v3.1 を宣言するが、**`CHARTER-RIDER.md` も `LICENSE` �
 - `docs/operator-quickstart.md` — clone から検証済みのローカル実行まで
 - `MIGRATION-TODO.md` — Charter §2(a)-(h) 適合の未処理リスト
 - `migration.edn` — 切り出し元の revision / tree / ファイル数
+
+## aiueos 上の分散型 dapp 設計（2026-10-19〜）
+
+kaikei を aiueos アプリ（分散型 dapp、itonami agent 前提）として実現する設計と
+第 1 スライス（判断コア guest）が `docs/aiueos-dapp.md` にある。実装は
+`aiueos/`（guest + 記述子）と `appview/.../cljs/src/kaikei/journal.cljk`
+（parity adapter）。`npm test` は kbb runner に差し替え（shadow 経路は
+`test:shadow`。理由と実測は `docs/aiueos-dapp.md` の「実測した『動かない』」）。
