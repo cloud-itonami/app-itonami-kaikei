@@ -139,3 +139,147 @@
 (deftest xero-journals-keep-source-id
   (let [parsed (import-text (fixture "xero-journals.json"))]
     (is (some #(get-in % [:origin :source-id]) (:entries parsed)))))
+
+;; ───────── 2 つ目の PR: CSV・freee・MF・Zoho・FreshBooks ─────────
+
+(defn- import-format [file fmt & {:as opts}]
+  (ingest/ingest-text (fixture file) (merge {:format fmt} opts)))
+
+(deftest auto-detection
+  (doseq [[file fmt] [["xero-invoices.csv" "xero-invoice-csv"] ["qbo-invoices.csv" "qbo-invoice-csv"]
+                      ["freee-invoices.csv" "freee-invoice-csv"] ["mf-invoices.csv" "mf-invoice-csv"]
+                      ["freee-invoices.json" "freee-invoice-json"] ["mf-invoices.json" "mf-invoice-json"]
+                      ["zoho-invoices.json" "zoho-invoice-json"] ["freshbooks-invoices.json" "freshbooks-invoice-json"]
+                      ["freshbooks-bills.json" "freshbooks-invoice-json"]]]
+    (testing file (is (= (keyword fmt) (:format (import-text (fixture file))))))))
+
+(deftest xero-csv
+  (let [{:keys [invoices invoices-skipped warnings]} (import-format "xero-invoices.csv" "xero-invoice-csv")
+        i1 (by-number invoices "INV-0201")
+        i2 (by-number invoices "INV-0202")]
+    (testing "同じ InvoiceNumber の行が 1 つの請求書。税率は TaxType の表示名の % から"
+      (is (= [:sales "INV-0201" "2026-11-30" :draft "株式会社みなと" :exclusive [["10%" 50000 5000] ["8%（軽減）" 4000 320]] 59320]
+             (summary i1)))
+      (is (= "400" (get-in i1 [:lines 0 :account-code]))))
+    (testing "Discount（%）は単価 × 数量 に掛ける"
+      (is (= [27000 2700 29700] [(get-in i2 [:lines 0 :amount]) (:tax (inv/totals i2)) (:total (inv/totals i2))])))
+    (testing "違う通貨の請求書は飛ばす"
+      (is (= 1 invoices-skipped))
+      (is (some #(re-find #"USD" %) warnings))))
+  (testing "受け取った請求書（見出しは空白入りの表示名でもよい）"
+    (let [{[bill] :invoices} (import-format "xero-bills.csv" "xero-bill-csv")]
+      (is (= [:purchase "A-201" "2026-11-20" :draft "やまだ文具" :exclusive [["10%" 12100 1210]] 13310] (summary bill)))))
+  (testing "往復（売上・受け取った請求書）"
+    (doseq [[fmt kind] [["xero-invoice-csv" :sales] ["xero-bill-csv" :purchase]]]
+      (let [{:keys [text error]} (export/export sample-db fmt)
+            back (:invoices (ingest/ingest-text text {:format fmt}))
+            ;; Xero の CSV は税込・税抜を持たないので税抜で書く（合計は同じ）。状態は下書きで読む
+            comparable (fn [i] (let [t (inv/totals i)] [(:kind i) (:number i) (:date i) (get-in i [:partner :name]) (:net t) (:tax t) (:total t)]))]
+        (is (nil? error))
+        (is (= (map comparable (filter #(= kind (:kind %)) (:invoices sample-db))) (map comparable back)))
+        (is (every? #(= :draft (:status %)) back))))))
+
+(deftest qbo-csv
+  (let [{:keys [invoices]} (import-format "qbo-invoices.csv" "qbo-invoice-csv")]
+    (is (= [[:sales "1001" "2026-11-16" :draft "株式会社みなと" :exclusive [["10%" 50000 5000] ["8%（軽減）" 4000 320]] 59320]
+            [:sales "1002" "2026-11-20" :draft "合同会社かもめ" :exclusive [["10%" 30000 3000]] 33000]]
+           (mapv summary invoices))))
+  (testing "往復（税込の請求書は税抜で書く）"
+    (let [{:keys [text notes]} (export/export sample-db "qbo-invoice-csv")
+          back (:invoices (ingest/ingest-text text {:format "qbo-invoice-csv"}))
+          totals (fn [i] (select-keys (inv/totals i) [:net :tax :total]))]
+      (is (= (map totals (filter #(= :sales (:kind %)) (:invoices sample-db))) (map totals back)))
+      (is (some #(re-find #"受け取った請求書 1 件" %) notes)))))
+
+(deftest freee-csv
+  (let [{:keys [invoices]} (import-format "freee-invoices.csv" "freee-invoice-csv")
+        [i1 i2] invoices]
+    (testing "本文と明細の行。テキストの行は読まない。0% は税区分で区分する"
+      (is (= [:sales "INV-0301" "2026-11-30" :draft "株式会社みなと" :exclusive
+              [["10%" 50000 5000] ["8%（軽減）" 4000 320] ["不課税" 200 0]] 59520]
+             (summary i1)))
+      (is (= ["売上高" "売上高" "立替金"] (mapv :account (:lines i1)))))
+    (testing "内税・四捨五入（1,000 × 8/108 = 74.07 → 74）"
+      (is (= [:inclusive :half-up [3000 74] 34000]
+             [(:tax-mode i2) (:rounding i2) (mapv :used-tax (:groups (inv/totals i2))) (:total (inv/totals i2))]))))
+  (testing "往復"
+    (let [{:keys [text error]} (export/export sample-db "freee-invoice-csv" {:encoding "utf-8"})
+          back (:invoices (ingest/ingest-text text {:format "freee-invoice-csv"}))]
+      (is (nil? error))
+      (is (= (map (comp #(assoc % 3 :draft) summary) (filter #(= :sales (:kind %)) (:invoices sample-db)))
+             (map summary back))))))
+
+(deftest freee-json
+  (let [{:keys [invoices business invoices-skipped]} (import-text (fixture "freee-invoices.json"))
+        [f1 f2] invoices]
+    (is (= [:sales "F-0001" "2026-11-30" :issued "株式会社みなと" :exclusive [["10%" 50000 5000] ["8%（軽減）" 4000 320]] 59320]
+           (summary f1)))
+    (is (= 2 (count (:lines f1))) "type が text の行は読まない")
+    (is (= [:void :inclusive :half-up] [(:status f2) (:tax-mode f2) (:rounding f2)]))
+    (is (= {:registration "T1234567890123"} business))
+    (is (= 0 invoices-skipped))
+    (testing "往復（下書きの印は無いので発行済みに戻る）"
+      (let [{:keys [db notes]} (round-trip sample-db "freee-invoice-json")
+            draft->issued (fn [i] (cond-> i (= :draft (:status i)) (assoc :status :issued)))]
+        (is (= (map (comp summary draft->issued) (filter #(= :sales (:kind %)) (:invoices sample-db))) (map summary (:invoices db))))
+        (is (some #(re-find #"下書き" %) notes))))))
+
+(deftest mf-csv
+  (let [{:keys [invoices]} (import-format "mf-invoices.csv" "mf-invoice-csv")
+        [m1 m2] invoices]
+    (is (= [:sales "MF-0001" "2026-11-30" :issued "株式会社みなと" :exclusive [["10%" 50000 5000] ["8%（軽減）" 4000 320]] 59320]
+           (summary m1)))
+    (is (= [:paid [["10%" 30000 3000] ["不課税" 200 0]]] [(:status m2) (mapv (juxt :label :base :used-tax) (:groups (inv/totals m2)))])))
+  (testing "Shift_JIS で書き出して読み戻す"
+    (let [{:keys [bytes encoding error]} (export/export sample-db "mf-invoice-csv")
+          back (:invoices (ingest/ingest-bytes bytes {:format "auto"}))
+          totals (fn [i] (select-keys (inv/totals i) [:net :tax :total]))]
+      (is (nil? error))
+      (is (= "shift_jis" encoding))
+      (is (= (map totals (filter #(= :sales (:kind %)) (:invoices sample-db))) (map totals back))))))
+
+(deftest mf-json
+  (let [{:keys [invoices business]} (import-text (fixture "mf-invoices.json"))
+        [b1 b2] invoices]
+    (is (= [:sales "MF-0101" "2026-11-30" :issued "株式会社みなと" :exclusive [["10%" 50000 5000] ["8%（軽減）" 4000 320]] 59320]
+           (summary b1)))
+    (testing "price × quantity を明細行の端数処理（切り捨て）で丸め、消費税は切り上げ（102.65 × 2 → 205、20.5 → 21）"
+      (is (= [205 :ceil 21 :paid] [(get-in b2 [:lines 0 :amount]) (:rounding b2) (:tax (inv/totals b2)) (:status b2)]))
+      (is (not-any? #(= :tax-mismatch (:code %)) (inv/problems sample-db b2))))
+    (is (= {:registration "T1234567890123"} business))
+    (testing "往復（下書きの印は無いので発行済みに戻る）"
+      (let [{:keys [db notes]} (round-trip sample-db "mf-invoice-json")
+            draft->issued (fn [i] (cond-> i (= :draft (:status i)) (assoc :status :issued)))]
+        (is (= (map (comp summary draft->issued) (filter #(= :sales (:kind %)) (:invoices sample-db))) (map summary (:invoices db))))
+        (is (some #(re-find #"下書き" %) notes))))))
+
+(deftest zoho-json
+  (let [{:keys [invoices invoices-skipped warnings]} (import-text (fixture "zoho-invoices.json"))
+        z1 (by-number invoices "INV-00003")]
+    (is (= [:sales "INV-00003" "2026-11-17" :issued "Bowman & Co" :exclusive [["10%" 24000 2400] ["8%" 4500 360]] 31260]
+           (summary z1)))
+    (is (= :void (:status (by-number invoices "INV-00005"))))
+    (testing "請求書全体の値引き・明細の無い一覧は飛ばす"
+      (is (= 2 invoices-skipped))
+      (is (some #(re-find #"値引き" %) warnings))))
+  (testing "読むだけ（書き出しの形式に無い）"
+    (is (not-any? #{"zoho-invoice-json" "freshbooks-invoice-json"} ingest/export-format-ids))))
+
+(deftest freshbooks-json
+  (let [{:keys [invoices invoices-skipped]} (import-text (fixture "freshbooks-invoices.json"))]
+    (is (= [[:sales "0000077" "2026-11-10" :issued "Test Client" :exclusive [["10%" 24000 2400]] 26400]] (mapv summary invoices)))
+    (is (= 1 invoices-skipped) "1 行に税が 2 つの請求書"))
+  (let [{[bill] :invoices} (import-text (fixture "freshbooks-bills.json"))]
+    (is (= [:purchase "BN101" "2026-11-12" :issued "vendor 55" :exclusive [["10%" 15000 1500]] 16500] (summary bill)))
+    (is (= "仕入高" (get-in bill [:lines 0 :account])))))
+
+(deftest chain-across-formats
+  (testing "kaikei → Xero JSON → QBO JSON → freee JSON → MF JSON → MF CSV → kaikei で、番号・日付・取引先・税率ごとの対価と税額・合計が保たれる"
+    (let [sales (fn [db] (update db :invoices (fn [is] (filterv #(= :sales (:kind %)) is))))
+          start (sales sample-db)
+          step (fn [db fmt] (:db (round-trip db fmt)))
+          end (reduce step start ["xero-invoices-json" "qbo-invoices-json" "freee-invoice-json" "mf-invoice-json" "mf-invoice-csv"])
+          keep (fn [i] (let [t (inv/totals i)]
+                         [(:number i) (:date i) (get-in i [:partner :name])
+                          (mapv (juxt :label :net :used-tax) (:groups t)) (:total t)]))]
+      (is (= (map keep (:invoices start)) (map keep (:invoices end)))))))

@@ -1,0 +1,80 @@
+{
+  "response": {
+    "result": {
+      "bill": {
+        "amount": {
+          "amount": "15000",
+          "code": "JPY"
+        },
+        "bill_number": "BN101",
+        "created_at": "2026-11-12 15:06:32",
+        "currency_code": "JPY",
+        "due_date": "2026-12-12",
+        "due_offset_days": 30,
+        "id": 1141,
+        "issue_date": "2026-11-12",
+        "language": "ja",
+        "vendorid": 55,
+        "lines": [
+          {
+            "amount": {
+              "amount": "15000",
+              "code": "JPY"
+            },
+            "category": {
+              "category": "仕入高",
+              "categoryid": 3696445,
+              "is_cogs": true,
+              "parentid": 3696439,
+              "vis_state": 0
+            },
+            "description": "原材料",
+            "id": 2621,
+            "list_index": 1,
+            "quantity": "15",
+            "tax_amount1": {
+              "amount": "1500",
+              "code": "JPY"
+            },
+            "tax_amount2": null,
+            "tax_authorityid1": null,
+            "tax_authorityid2": null,
+            "tax_name1": "消費税",
+            "tax_name2": null,
+            "tax_percent1": 10,
+            "tax_percent2": null,
+            "total_amount": {
+              "amount": "16500",
+              "code": "JPY"
+            },
+            "unit_cost": {
+              "amount": "1000.00",
+              "code": "JPY"
+            }
+          }
+        ],
+        "outstanding": {
+          "amount": "16500",
+          "code": "JPY"
+        },
+        "overall_category": "仕入高",
+        "overall_description": "原材料",
+        "paid": {
+          "amount": "0",
+          "code": "JPY"
+        },
+        "status": "unpaid",
+        "tax_amount": {
+          "amount": "1500",
+          "code": "JPY"
+        },
+        "total_amount": {
+          "amount": "16500",
+          "code": "JPY"
+        },
+        "updated_at": "2026-11-12 15:06:53",
+        "vis_state": 0
+      }
+    }
+  }
+}

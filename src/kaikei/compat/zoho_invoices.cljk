@@ -1,0 +1,105 @@
+(ns kaikei.compat.zoho-invoices
+  "Zoho Invoice API v3 の invoice の JSON（読むだけ。オーナーの判断 2026-10-22）。
+  形の正本は Zoho の OpenAPI の zip の invoices.yml（sha256 53e03d28…、2026-10-09）と
+  API の文書（invoices・response）。Zoho Books の invoice も同じ形。
+
+  - 応答は {\"code\": 0, \"message\": \"success\", \"invoices\": […]}（一覧）か
+    {\"invoice\": {…}}（1 件）。一覧の応答は line_items を持たないことがあるので、
+    明細の無いものは飛ばす。
+  - line_items[]: name・description・quantity・rate・item_total（行の金額）・
+    tax_percentage（行の税率）。行の税額は無く、税額は請求書の taxes[]（tax_name・
+    tax_amount）と tax_total にある。is_inclusive_tax が真なら税込。
+  - 日付は yyyy-mm-dd。status は draft・sent・viewed・overdue・unpaid・partially_paid・
+    paid・void。
+  - 請求書全体の値引き（discount）・送料（shipping_charge）は 1 行 1 税率に入らない
+    ので、その請求書は飛ばす。adjustment（端数の調整）は不課税の行にする。
+  - 端数処理の欄は無い。taxes[] の額を再現する向きを選ぶ。
+  - 文書の見本は数が合わないものがある（total・balance は文字列と宣言され、見本では
+    数）。数でも文字列でも読む。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.invoice :as invoice]
+            [kaikei.compat.common :as common]))
+
+(defn detect? [data]
+  (and (map? data)
+       (or (and (map? (get data "invoice")) (contains? (get data "invoice") "line_items"))
+           (and (contains? data "code") (sequential? (get data "invoices"))))))
+
+(defn- amount [v exp] (when (some? v) (core/parse-amount v exp)))
+
+(defn- nonzero? [v exp] (let [a (:amount (amount v exp))] (and a (not (zero? a)))))
+
+(defn- read-invoice [{:keys [currency exp]} i inv]
+  (let [where (str "invoice " (or (get inv "invoice_number") (inc i)))
+        items (get inv "line_items")
+        code (get inv "currency_code")]
+    (cond
+      (not (sequential? items)) {:skip "明細の無い請求書（一覧の応答）"}
+      (and code (not= code currency)) {:skip (str "帳簿と違う通貨（" code "）の請求書")}
+      (nonzero? (get inv "discount") 4) {:skip "請求書全体の値引きのある請求書"}
+      (nonzero? (get inv "shipping_charge") exp) {:skip "送料のある請求書"}
+      :else
+      (let [parts (vec (for [l (filter map? items)
+                             :let [{a :amount err :error} (amount (get l "item_total") exp)
+                                   pct (get l "tax_percentage")
+                                   rate (common/percent->rate pct)]]
+                         (if (or err (nil? a))
+                           {:problem (str where ": item_total \"" (get l "item_total") "\" を読めません")}
+                           {:line (cond-> {:description (str (or (common/blank->nil (get l "description")) (get l "name") ""))
+                                           :amount a
+                                           :category (if (and rate (zero? rate) (nil? (get l "tax_id"))) :out-of-scope :taxable)}
+                                    rate (assoc :rate rate)
+                                    (some? (get l "quantity")) (assoc :quantity (str (get l "quantity")))
+                                    (some? (get l "rate")) (assoc :unit-price (str (get l "rate"))))
+                            :tax-name (get l "tax_name")
+                            :rate-unknown? (nil? rate)})))
+            adjustment (:amount (amount (get inv "adjustment") exp))
+            parts (cond-> parts
+                    (and adjustment (not (zero? adjustment)))
+                    (conj {:line {:description "Adjustment" :amount adjustment :category :out-of-scope :rate 0}}))
+            p (common/first-problem parts)
+            date (core/parse-date (get inv "date"))
+            rate-of-name (into {} (keep (fn [{:keys [line tax-name]}] (when tax-name [tax-name (:rate line)])) parts))
+            stated (vec (for [[rate ts] (group-by first (for [t (get inv "taxes") :when (map? t)
+                                                              :let [r (rate-of-name (get t "tax_name"))
+                                                                    a (:amount (amount (get t "tax_amount") exp))]
+                                                              :when (and r a)]
+                                                          [r a]))]
+                          {:rate rate :tax (reduce + 0 (map second ts))}))
+            status (get inv "status")]
+        (cond
+          p {:problem (:problem p)}
+          (nil? date) {:problem (str where ": date \"" (get inv "date") "\" を読めません")}
+          :else
+          {:invoice (invoice/infer-rounding
+                     (cond-> {:kind :sales
+                              :number (str (get inv "invoice_number" ""))
+                              :date date
+                              :status (case status "draft" :draft "void" :void "paid" :paid :issued)
+                              :partner {:name (str (get inv "customer_name" ""))}
+                              :tax-mode (if (true? (get inv "is_inclusive_tax")) :inclusive :exclusive)
+                              :lines (mapv :line parts)
+                              :origin (cond-> {:format :zoho-invoice-json}
+                                        (get inv "invoice_id") (assoc :id (str (get inv "invoice_id"))))}
+                       (core/parse-date (get inv "due_date")) (assoc :due-date (core/parse-date (get inv "due_date")))
+                       (common/blank->nil (get inv "reference_number")) (assoc :subject (text/trim (str (get inv "reference_number"))))
+                       (seq stated) (assoc :stated (cond-> {:tax-by-rate stated}
+                                                     (:amount (amount (get inv "tax_total") exp)) (assoc :tax (:amount (amount (get inv "tax_total") exp)))
+                                                     (:amount (amount (get inv "total") exp)) (assoc :total (:amount (amount (get inv "total") exp)))))
+                       (:amount (amount (get inv "balance") exp)) (assoc :amount-due (:amount (amount (get inv "balance") exp))))
+                     :half-up)
+           :rate-unknown? (some :rate-unknown? parts)})))))
+
+(defn read-data
+  "構文解析済みの JSON → 請求書の取り込み結果。通貨は currency_code（いちばん多い
+  もの）、無ければ opts の :currency（既定 JPY）。"
+  [data {:keys [currency] :or {currency "JPY"}}]
+  (let [invs (if (map? (get data "invoice")) [(get data "invoice")] (filter map? (get data "invoices")))
+        currency (common/currency-of (map #(get % "currency_code") invs) currency)
+        exp (core/exponent currency)]
+    (if-not exp
+      {:format :zoho-invoice-json :invoices [] :rejected 0 :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      (let [candidates (map-indexed (partial read-invoice {:currency currency :exp exp}) invs)]
+        (-> (merge {:format :zoho-invoice-json :currency currency} (common/finish-invoices candidates))
+            (update :warnings into (when (some :rate-unknown? candidates) ["tax_percentage の無い明細があります"])))))))

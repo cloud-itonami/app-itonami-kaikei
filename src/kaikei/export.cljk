@@ -14,6 +14,8 @@
             [kaikei.compat.qbo :as qbo]
             [kaikei.compat.xero-invoices :as xero-invoices]
             [kaikei.compat.qbo-invoices :as qbo-invoices]
+            [kaikei.compat.freee-invoices :as freee-invoices]
+            [kaikei.compat.mf-invoices :as mf-invoices]
             [kaikei.compat.yayoi :as yayoi]
             [kaikei.compat.mf :as mf]
             [kaikei.compat.freee :as freee]))
@@ -33,6 +35,13 @@
     "xero-csv" (xero/write-csv db (cond-> {} date-order (assoc :date-order date-order)))
     "xero-invoices-json" (xero-invoices/write db)
     "qbo-invoices-json" (qbo-invoices/write db)
+    "xero-invoice-csv" (xero-invoices/write-csv db :sales (cond-> {} date-order (assoc :date-order date-order)))
+    "xero-bill-csv" (xero-invoices/write-csv db :purchase (cond-> {} date-order (assoc :date-order date-order)))
+    "qbo-invoice-csv" (qbo-invoices/write-csv db (cond-> {} date-order (assoc :date-order date-order)))
+    "freee-invoice-csv" (freee-invoices/write-csv db)
+    "freee-invoice-json" (freee-invoices/write db)
+    "mf-invoice-csv" (mf-invoices/write-csv db)
+    "mf-invoice-json" (mf-invoices/write db)
     {:error (str "知らない形式です: " format-id)}))
 
 (defn- content-note

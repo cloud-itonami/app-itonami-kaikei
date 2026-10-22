@@ -139,7 +139,7 @@
      [:div {:class "kk-toolbar-group"}
       [:label {:class "kk-inline-label" :for "kk-export-format"} "書き出す形式"]
       (select-el h [:set-export-format] (:export-format ui)
-                 (map (juxt :id :label) ingest/formats) {:id "kk-export-format"})
+                 (map (juxt :id :label) ingest/export-formats) {:id "kk-export-format"})
       (let [fmt (ingest/format-by-id (:export-format ui))]
         (when (:encodings fmt)
           (select-el h [:set-export-encoding] (or (:export-encoding ui) (:encoding fmt))
@@ -805,6 +805,7 @@
   [:section {:class "kk-empty"}
    [:h2 {:class "kk-h2"} "まだ仕訳がありません"]
    [:p "会計ソフトから書き出した仕訳帳（CSV）か、QuickBooks Online・Xero の API の JSON を取り込んでください。"
+    "請求書（Xero・QuickBooks・freee請求書・MF クラウド請求書・Zoho Invoice・FreshBooks）も取り込めます。"
     "請求書から始めることもできます。試すだけなら、合成データのサンプル（仕訳と請求書）を読み込めます。"]
    [:noscript [:p {:class "kk-noscript"}
                "この道具は JavaScript で動きます（すべてブラウザの中で処理し、何も送信しません）。"]]

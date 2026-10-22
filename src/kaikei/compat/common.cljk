@@ -235,6 +235,22 @@
      :invoices-rejected (count (filter :problem candidates))
      :invoices-skipped (reduce + 0 (vals skips))}))
 
+(defn rate-from-label
+  "税率の表示名（「10%」「8%（軽減）」「軽8%」「8% (軽減税率)」「20% (VAT on Income)」
+  「非課税」「不課税」「免税」…）→ {:category :rate :reduced?}。% の数か区分の名前が
+  読めなければ nil（推測しない）。"
+  [s]
+  (when-let [s (blank->nil s)]
+    (cond
+      (text/re-find #"非課" s) {:category :exempt :rate 0}
+      (text/re-find #"不課税|対象外" s) {:category :out-of-scope :rate 0}
+      (text/re-find #"免税|輸出" s) {:category :zero-rated :rate 0}
+      :else
+      (when-let [[_ pct] (text/re-find #"(\d+(?:\.\d+)?)\s*[%％]" s)]
+        (when-let [rate (percent->rate pct)]
+          (cond-> {:category :taxable :rate rate}
+            (text/re-find #"軽" s) (assoc :reduced? true)))))))
+
 (defn currency-of
   "請求書の通貨の列 → 帳簿の通貨（いちばん多いもの。無ければ fallback）。"
   [codes fallback]

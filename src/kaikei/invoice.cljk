@@ -194,20 +194,30 @@
 ;; ───────── 端数処理の向き ─────────
 
 (defn infer-rounding
-  "取り込み元が税率ごとの税額を書いている請求書に、その額を再現する端数処理の向き
-  （:floor → :half-up → :ceil の順に試す）を付ける。どれでも再現できなければ
+  "取り込み元が税率ごとの税額（無ければ税額の合計）を書いている請求書に、その額を
+  再現する端数処理の向き（:floor → :half-up → :ceil の順に試す）を付ける。どれでも再現できなければ
   default のまま（検査で差を出す）。丸めの向きは請求書ごとに任意（国税庁 Q&A
   問 57）で、多くの形式は向きを書かないため。"
   [inv default]
-  (if (seq (get-in inv [:stated :tax-by-rate]))
-    (or (first (for [r roundings
-                     :let [t (totals (assoc inv :rounding r))]
-                     :when (every? #(or (nil? (:stated-tax %)) (= (:stated-tax %) (:tax %))) (:groups t))]
-                 (assoc inv :rounding r)))
-        (assoc inv :rounding default))
-    (assoc inv :rounding default)))
+  (let [by-rate? (seq (get-in inv [:stated :tax-by-rate]))
+        total-tax (get-in inv [:stated :tax])]
+    (if (or by-rate? (some? total-tax))
+      (or (first (for [r roundings
+                       :let [t (totals (assoc inv :rounding r))]
+                       :when (if by-rate?
+                               (every? #(or (nil? (:stated-tax %)) (= (:stated-tax %) (:tax %))) (:groups t))
+                               (= total-tax (:computed-tax t)))]
+                   (assoc inv :rounding r)))
+          (assoc inv :rounding default))
+      (assoc inv :rounding default))))
 
 ;; ───────── 適格請求書の検査 ─────────
+
+(defn withholding?
+  "源泉徴収がある請求書か。:withholding は額（正の整数）か、額が分からない形式では true。"
+  [inv]
+  (let [w (:withholding inv)]
+    (or (true? w) (and (number? w) (pos? w)))))
 
 (defn qualified?
   "仕入の請求書の発行者（取引先）が、形の正しい登録番号を書いているか。"
@@ -251,7 +261,7 @@
       (blank? recipient) (conj {:code :recipient-name})
       (not (:valid? t)) (conj {:code :buffer})
       (and sales? (seq differences)) (conj {:code :tax-mismatch :differences differences})
-      (pos? (or (:withholding inv) 0)) (conj {:code :withholding}))))
+      (withholding? inv) (conj {:code :withholding}))))
 
 (defn missing-items? [db inv]
   (boolean (some #(required-items (:code %)) (problems db inv))))
@@ -313,7 +323,7 @@
       (not (#{:issued :paid} (:status inv))) :status
       (posted-entry db (:id inv)) :already-posted
       (in-ledger? db inv) :in-ledger
-      (pos? (or (:withholding inv) 0)) :withholding
+      (withholding? inv) :withholding
       (empty? (:lines inv)) :no-lines
       (nil? (some-> (:date inv) core/parse-date)) :invalid-date
       (some #(and (= :taxable (:category % :taxable)) (nil? (:rate %))) (:lines inv)) :rate-unknown
@@ -496,17 +506,17 @@
                         #"^0+(?=\d)" "")]
     (if (= s "") "0" s)))
 
-(defn line-amount
-  "単価 × 数量 → {:amount 最小通貨単位} か {:error :format|:range}。exp は通貨の
-  小数桁、rounding は :floor・:half-up・:ceil（絶対値で丸める）。数量が空なら 1。"
-  [quantity unit-price exp rounding]
-  (let [q (if (blank? quantity) {:neg? false :digits "1" :scale 0} (parse-decimal quantity))
-        p (parse-decimal unit-price)]
-    (if (or (nil? q) (nil? p))
+(defn line-amount-of
+  "10 進の文字列の積（単価 × 数量 × 値引きの率 …）を通貨の桁で 1 回だけ丸める →
+  {:amount 最小通貨単位} か {:error :format|:range}。exp は通貨の小数桁、rounding は
+  :floor・:half-up・:ceil（絶対値で丸める）。途中では丸めない（筆算で正確）。"
+  [factors exp rounding]
+  (let [ds (map parse-decimal factors)]
+    (if (or (empty? ds) (some nil? ds))
       {:error :format}
-      (let [digits (multiply-digits (:digits q) (:digits p))
-            scale (+ (:scale q) (:scale p))
-            neg? (not= (:neg? q) (:neg? p))
+      (let [digits (reduce multiply-digits (map :digits ds))
+            scale (reduce + 0 (map :scale ds))
+            neg? (odd? (count (filter :neg? ds)))
             [whole rest-digits] (if (<= scale exp)
                                   [(str digits (apply str (repeat (- exp scale) "0"))) ""]
                                   (let [cut (- scale exp)
@@ -521,6 +531,23 @@
           {:error :range}
           (let [n (cond-> (parse-long whole) up? inc)]
             {:amount (if (and neg? (pos? n)) (- n) n)}))))))
+
+(defn line-amount
+  "単価 × 数量 → {:amount 最小通貨単位} か {:error :format|:range}（line-amount-of）。
+  数量が空なら 1。"
+  [quantity unit-price exp rounding]
+  (line-amount-of [(if (blank? quantity) "1" quantity) unit-price] exp rounding))
+
+(defn discount-factor
+  "値引きの率（%、\"5\"・\"12.5\"）→ 掛ける率の 10 進の文字列（\"0.95\"・\"0.875\"）。
+  空・0 なら nil、読めなければ :error。"
+  [percent]
+  (when-not (blank? percent)
+    (let [{:keys [amount error]} (core/parse-amount percent 4)]
+      (cond
+        error :error
+        (zero? amount) nil
+        :else (core/format-amount (- 1000000 amount) 6)))))
 
 ;; ───────── 画面の入力（下書き） ─────────
 ;;

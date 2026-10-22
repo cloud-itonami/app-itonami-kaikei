@@ -34,6 +34,7 @@
   TxnTaxDetail には kaikei の税率ごとの税額を書く。取消の請求書は書き出さない。"
   (:require [kotoba.lang.text :as text]
             [kaikei.core :as core]
+            [kaikei.csv :as csv]
             [kaikei.invoice :as invoice]
             [kaikei.json :as json]
             [kaikei.compat.common :as common]))
@@ -289,3 +290,130 @@
 (defn write [db]
   (let [{:keys [value notes]} (data db)]
     {:text (str (json/write value) "\n") :notes notes}))
+
+;; ───────── invoices の取り込み CSV ─────────
+;;
+;; QuickBooks Help「Import multiple invoices at once」（米・英。米は 2026-10-01 更新）と
+;; Intuit の PDF「import invoices」（2018）の見本の見出し（18 列）:
+;;   *InvoiceNo,*Customer,*InvoiceDate,*DueDate,Terms,Location,Memo,
+;;   Item(Product/Service),ItemDescription,ItemQuantity,ItemRate,*ItemAmount,
+;;   Shipping address,Ship via,Shipping date,Tracking no.,Shipping Charge,Service Date
+;; 1 行 = 1 明細で、どの行にも請求書番号・取引先・日付・期日を書く。1,000 行・100 件
+;; まで。負の明細（値引き・クレジットメモ）は取り込めない。米国版は売上税を設定した
+;; 会社では使えない（税の列が無い）。英国版は品目の税コード（Item tax code）が要り、
+;; 税込・税抜は取り込みのときに選ぶ。日付の形も取り込みのときに選ぶ。
+;;
+;; 今の見本の見出し（とくに英国版の税の列の名前）はログインが要るので未確認。
+;; kaikei は 2018 年の 18 列に ItemTaxCode を足して書き、読むときは英数字だけで
+;; 照合する（「Item tax code」も ItemTaxCode と同じ）。
+
+(def csv-columns
+  ["*InvoiceNo" "*Customer" "*InvoiceDate" "*DueDate" "Terms" "Location" "Memo" "Item(Product/Service)"
+   "ItemDescription" "ItemQuantity" "ItemRate" "*ItemAmount" "Shipping address" "Ship via" "Shipping date"
+   "Tracking no." "Shipping Charge" "Service Date" "ItemTaxCode"])
+
+(defn- csv-norm [h] (text/lower (text/replace (str h) #"[^A-Za-z0-9]" "")))
+
+(defn csv-detect? [rows]
+  (let [h (set (map csv-norm (first rows)))]
+    (every? h ["invoiceno" "customer" "itemamount"])))
+
+(defn- pick [rec k] (common/blank->nil (get rec k)))
+
+(defn read-csv
+  "parse 済みの CSV 行 → 請求書の取り込み結果（売上の請求書）。opts: :currency
+  （既定 JPY）、:date-order（無ければ日付から推し、推せなければ mdy）。税の列
+  （ItemTaxCode）が無ければ税なし、あれば税抜として読む。状態は下書き。"
+  [rows {:keys [currency date-order] :or {currency "JPY"}}]
+  (let [exp (core/exponent currency)
+        header (set (map csv-norm (first rows)))
+        taxed? (contains? header "itemtaxcode")
+        recs (csv/records (cons (mapv csv-norm (first rows)) (rest rows)))
+        guessed (common/detect-date-order (concat (keep #(pick % "invoicedate") recs) (keep #(pick % "duedate") recs)))
+        order (or date-order guessed "mdy")
+        groups (vals (reduce (fn [acc rec]
+                               (update acc (or (pick rec "invoiceno") (str "#" (::csv/row rec))) (fnil conj []) rec))
+                             (array-map) recs))
+        read-group
+        (fn [recs]
+          (let [first-of (fn [k] (some #(pick % k) recs))
+                where (str "行 " (::csv/row (first recs)))
+                date (some-> (first-of "invoicedate") (common/parse-ordered-date order))
+                parts (vec (for [rec recs
+                                 :let [w (str "行 " (::csv/row rec))
+                                       {:keys [amount problem]} (common/read-amount (or (pick rec "itemamount") "") exp (str w " ItemAmount"))
+                                       label (pick rec "itemtaxcode")
+                                       rate (if taxed? (common/rate-from-label label) {:category :out-of-scope :rate 0})]]
+                             (if problem
+                               {:problem problem}
+                               {:line (cond-> (merge {:description (or (pick rec "itemdescription") (pick rec "itemproductservice") "")
+                                                      :amount amount :category :taxable}
+                                                     rate)
+                                        (pick rec "itemquantity") (assoc :quantity (pick rec "itemquantity"))
+                                        (pick rec "itemrate") (assoc :unit-price (pick rec "itemrate"))
+                                        label (assoc :tax {:scheme :qbo-code :code label}))
+                                :rate-unknown? (nil? rate)})))
+                p (common/first-problem parts)]
+            (cond
+              p {:problem (:problem p)}
+              (nil? date) {:problem (str where ": InvoiceDate \"" (first-of "invoicedate") "\" を読めません（日付の並び " order "）")}
+              :else
+              {:invoice (cond-> {:kind :sales
+                                 :number (or (first-of "invoiceno") "")
+                                 :date date
+                                 :status :draft
+                                 :partner {:name (or (first-of "customer") "")}
+                                 :tax-mode (if taxed? :exclusive :none)
+                                 :rounding :half-up
+                                 :lines (mapv :line parts)
+                                 :origin {:format :qbo-invoice-csv}}
+                          (some-> (first-of "duedate") (common/parse-ordered-date order))
+                          (assoc :due-date (common/parse-ordered-date (first-of "duedate") order))
+                          (first-of "memo") (assoc :subject (first-of "memo")))
+               :rate-unknown? (some :rate-unknown? parts)})))
+        candidates (map read-group groups)]
+    (if-not exp
+      {:format :qbo-invoice-csv :invoices [] :rejected 0 :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      (-> (merge {:format :qbo-invoice-csv :currency currency} (common/finish-invoices candidates))
+          (update :warnings into
+                  (remove nil?
+                          [(if taxed?
+                             "QBO の CSV は税込・税抜を書かないので、金額を税抜として読みました。状態は下書きです"
+                             "税の列（ItemTaxCode）が無いので、税なしの請求書として読みました。状態は下書きです")
+                           (when (some :rate-unknown? candidates)
+                             "ItemTaxCode から税率を読めない明細があります（% の数か 非課税・不課税・免税 の名前が要ります）")
+                           (when (and (nil? date-order) (nil? guessed))
+                             "日付の並びを判定できないので、月/日/年 と読みました（違うときは日付の並びを指定してください）")]))))))
+
+(defn write-csv
+  "db → invoices の取り込み CSV（売上の請求書だけ）。金額は税抜、ItemTaxCode は
+  税率の名前。opts の :date-order は \"mdy\"（既定）・\"dmy\"・\"ymd\"。"
+  ([db] (write-csv db {}))
+  ([db {:keys [date-order] :or {date-order "mdy"}}]
+   (let [exp (core/exponent (:currency db))
+         money #(core/format-amount % exp)
+         date #(some-> % (common/format-ordered-date date-order))
+         invs (filter #(and (= :sales (:kind %)) (not= :void (:status %))) (:invoices db))
+         purchases (count (filter #(= :purchase (:kind %)) (:invoices db)))
+         voids (count (filter #(and (= :sales (:kind %)) (= :void (:status %))) (:invoices db)))
+         negatives (count (filter (fn [inv] (some #(neg? (:amount % 0)) (:lines inv))) invs))
+         rows (for [inv invs
+                    :let [t (invoice/totals inv)]
+                    [i l] (map-indexed vector (:lines inv))
+                    :let [share (get (:line-tax t) i 0)
+                          net (if (= :inclusive (:tax-mode inv)) (- (:amount l 0) share) (:amount l 0))
+                          simple? (and (= :exclusive (:tax-mode inv)) (:quantity l) (:unit-price l)
+                                       (= net (:amount (invoice/line-amount (:quantity l) (:unit-price l) exp :half-up))))]]
+                [(:number inv) (get-in inv [:partner :name]) (date (:date inv)) (date (or (:due-date inv) (:date inv)))
+                 nil nil (:subject inv) nil (:description l)
+                 (when simple? (:quantity l)) (when simple? (:unit-price l)) (money net)
+                 nil nil nil nil nil nil
+                 (when-not (= :none (:tax-mode inv))
+                   (or (common/tax-code l :qbo-code) (invoice/group-label (invoice/group-key l))))])]
+     {:text (csv/write (cons csv-columns rows))
+      :notes (cond-> ["金額（ItemAmount）は税抜で書きました。英国版では取り込みのときに Exclusive を選び、税コード（ItemTaxCode）を会社の税コードに対応づけてください。米国版は売上税を設定した会社では CSV で取り込めません"
+                      "ItemTaxCode の列名は 2018 年の見本に無く、未確認です（取り込みの対応づけで選んでください）"
+                      "QBO の CSV には登録番号の受け皿がありません"]
+               (pos? purchases) (conj (str "受け取った請求書 " purchases " 件はこの形式に入りません"))
+               (pos? voids) (conj (str "取消の請求書 " voids " 件は書き出していません"))
+               (pos? negatives) (conj (str "負の明細（値引き）のある請求書 " negatives " 件は、QBO の CSV では取り込めません")))})))

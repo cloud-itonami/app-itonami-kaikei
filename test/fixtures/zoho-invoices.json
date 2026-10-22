@@ -1,0 +1,138 @@
+{
+  "code": 0,
+  "message": "success",
+  "invoices": [
+    {
+      "invoice_id": 982000000567114,
+      "invoice_number": "INV-00003",
+      "customer_id": 982000000567001,
+      "customer_name": "Bowman & Co",
+      "date": "2026-11-17",
+      "due_date": "2026-12-02",
+      "reference_number": "PO-123",
+      "status": "sent",
+      "currency_code": "JPY",
+      "exchange_rate": 1.0,
+      "discount": 0,
+      "discount_type": "item_level",
+      "is_discount_before_tax": true,
+      "is_inclusive_tax": false,
+      "shipping_charge": 0,
+      "adjustment": 0,
+      "line_items": [
+        {
+          "line_item_id": 982000000567021,
+          "item_id": 982000000030049,
+          "name": "Hard Drive",
+          "description": "500GB",
+          "item_order": 1,
+          "rate": 12000,
+          "quantity": 2,
+          "unit": "pcs",
+          "discount": 0,
+          "tax_id": 982000000557028,
+          "tax_name": "Sales Tax",
+          "tax_type": "tax",
+          "tax_percentage": 10,
+          "item_total": 24000
+        },
+        {
+          "line_item_id": 982000000567022,
+          "item_id": 982000000030050,
+          "name": "Cable",
+          "description": "",
+          "item_order": 2,
+          "rate": 1500,
+          "quantity": 3,
+          "unit": "pcs",
+          "discount": 0,
+          "tax_id": 982000000557029,
+          "tax_name": "Reduced",
+          "tax_type": "tax",
+          "tax_percentage": 8,
+          "item_total": 4500
+        }
+      ],
+      "sub_total": 28500,
+      "tax_total": 2760,
+      "total": 31260,
+      "balance": 31260,
+      "taxes": [
+        {
+          "tax_name": "Sales Tax",
+          "tax_amount": 2400
+        },
+        {
+          "tax_name": "Reduced",
+          "tax_amount": 360
+        }
+      ]
+    },
+    {
+      "invoice_id": 982000000567115,
+      "invoice_number": "INV-00004",
+      "customer_name": "Bowman & Co",
+      "date": "2026-11-20",
+      "status": "sent",
+      "currency_code": "JPY",
+      "discount": 10,
+      "discount_type": "entity_level",
+      "is_inclusive_tax": false,
+      "line_items": [
+        {
+          "name": "Service",
+          "rate": 10000,
+          "quantity": 1,
+          "tax_percentage": 10,
+          "item_total": 10000
+        }
+      ],
+      "sub_total": 10000,
+      "tax_total": 900,
+      "total": 9900
+    },
+    {
+      "invoice_id": 982000000567116,
+      "invoice_number": "INV-00005",
+      "customer_name": "Bowman & Co",
+      "date": "2026-11-21",
+      "status": "void",
+      "currency_code": "JPY",
+      "discount": 0,
+      "is_inclusive_tax": true,
+      "line_items": [
+        {
+          "name": "Void item",
+          "rate": 11000,
+          "quantity": 1,
+          "tax_name": "Sales Tax",
+          "tax_percentage": 10,
+          "item_total": 11000
+        }
+      ],
+      "sub_total": 10000,
+      "tax_total": 1000,
+      "total": 11000,
+      "taxes": [
+        {
+          "tax_name": "Sales Tax",
+          "tax_amount": 1000
+        }
+      ]
+    },
+    {
+      "invoice_id": 982000000567117,
+      "invoice_number": "INV-00006",
+      "customer_name": "Bowman & Co",
+      "date": "2026-11-22",
+      "status": "draft",
+      "currency_code": "JPY",
+      "total": 5000
+    }
+  ],
+  "page_context": {
+    "page": 1,
+    "per_page": 200,
+    "has_more_page": false
+  }
+}

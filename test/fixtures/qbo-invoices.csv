@@ -1,0 +1,4 @@
+*InvoiceNo,*Customer,*InvoiceDate,*DueDate,Terms,Location,Memo,Item(Product/Service),ItemDescription,ItemQuantity,ItemRate,*ItemAmount,Shipping address,Ship via,Shipping date,Tracking no.,Shipping Charge,Service Date,ItemTaxCode
+1001,株式会社みなと,16/11/2026,16/12/2026,Net 30,,11 月分,保守,ウェブサイトの保守,1,50000,50000,,,,,,,10%
+1001,株式会社みなと,16/11/2026,16/12/2026,Net 30,,11 月分,弁当,打ち合わせの弁当,5,800,4000,,,,,,,8%（軽減）
+1002,合同会社かもめ,20/11/2026,20/12/2026,,,,デザイン,ロゴ,1,30000,30000,,,,,,,10%

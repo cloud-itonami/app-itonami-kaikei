@@ -14,10 +14,21 @@
 
   請求書の形式（第 3 スライス、JUN-321。:content :invoices）:
 
-    xero-invoices-json  Xero Accounting API の Invoices（ACCREC・ACCPAY）
-    qbo-invoices-json   QuickBooks Online の Invoice・Bill（query の応答）
+    xero-invoices-json       Xero Accounting API の Invoices（ACCREC・ACCPAY）
+    qbo-invoices-json        QuickBooks Online の Invoice・Bill（query の応答）
+    xero-invoice-csv         Xero の customer invoices 取り込み CSV
+    xero-bill-csv            Xero の bills 取り込み CSV
+    qbo-invoice-csv          QuickBooks Online の invoices 取り込み CSV
+    freee-invoice-csv        freee請求書 の帳票 CSV インポート（請求書）
+    freee-invoice-json       freee請求書 API の invoice
+    mf-invoice-csv           MF クラウド請求書 の CSV 一括追加（縦並び）
+    mf-invoice-json          MF クラウド請求書 API v3 の Billing
+    zoho-invoice-json        Zoho Invoice API v3 の invoice（読むだけ）
+    freshbooks-invoice-json  FreshBooks の invoices・bills（読むだけ）
 
   :content は :journal（仕訳と勘定科目）・:invoices（請求書）・:all（kaikei-json）。
+  :read-only の形式は書き出さない。Xero の bills の CSV は見出しが customer invoices
+  と同じなので、自動の判定では売上の請求書として読む（受け取った請求書は形式を選ぶ）。
 
   この ns はネットワークに触れない。JSON の構文解析はホスト（JSON.parse）、
   文字コードの解読はホストの TextDecoder（kaikei.encoding）。"
@@ -30,6 +41,10 @@
             [kaikei.compat.qbo :as qbo]
             [kaikei.compat.xero-invoices :as xero-invoices]
             [kaikei.compat.qbo-invoices :as qbo-invoices]
+            [kaikei.compat.freee-invoices :as freee-invoices]
+            [kaikei.compat.mf-invoices :as mf-invoices]
+            [kaikei.compat.zoho-invoices :as zoho-invoices]
+            [kaikei.compat.freshbooks-invoices :as freshbooks-invoices]
             [kaikei.compat.yayoi :as yayoi]
             [kaikei.compat.mf :as mf]
             [kaikei.compat.freee :as freee]))
@@ -54,9 +69,33 @@
    {:id "xero-invoices-json" :content :invoices :label "Xero API JSON（Invoices）" :kind :json :encoding "utf-8"
     :file "kaikei-xero-invoices.json" :mime "application/json"}
    {:id "qbo-invoices-json" :content :invoices :label "QuickBooks Online API JSON（Invoice・Bill）" :kind :json
-    :encoding "utf-8" :file "kaikei-quickbooks-invoices.json" :mime "application/json"}])
+    :encoding "utf-8" :file "kaikei-quickbooks-invoices.json" :mime "application/json"}
+   {:id "xero-invoice-csv" :content :invoices :label "Xero 請求書の取り込み CSV（customer invoices）" :kind :csv
+    :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-xero-invoices.csv" :mime "text/csv"}
+   {:id "xero-bill-csv" :content :invoices :label "Xero 受け取った請求書の取り込み CSV（bills）" :kind :csv
+    :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-xero-bills.csv" :mime "text/csv"}
+   {:id "qbo-invoice-csv" :content :invoices :label "QuickBooks Online 請求書の取り込み CSV（invoices）" :kind :csv
+    :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-quickbooks-invoices.csv" :mime "text/csv"}
+   {:id "freee-invoice-csv" :content :invoices :label "freee請求書 帳票 CSV インポート（請求書）" :kind :csv
+    :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-freee-invoices.csv" :mime "text/csv"}
+   {:id "freee-invoice-json" :content :invoices :label "freee請求書 API JSON（invoice）" :kind :json
+    :encoding "utf-8" :file "kaikei-freee-invoices.json" :mime "application/json"}
+   {:id "mf-invoice-csv" :content :invoices :label "MF クラウド請求書 CSV 一括追加（縦並び）" :kind :csv
+    :encoding "shift_jis" :encodings ["shift_jis" "utf-8"] :file "kaikei-moneyforward-invoices.csv" :mime "text/csv"}
+   {:id "mf-invoice-json" :content :invoices :label "MF クラウド請求書 API JSON（Billing）" :kind :json
+    :encoding "utf-8" :file "kaikei-moneyforward-invoices.json" :mime "application/json"}
+   {:id "zoho-invoice-json" :content :invoices :read-only true :label "Zoho Invoice API JSON（invoice、読むだけ）"
+    :kind :json :encoding "utf-8"}
+   {:id "freshbooks-invoice-json" :content :invoices :read-only true :label "FreshBooks API JSON（invoices・bills、読むだけ）"
+    :kind :json :encoding "utf-8"}])
 
 (def format-ids (mapv :id formats))
+
+(def export-formats
+  "書き出せる形式（読むだけの形式を除く）。"
+  (filterv (complement :read-only) formats))
+
+(def export-format-ids (mapv :id export-formats))
 
 (defn content-formats
   "content（:journal・:invoices）を書ける形式。kaikei-json はどちらにも入る。"
@@ -79,12 +118,20 @@
     ;; 入れたもの、QBO の QueryResponse に Invoice・Bill があるもの）
     (xero-invoices/detect? data) "xero-invoices-json"
     (qbo-invoices/detect? data) "qbo-invoices-json"
+    (freee-invoices/detect? data) "freee-invoice-json"
+    (mf-invoices/detect? data) "mf-invoice-json"
+    (zoho-invoices/detect? data) "zoho-invoice-json"
+    (freshbooks-invoices/detect? data) "freshbooks-invoice-json"
     (xero/detect? data) "xero-json"
     (qbo/detect? data) "qbo-json"
     :else nil))
 
 (defn detect-csv [rows]
   (cond
+    (freee-invoices/csv-detect? rows) "freee-invoice-csv"
+    (mf-invoices/csv-detect? rows) "mf-invoice-csv"
+    (xero-invoices/csv-detect? rows) "xero-invoice-csv"
+    (qbo-invoices/csv-detect? rows) "qbo-invoice-csv"
     (mf/detect? rows) "mf"
     (freee/detect? rows) "freee"
     (qbo/csv-detect? rows) "qbo-csv"
@@ -120,6 +167,10 @@
             "qbo-json" (qbo/read-data data opts)
             "xero-invoices-json" (xero-invoices/read-data data opts)
             "qbo-invoices-json" (qbo-invoices/read-data data opts)
+            "freee-invoice-json" (freee-invoices/read-data data)
+            "mf-invoice-json" (mf-invoices/read-data data)
+            "zoho-invoice-json" (zoho-invoices/read-data data opts)
+            "freshbooks-invoice-json" (freshbooks-invoices/read-data data opts)
             (empty-result fmt (if (nil? fmt)
                                 "JSON の形を判定できません（kaikei の帳簿 JSON、Xero の Accounts・Journals・ManualJournals・Invoices、QBO の query の応答のどれでもありません）"
                                 (str (:label (format-by-id fmt)) " は JSON ではありません"))))))
@@ -131,6 +182,11 @@
           "yayoi" (yayoi/read-rows rows)
           "qbo-csv" (qbo/read-csv rows opts)
           "xero-csv" (xero/read-csv rows opts)
+          "xero-invoice-csv" (xero-invoices/read-csv rows :sales opts)
+          "xero-bill-csv" (xero-invoices/read-csv rows :purchase opts)
+          "qbo-invoice-csv" (qbo-invoices/read-csv rows opts)
+          "freee-invoice-csv" (freee-invoices/read-csv rows)
+          "mf-invoice-csv" (mf-invoices/read-csv rows)
           (empty-result fmt (if (nil? fmt)
                               "CSV の形を判定できません。形式を選んでから取り込んでください"
                               (str (:label (format-by-id fmt)) " は CSV ではありません"))))))))

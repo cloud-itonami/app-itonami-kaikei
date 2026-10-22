@@ -1,0 +1,316 @@
+(ns kaikei.compat.mf-invoices
+  "マネーフォワード クラウド請求書 の請求書 —— CSV 一括追加（縦並び）の形と、API v3 の
+  Billing の JSON。どちらも売上の請求書だけで、金額は円。
+
+  ## CSV（帳票の CSV 一括追加、縦並び、法人）
+
+  MF ガイド「帳票をCSVアップロードする方法」（do019、2026-07-10）。A 列 csv_type(変更不可)
+  （請求書の縦並びは 40101）、B 列 行形式（請求書の行・品目の行）。請求書の行に
+  取引先名称・件名・請求日・お支払期限・請求書番号・小計・消費税・合計金額・入金
+  ステータス、品目の行に 品名・単価・数量・単位・金額・品目消費税率（免税・非課税・
+  不課税・5%・8%・軽8%・10%）。
+  - 列の並びと見出しは 2023 年の画面写しから読んだもので、見出しの正確な文字列は
+    未確認（見本のダウンロードにログインが要る）。小計・消費税・合計金額・金額は
+    アップロードでは使われない（MF が計算する）。
+  - CSV に消費税の表示方法と端数処理の欄は無い。kaikei は税抜（外税）として読み、
+    書かれた消費税（合計）を再現する端数処理の向きを選ぶ。
+  - ダウンロードの CSV の列は文書に無い（アップロードと同じ並びと推定、未確認）。
+  - 文字コードは Shift_JIS（Windows）か UTF-8 を選ぶ。
+
+  ## JSON（API v3、iv_web_api.yaml 3.6.0）
+
+  `GET /billings` の応答 {\"data\": [Billing…], \"pagination\": …} か Billing 1 つ。
+  - items[]: name・detail・unit・price（文字列）・quantity（文字列）・excise
+    （ten_percent・eight_percent_as_reduced_tax_rate・eight_percent・five_percent・
+    tax_exemption 免税・non_taxable 非課税・untaxable 不課税）。明細の金額の欄は
+    無いので、price × quantity を config.rounding（明細行の端数処理）で丸める。
+  - config.consumption_tax_display_type（internal 内税・external 外税）、
+    config.rounding_consumption_tax（round_down・round_up・round_off）。
+  - 税率ごとの消費税 excise_price_of_<税率> を取り込み元の額にする。
+  - registration_code は発行者（自社）の登録番号。payment_status が 入金済み なら
+    入金済み、ほかは発行済み。
+  - 日付は request の例が 2022-12-09、response の例が 2022/12/09。どちらも読む。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]
+            [kaikei.invoice :as invoice]
+            [kaikei.json :as json]
+            [kaikei.compat.common :as common]))
+
+(def ^:private api-rounding {"round_down" :floor "round_up" :ceil "round_off" :half-up})
+(def ^:private rounding->api {:floor "round_down" :ceil "round_up" :half-up "round_off"})
+
+(def ^:private excise->fields
+  {"ten_percent" {:category :taxable :rate 1000}
+   "eight_percent_as_reduced_tax_rate" {:category :taxable :rate 800 :reduced? true}
+   "eight_percent" {:category :taxable :rate 800}
+   "five_percent" {:category :taxable :rate 500}
+   "tax_exemption" {:category :zero-rated :rate 0}
+   "non_taxable" {:category :exempt :rate 0}
+   "untaxable" {:category :out-of-scope :rate 0}})
+
+(defn- excise-of
+  "kaikei の行 → MF の excise と CSV の品目消費税率。表せなければ nil。"
+  [l]
+  (case (:category l :taxable)
+    :zero-rated ["tax_exemption" "免税"]
+    :exempt ["non_taxable" "非課税"]
+    :out-of-scope ["untaxable" "不課税"]
+    (cond
+      (= 1000 (:rate l)) ["ten_percent" "10%"]
+      (and (= 800 (:rate l)) (:reduced? l)) ["eight_percent_as_reduced_tax_rate" "軽8%"]
+      (= 800 (:rate l)) ["eight_percent" "8%"]
+      (= 500 (:rate l)) ["five_percent" "5%"]
+      :else nil)))
+
+(defn- representable? [inv] (every? excise-of (:lines inv)))
+
+(defn- simple-quantity
+  "単価 × 数量（rounding）が金額と同じなら [数量 単価]、違えば [\"1\" 金額]。"
+  [l rounding]
+  (if (and (:quantity l) (:unit-price l)
+           (= (:amount l) (:amount (invoice/line-amount (:quantity l) (:unit-price l) 0 rounding))))
+    [(:quantity l) (:unit-price l)]
+    ["1" (core/format-amount (:amount l 0) 0)]))
+
+;; ───────── CSV ─────────
+
+(def csv-columns
+  ["csv_type(変更不可)" "行形式" "取引先名称" "件名" "請求日" "お支払期限" "請求書番号" "売上計上日" "メモ" "タグ"
+   "小計" "消費税" "合計金額" "取引先敬称" "取引先郵便番号" "取引先都道府県" "取引先住所1" "取引先住所2" "取引先部署"
+   "取引先担当者役職" "取引先担当者氏名" "自社担当者氏名" "備考" "振込先" "入金ステータス" "メール送信ステータス"
+   "郵送ステータス" "ダウンロードステータス" "納品日" "品名" "品目コード" "単価" "数量" "単位" "納品書番号" "詳細" "金額"
+   "品目消費税率"])
+
+(defn- csv-norm [h] (text/replace (text/trim (str h)) #"[（(].*[)）]$" ""))
+
+(defn csv-detect? [rows]
+  (= "csv_type" (csv-norm (first (first rows)))))
+
+(defn- pick [rec k] (common/blank->nil (get rec k)))
+
+(defn read-csv
+  "parse 済みの CSV 行 → 請求書の取り込み結果（通貨は JPY）。"
+  [rows]
+  (let [recs (csv/records (cons (mapv csv-norm (first rows)) (rest rows)))
+        groups (reduce (fn [acc rec]
+                         (case (pick rec "行形式")
+                           "品目" (if (seq acc) (conj (pop acc) (conj (peek acc) rec)) acc)
+                           (if (or (pick rec "取引先名称") (pick rec "請求書番号") (pick rec "請求日"))
+                             (conj acc [rec])
+                             acc)))
+                       [] recs)
+        read-group
+        (fn [[head & items]]
+          (let [where (str "行 " (::csv/row head))
+                date (core/parse-date (pick head "請求日"))
+                parts (vec (for [rec items
+                                 :let [w (str "行 " (::csv/row rec))
+                                       amt (if (pick rec "金額")
+                                             (core/parse-amount (pick rec "金額") 0)
+                                             (if (pick rec "単価")
+                                               (invoice/line-amount (pick rec "数量") (pick rec "単価") 0 :half-up)
+                                               {:amount 0}))
+                                       rate (common/rate-from-label (pick rec "品目消費税率"))]]
+                             (if (:error amt)
+                               {:problem (str w ": 金額を読めません")}
+                               {:line (cond-> (merge {:description (or (pick rec "品名") "") :amount (:amount amt) :category :taxable}
+                                                     rate)
+                                        (pick rec "数量") (assoc :quantity (text/replace (pick rec "数量") "," ""))
+                                        (pick rec "単価") (assoc :unit-price (text/replace (pick rec "単価") "," "")))
+                                :rate-unknown? (nil? rate)})))
+                p (common/first-problem parts)
+                stated-tax (some-> (pick head "消費税") (core/parse-amount 0) :amount)
+                payment (pick head "入金ステータス")]
+            (cond
+              p {:problem (:problem p)}
+              (nil? date) {:problem (str where ": 請求日 \"" (pick head "請求日") "\" を読めません")}
+              :else
+              {:invoice (invoice/infer-rounding
+                         (cond-> {:kind :sales
+                                  :number (or (pick head "請求書番号") "")
+                                  :date date
+                                  :status (case payment "入金済み" :paid "未入金" :issued :draft)
+                                  :partner {:name (or (pick head "取引先名称") "")}
+                                  :tax-mode :exclusive
+                                  :lines (mapv :line parts)
+                                  :origin {:format :mf-invoice-csv}}
+                           (core/parse-date (pick head "お支払期限")) (assoc :due-date (core/parse-date (pick head "お支払期限")))
+                           (pick head "件名") (assoc :subject (pick head "件名"))
+                           stated-tax (assoc :stated {:tax stated-tax}))
+                         :floor)
+               :rate-unknown? (some :rate-unknown? parts)})))
+        candidates (map read-group groups)]
+    (-> (merge {:format :mf-invoice-csv :currency "JPY"} (common/finish-invoices candidates))
+        (update :warnings into
+                (remove nil?
+                        ["MF の CSV は消費税の表示方法を書かないので、税抜（外税）として読みました"
+                         (when (some :rate-unknown? candidates) "品目消費税率の読めない明細があります")])))))
+
+(defn write-csv
+  "db → CSV 一括追加（縦並び）の CSV（売上の請求書だけ、円だけ）。"
+  [db]
+  (if (not= "JPY" (:currency db))
+    {:error (str "MF クラウド請求書 の CSV は円の金額です。帳簿の通貨が " (:currency db) " なので書き出しません")}
+    (let [all (filter #(and (= :sales (:kind %)) (not= :void (:status %))) (:invoices db))
+          invs (filter representable? all)
+          skipped (- (count all) (count invs))
+          purchases (count (filter #(= :purchase (:kind %)) (:invoices db)))
+          inclusive (count (filter #(= :inclusive (:tax-mode %)) invs))
+          index (zipmap csv-columns (range))
+          blank (vec (repeat (count csv-columns) nil))
+          put (fn [m] (reduce (fn [r [k v]] (assoc r (index k) v)) blank m))
+          money #(core/format-amount % 0)
+          rows (mapcat (fn [inv]
+                         (let [t (invoice/totals inv)]
+                           (cons (put {"csv_type(変更不可)" "40101" "行形式" "請求書"
+                                       "取引先名称" (get-in inv [:partner :name]) "件名" (:subject inv)
+                                       "請求日" (core/slash-date (:date inv))
+                                       "お支払期限" (some-> (:due-date inv) core/slash-date)
+                                       "請求書番号" (:number inv) "売上計上日" (core/slash-date (:date inv))
+                                       "小計" (money (:net t)) "消費税" (money (:tax t)) "合計金額" (money (:total t))
+                                       "入金ステータス" (case (:status inv) :paid "入金済み" :issued "未入金" nil)})
+                                 (for [[i l] (map-indexed vector (:lines inv))
+                                       :let [net (if (= :inclusive (:tax-mode inv))
+                                                   (- (:amount l 0) (get (:line-tax t) i 0))
+                                                   (:amount l 0))
+                                             [qty unit] (if (= :inclusive (:tax-mode inv))
+                                                          ["1" (money net)]
+                                                          (simple-quantity l :floor))]]
+                                   (put {"csv_type(変更不可)" "40101" "行形式" "品目" "品名" (:description l)
+                                         "単価" unit "数量" qty "金額" (money net)
+                                         "品目消費税率" (second (excise-of l))})))))
+                       invs)]
+      {:text (csv/write (cons csv-columns rows))
+       :notes (cond-> ["見出しは 2023 年の画面写しから読んだもので、正確な文字列は未確認です（MF の「サンプルCSV」と見比べてください）"
+                       "小計・消費税・合計金額・金額は MF がアップロードで使いません（MF が計算します）。消費税の表示方法と端数処理は MF の帳票設定で選びます"
+                       "登録番号は MF の送付元情報から来ます"]
+                (pos? inclusive) (conj (str "税込の請求書 " inclusive " 件は、単価を税抜にして書きました（MF の帳票設定を外税にしてください）"))
+                (pos? purchases) (conj (str "受け取った請求書 " purchases " 件はこの形式に入りません"))
+                (pos? skipped) (conj (str "MF の品目消費税率で表せない請求書 " skipped " 件は書き出していません")))})))
+
+;; ───────── JSON（API v3） ─────────
+
+(defn- billing? [m] (and (map? m) (contains? m "billing_number") (contains? m "items")))
+
+(defn detect? [data]
+  (or (billing? data)
+      (and (map? data) (sequential? (get data "data")) (some billing? (get data "data")))))
+
+(defn- read-billing [i b]
+  (let [where (str "billing " (or (get b "billing_number") (inc i)))
+        line-rounding (get api-rounding (get-in b ["config" "rounding"]) :floor)
+        parts (vec (for [item (filter map? (get b "items"))
+                         :let [amt (if (get item "price")
+                                     (invoice/line-amount (some-> (get item "quantity") str) (str (get item "price")) 0 line-rounding)
+                                     {:amount 0})
+                               rate (excise->fields (get item "excise"))]]
+                     (if (:error amt)
+                       {:problem (str where ": price × quantity を読めません")}
+                       {:line (cond-> (merge {:description (str (get item "name" "")) :amount (:amount amt) :category :taxable} rate)
+                                (some? (get item "quantity")) (assoc :quantity (str (get item "quantity")))
+                                (some? (get item "price")) (assoc :unit-price (str (get item "price"))))
+                        :rate-unknown? (nil? rate)})))
+        p (common/first-problem parts)
+        date (core/parse-date (get b "billing_date"))
+        num (fn [k] (some-> (get b k) (core/parse-amount 0) :amount))
+        stated (vec (for [[k m] [["excise_price_of_ten_percent" {:rate 1000}]
+                                 ["excise_price_of_eight_percent_as_reduced_tax_rate" {:rate 800 :reduced? true}]
+                                 ["excise_price_of_eight_percent" {:rate 800}]
+                                 ["excise_price_of_five_percent" {:rate 500}]]
+                          :let [v (num k)]
+                          :when (and v (some #(= (:rate m) (:rate (:line %))) parts))]
+                      (assoc m :tax v)))]
+    (cond
+      p {:problem (:problem p)}
+      (nil? date) {:problem (str where ": billing_date \"" (get b "billing_date") "\" を読めません")}
+      :else
+      {:invoice (cond-> {:kind :sales
+                         :number (str (get b "billing_number" ""))
+                         :date date
+                         :status (if (= "入金済み" (get b "payment_status")) :paid :issued)
+                         :partner {:name (str (get b "partner_name" ""))}
+                         :tax-mode (if (= "internal" (get-in b ["config" "consumption_tax_display_type"])) :inclusive :exclusive)
+                         :rounding (get api-rounding (get-in b ["config" "rounding_consumption_tax"]) :floor)
+                         :lines (mapv :line parts)
+                         :origin (cond-> {:format :mf-invoice-json}
+                                   (get b "id") (assoc :id (str (get b "id"))))}
+                  (core/parse-date (get b "due_date")) (assoc :due-date (core/parse-date (get b "due_date")))
+                  (common/blank->nil (get b "title")) (assoc :subject (text/trim (get b "title")))
+                  (or (seq stated) (num "excise_price"))
+                  (assoc :stated (cond-> {}
+                                   (seq stated) (assoc :tax-by-rate stated)
+                                   (num "excise_price") (assoc :tax (num "excise_price"))
+                                   (num "total_price") (assoc :total (num "total_price")))))
+       :registration (common/blank->nil (get b "registration_code"))
+       :rate-unknown? (some :rate-unknown? parts)})))
+
+(defn read-data
+  "構文解析済みの JSON → 請求書の取り込み結果（通貨は JPY）。"
+  [data]
+  (let [bs (if (billing? data) [data] (filter map? (get data "data")))
+        candidates (map-indexed read-billing bs)
+        registration (some :registration candidates)]
+    (cond-> (-> (merge {:format :mf-invoice-json :currency "JPY"} (common/finish-invoices candidates))
+                (update :warnings into (when (some :rate-unknown? candidates) ["excise の読めない明細があります"])))
+      registration (assoc :business {:registration registration}))))
+
+(defn data
+  "db → {\"data\": [Billing…]}。戻りは {:value :notes} か {:error}。"
+  [db]
+  (if (not= "JPY" (:currency db))
+    {:error (str "MF クラウド請求書 は円の金額です。帳簿の通貨が " (:currency db) " なので書き出しません")}
+    (let [money #(core/format-amount % 0)
+          all (filter #(and (= :sales (:kind %)) (not= :void (:status %))) (:invoices db))
+          invs (filter representable? all)
+          skipped (- (count all) (count invs))
+          purchases (count (filter #(= :purchase (:kind %)) (:invoices db)))
+          registration (some-> (get-in db [:business :registration]) invoice/normalize-registration)
+          excise-keys ["untaxable" "non_taxable" "tax_exemption" "five_percent" "eight_percent"
+                       "eight_percent_as_reduced_tax_rate" "ten_percent"]
+          group-excise (fn [g] (first (excise-of (merge {:category :taxable}
+                                                        (let [[rate x] (:key g)]
+                                                          (if (keyword? x) {:category x :rate 0} {:rate rate :reduced? x}))))))]
+      {:value
+       (json/ordered
+        [["data"
+          (vec (for [inv invs
+                     :let [t (invoice/totals inv)
+                           by-excise (group-by group-excise (:groups t))
+                           sum (fn [k f] (money (reduce + 0 (map f (get by-excise k)))))]]
+                 (json/ordered
+                  (concat
+                   [["id" (when (= :mf-invoice-json (get-in inv [:origin :format])) (get-in inv [:origin :id]))]
+                    ["partner_name" (get-in inv [:partner :name])]
+                    ["title" (:subject inv)]
+                    ["billing_date" (:date inv)]
+                    ["due_date" (:due-date inv)]
+                    ["sales_date" (:date inv)]
+                    ["billing_number" (:number inv)]
+                    ["payment_status" (case (:status inv) :paid "入金済み" "未入金")]
+                    ["items" (vec (for [l (:lines inv)
+                                        :let [[qty unit] (simple-quantity l :floor)]]
+                                    (json/ordered [["name" (:description l)]
+                                                   ["price" unit]
+                                                   ["quantity" qty]
+                                                   ["excise" (first (excise-of l))]])))]
+                    ["excise_price" (money (:tax t))]]
+                   (for [k excise-keys] [(str "excise_price_of_" k) (sum k :used-tax)])
+                   [["subtotal_price" (money (:net t))]]
+                   (for [k excise-keys] [(str "subtotal_of_" k "_excise") (sum k :net)])
+                   (for [k excise-keys] [(str "subtotal_with_tax_of_" k "_excise") (sum k :gross)])
+                   [["total_price" (money (:total t))]
+                    ["registration_code" registration]
+                    ["use_invoice_template" true]
+                    ["config" (json/ordered [["rounding" "round_down"]
+                                             ["rounding_consumption_tax" (rounding->api (:rounding inv :floor))]
+                                             ["consumption_tax_display_type" (if (= :inclusive (:tax-mode inv)) "internal" "external")]])]]))))]])
+       :notes (cond-> ["請求書の作成（POST /invoice_template_billings）には取引先の department_id が要ります（この形は応答の形です）。config は API で設定できません"]
+                (some #(= :draft (:status %)) invs)
+                (conj (str "下書きの請求書 " (count (filter #(= :draft (:status %)) invs)) " 件は、MF クラウド請求書 の形に下書きの印が無いので、読み戻すと発行済みになります"))
+                (pos? purchases) (conj (str "受け取った請求書 " purchases " 件はこの形式に入りません"))
+                (pos? skipped) (conj (str "MF の excise で表せない請求書 " skipped " 件は書き出していません")))})))
+
+(defn write [db]
+  (let [{:keys [value notes error]} (data db)]
+    (if error {:error error} {:text (str (json/write value) "\n") :notes notes})))

@@ -11,8 +11,13 @@
 - QuickBooks Online の Account・JournalEntry（API の JSON）と journal entries CSV
 - Xero の Accounts・Journals・ManualJournals（API の JSON）と manual journal CSV
 
-請求書は Xero の Invoices（ACCREC・ACCPAY）と QuickBooks Online の Invoice・Bill（API の
-JSON）を読み書きする。
+請求書は次の形式を読み書きする（Zoho Invoice と FreshBooks は読むだけ）:
+
+- Xero の Invoices（API の JSON）と、請求書・受け取った請求書の取り込み CSV
+- QuickBooks Online の Invoice・Bill（API の JSON）と invoices の取り込み CSV
+- freee請求書 の帳票 CSV インポートと API の invoice
+- マネーフォワード クラウド請求書 の CSV 一括追加と API v3 の Billing
+- Zoho Invoice の invoice、FreshBooks の invoices・bills（API の JSON）
 
 データは送信されない。保存はこの端末の IndexedDB だけ。
 

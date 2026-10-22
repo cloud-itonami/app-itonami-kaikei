@@ -167,7 +167,7 @@
 (defn export-tool [args]
   (reject-unknown args ["ledger" "format" "encoding" "output_date_order"])
   (let [db (ledger-arg args)
-        fmt (enum-arg args "format" ingest/format-ids nil)]
+        fmt (enum-arg args "format" ingest/export-format-ids nil)]
     (when (get args "encoding") (enum-arg args "encoding" enc/encodings nil))
     (when (get args "output_date_order") (enum-arg args "output_date_order" common/date-orders nil))
     (export-out db fmt args)))
@@ -175,7 +175,7 @@
 (defn convert-tool [args]
   (reject-unknown args ["text" "bytes_base64" "from" "to" "input_encoding" "encoding" "currency"
                         "date_order" "output_date_order"])
-  (let [to-fmt (enum-arg args "to" ingest/format-ids nil)
+  (let [to-fmt (enum-arg args "to" ingest/export-format-ids nil)
         {:keys [parsed db]} (read-input (cond-> (select-keys args ["text" "bytes_base64" "currency" "date_order"])
                                           (get args "from") (assoc "format" (get args "from"))
                                           (get args "input_encoding") (assoc "encoding" (get args "input_encoding"))))]
@@ -365,7 +365,7 @@
                        "UTF-8 as text. Fields the format cannot hold are listed in notes. Pure: writes no file.")
     "inputSchema" {"type" "object"
                    "properties" {"ledger" ledger-schema
-                                 "format" {"type" "string" "enum" ingest/format-ids}
+                                 "format" {"type" "string" "enum" ingest/export-format-ids}
                                  "encoding" {"type" "string" "enum" enc/encodings
                                              "description" "Defaults per format (Shift_JIS for 弥生・MF・freee)."}
                                  "output_date_order" {"type" "string" "enum" common/date-orders
@@ -378,7 +378,7 @@
     "inputSchema" {"type" "object"
                    "properties" (merge input-schema
                                        {"from" {"type" "string" "enum" (vec (cons "auto" ingest/format-ids)) "default" "auto"}
-                                        "to" {"type" "string" "enum" ingest/format-ids}
+                                        "to" {"type" "string" "enum" ingest/export-format-ids}
                                         "input_encoding" {"type" "string" "enum" ["auto" "utf-8" "shift_jis"] "default" "auto"}
                                         "encoding" {"type" "string" "enum" enc/encodings}
                                         "currency" currency-schema

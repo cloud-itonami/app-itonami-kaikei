@@ -1,0 +1,5 @@
+*ContactName,EmailAddress,POAddressLine1,POAddressLine2,POAddressLine3,POAddressLine4,POCity,PORegion,POPostalCode,POCountry,*InvoiceNumber,Reference,*InvoiceDate,*DueDate,InventoryItemCode,*Description,*Quantity,*UnitAmount,Discount,*AccountCode,*TaxType,TaxAmount,TrackingName1,TrackingOption1,TrackingName2,TrackingOption2,Currency
+株式会社みなと,,,,,,,,,,INV-0201,11 月分,30/11/2026,31/12/2026,,保守作業,1,50000,,400,消費税 10%,5000,,,,,JPY
+,,,,,,,,,,INV-0201,,,,,打ち合わせの弁当,5,800,,400,軽減税率 8%,320,,,,,JPY
+合同会社かもめ,,,,,,,,,,INV-0202,,02/12/2026,31/12/2026,,デザイン,2,15000,10,400,消費税 10%,2700,,,,,JPY
+Example Ltd,,,,,,,,,,INV-0203,,05/12/2026,05/01/2027,,Consulting,1,100,,400,No VAT,,,,,,USD
