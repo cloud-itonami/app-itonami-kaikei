@@ -191,6 +191,22 @@
      :line-tax (apply merge {} (map :shares groups))
      :valid? (= 1 (core/invoice-buffer-valid? full-buf))}))
 
+;; ───────── 端数処理の向き ─────────
+
+(defn infer-rounding
+  "取り込み元が税率ごとの税額を書いている請求書に、その額を再現する端数処理の向き
+  （:floor → :half-up → :ceil の順に試す）を付ける。どれでも再現できなければ
+  default のまま（検査で差を出す）。丸めの向きは請求書ごとに任意（国税庁 Q&A
+  問 57）で、多くの形式は向きを書かないため。"
+  [inv default]
+  (if (seq (get-in inv [:stated :tax-by-rate]))
+    (or (first (for [r roundings
+                     :let [t (totals (assoc inv :rounding r))]
+                     :when (every? #(or (nil? (:stated-tax %)) (= (:stated-tax %) (:tax %))) (:groups t))]
+                 (assoc inv :rounding r)))
+        (assoc inv :rounding default))
+    (assoc inv :rounding default)))
+
 ;; ───────── 適格請求書の検査 ─────────
 
 (defn qualified?

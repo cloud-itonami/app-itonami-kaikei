@@ -50,17 +50,39 @@
 (defn invoice-code [line scheme]
   (when (= scheme (get-in line [:invoice :scheme])) (get-in line [:invoice :code])))
 
+(defn invoice-entry?
+  "請求書から起こした仕訳か（kaikei.invoice/post が origin に付ける）。"
+  [entry]
+  (= :invoice (get-in entry [:origin :format])))
+
+(defn export-tax-code
+  "日本の仕訳 CSV（MF・freee・弥生）に書く税区分。請求書から起こした仕訳の行は
+  「対象外」—— 消費税はもう仮受消費税・仮払消費税の行に分けてあるので、取り込み先が
+  科目の既定の税区分で税を計算し直して二重にしないため。ほかの行は tax-code。"
+  [entry line scheme]
+  (when line
+    (if (invoice-entry? entry) "対象外" (tax-code line scheme))))
+
+(defn invoice-entry-note
+  "請求書から起こした仕訳を日本の仕訳 CSV に書いたときの注記（無ければ nil）。"
+  [db]
+  (let [n (count (filter invoice-entry? (:entries db)))]
+    (when (pos? n)
+      (str "請求書から起こした仕訳 " n " 件は、すべての行の税区分を 対象外 と書きました"
+           "（消費税は仮受消費税・仮払消費税の行に分けてあります。取り込み先で税を計算し直させないため）"))))
+
 (defn lossy-note
-  "書き出しで落ちる項目の注記。fields は {:sub-account \"補助科目\" …}。"
+  "書き出しで落ちる項目の注記。fields は {:sub-account \"補助科目\" …}。請求書から
+  起こした仕訳の税区分・インボイス区分は export-tax-code が書くので数えない。"
   [db scheme fields]
-  (let [lines (for [e (:entries db), l (:lines e)] l)
+  (let [pairs (for [e (:entries db), l (:lines e)] [e l])
         dropped (for [[k label] fields
-                      :let [n (count (filter (fn [l]
+                      :let [n (count (filter (fn [[e l]]
                                                (case k
-                                                 :tax (and (:tax l) (not= scheme (get-in l [:tax :scheme])))
-                                                 :invoice (and (:invoice l) (not= scheme (get-in l [:invoice :scheme])))
+                                                 :tax (and (:tax l) (not (invoice-entry? e)) (not= scheme (get-in l [:tax :scheme])))
+                                                 :invoice (and (:invoice l) (not (invoice-entry? e)) (not= scheme (get-in l [:invoice :scheme])))
                                                  (some? (get l k))))
-                                             lines))]
+                                             pairs))]
                       :when (pos? n)]
                   (str label " " n " 行"))]
     (when (seq dropped)
@@ -159,3 +181,61 @@
         full ["January" "February" "March" "April" "May" "June" "July" "August" "September"
               "October" "November" "December"]]
     (str (parse-long d) " " (nth full (dec (parse-long m))) " " y)))
+
+;; ───────── 請求書（第 3 スライス、JUN-321） ─────────
+;;
+;; 請求書の取り込み結果は仕訳と別のキーを持つ（:entries は持たない —— :replace で
+;; 仕訳を消さないため。kaikei.core/merge-import）:
+;;
+;;   {:format :xero-invoices-json :currency "JPY"
+;;    :invoices [{…kaikei.invoice の値モデル…}]
+;;    :warnings ["…"] :rejected 0 :invoices-rejected 1 :invoices-skipped 2}
+
+(defn percent->rate
+  "税率の %（10、\"8\"、12.5、\"15.0000\"）→ basis points。読めない・範囲外は nil。"
+  [x]
+  (when (and (some? x) (not (text/blank? (str x))))
+    (let [{:keys [amount error]} (core/parse-amount x 2)]
+      (when (and (not error) (<= 0 amount 10000)) amount))))
+
+(defn rate->percent
+  "basis points → % の 10 進の文字列（1000 → \"10\"、1250 → \"12.5\"）。"
+  [rate]
+  (if (zero? (mod rate 100))
+    (str (quot rate 100))
+    (text/replace (core/format-amount rate 2) #"0+$" "")))
+
+(defn stated-tax-by-rate
+  "行と、行ごとに書かれていた税額 → :stated の :tax-by-rate（税率の区分ごとの和）。
+  税額の無い行だけの区分は入れない。"
+  [lines taxes]
+  (let [groups (reduce (fn [acc [l t]]
+                         (if (nil? t)
+                           acc
+                           (let [category (:category l :taxable)
+                                 k (if (= :taxable category) [(:rate l) (boolean (:reduced? l))] [0 category])]
+                             (update acc k (fnil + 0) t))))
+                       (array-map)
+                       (map vector lines taxes))]
+    (vec (for [[[rate x] tax] groups]
+           (if (keyword? x)
+             {:category x :rate 0 :tax tax}
+             (cond-> {:rate rate :tax tax} x (assoc :reduced? true)))))))
+
+(defn finish-invoices
+  "請求書の候補（{:invoice …}・{:problem …}・{:skip \"理由\"}）の列 → 取り込み結果の
+  一部。:skip は取り込まない種類（クレジットノートなど）で、理由ごとに数えて
+  警告にする。"
+  [candidates]
+  (let [skips (frequencies (keep :skip candidates))]
+    {:invoices (vec (keep :invoice candidates))
+     :warnings (vec (concat (keep :problem candidates)
+                            (for [[reason n] (sort-by key skips)] (str reason "（" n " 件）を取り込んでいません"))))
+     :rejected 0
+     :invoices-rejected (count (filter :problem candidates))
+     :invoices-skipped (reduce + 0 (vals skips))}))
+
+(defn currency-of
+  "請求書の通貨の列 → 帳簿の通貨（いちばん多いもの。無ければ fallback）。"
+  [codes fallback]
+  (or (some->> (remove nil? codes) frequencies (sort-by (comp - val)) ffirst) fallback))

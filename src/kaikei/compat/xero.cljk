@@ -155,7 +155,10 @@
                        :lines (mapv :line parts)
                        :origin (cond-> {:format :xero-json}
                                  (get j "JournalID") (assoc :id (get j "JournalID"))
-                                 (get j "SourceType") (assoc :source-type (get j "SourceType")))}
+                                 (get j "SourceType") (assoc :source-type (get j "SourceType"))
+                                 ;; 請求書（Invoices の InvoiceID）と同じ id。kaikei.invoice が二重の
+                                 ;; 計上を避けるのに使う
+                                 (get j "SourceID") (assoc :source-id (get j "SourceID")))}
                 (get j "JournalNumber") (assoc :number (str (get j "JournalNumber")))
                 (common/blank->nil (get j "Reference")) (assoc :memo (text/trim (get j "Reference"))))})))
 

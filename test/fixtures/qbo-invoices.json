@@ -1,0 +1,256 @@
+{
+  "QueryResponse": {
+    "Invoice": [
+      {
+        "Id": "130",
+        "SyncToken": "0",
+        "domain": "QBO",
+        "DocNumber": "1037",
+        "TxnDate": "2026-10-31",
+        "DueDate": "2026-11-30",
+        "CustomerRef": {
+          "value": "3",
+          "name": "株式会社みなと"
+        },
+        "CurrencyRef": {
+          "value": "JPY",
+          "name": "Japanese Yen"
+        },
+        "GlobalTaxCalculation": "TaxExcluded",
+        "CustomerMemo": {
+          "value": "10 月分"
+        },
+        "Line": [
+          {
+            "Id": "1",
+            "LineNum": 1,
+            "Description": "ウェブサイトの保守（10 月分）",
+            "Amount": 50000,
+            "DetailType": "SalesItemLineDetail",
+            "SalesItemLineDetail": {
+              "ItemRef": {
+                "value": "1",
+                "name": "保守"
+              },
+              "UnitPrice": 50000,
+              "Qty": 1,
+              "ItemAccountRef": {
+                "value": "79",
+                "name": "売上高"
+              },
+              "TaxCodeRef": {
+                "value": "4"
+              }
+            }
+          },
+          {
+            "Id": "2",
+            "LineNum": 2,
+            "Description": "打ち合わせの弁当",
+            "Amount": 4000,
+            "DetailType": "SalesItemLineDetail",
+            "SalesItemLineDetail": {
+              "ItemRef": {
+                "value": "2",
+                "name": "弁当"
+              },
+              "UnitPrice": 800,
+              "Qty": 5,
+              "ItemAccountRef": {
+                "value": "79",
+                "name": "売上高"
+              },
+              "TaxCodeRef": {
+                "value": "5"
+              }
+            }
+          },
+          {
+            "Amount": 54000,
+            "DetailType": "SubTotalLineDetail",
+            "SubTotalLineDetail": {}
+          }
+        ],
+        "TxnTaxDetail": {
+          "TotalTax": 5320,
+          "TaxLine": [
+            {
+              "Amount": 5000,
+              "DetailType": "TaxLineDetail",
+              "TaxLineDetail": {
+                "TaxRateRef": {
+                  "value": "10"
+                },
+                "PercentBased": true,
+                "TaxPercent": 10,
+                "NetAmountTaxable": 50000
+              }
+            },
+            {
+              "Amount": 320,
+              "DetailType": "TaxLineDetail",
+              "TaxLineDetail": {
+                "TaxRateRef": {
+                  "value": "11"
+                },
+                "PercentBased": true,
+                "TaxPercent": 8,
+                "NetAmountTaxable": 4000
+              }
+            }
+          ]
+        },
+        "TotalAmt": 59320,
+        "Balance": 59320
+      },
+      {
+        "Id": "131",
+        "DocNumber": "1038",
+        "TxnDate": "2026-11-02",
+        "PrivateNote": "Voided",
+        "CustomerRef": {
+          "value": "4",
+          "name": "合同会社かもめ"
+        },
+        "CurrencyRef": {
+          "value": "JPY"
+        },
+        "GlobalTaxCalculation": "TaxExcluded",
+        "Line": [
+          {
+            "Id": "1",
+            "Amount": 0,
+            "DetailType": "SalesItemLineDetail",
+            "SalesItemLineDetail": {
+              "Qty": 0,
+              "UnitPrice": 0,
+              "TaxCodeRef": {
+                "value": "4"
+              }
+            }
+          }
+        ],
+        "TxnTaxDetail": {
+          "TotalTax": 0
+        },
+        "TotalAmt": 0,
+        "Balance": 0
+      },
+      {
+        "Id": "132",
+        "DocNumber": "1039",
+        "TxnDate": "2026-11-03",
+        "CustomerRef": {
+          "value": "5",
+          "name": "Amy's Bird Sanctuary"
+        },
+        "CurrencyRef": {
+          "value": "JPY"
+        },
+        "Line": [
+          {
+            "Id": "1",
+            "Amount": 100,
+            "DetailType": "SalesItemLineDetail",
+            "SalesItemLineDetail": {
+              "TaxCodeRef": {
+                "value": "TAX"
+              }
+            }
+          }
+        ],
+        "TxnTaxDetail": {
+          "TxnTaxCodeRef": {
+            "value": "2"
+          },
+          "TotalTax": 9,
+          "TaxLine": [
+            {
+              "Amount": 7,
+              "DetailType": "TaxLineDetail",
+              "TaxLineDetail": {
+                "TaxRateRef": {
+                  "value": "3"
+                },
+                "PercentBased": true,
+                "TaxPercent": 7.1,
+                "NetAmountTaxable": 100
+              }
+            },
+            {
+              "Amount": 2,
+              "DetailType": "TaxLineDetail",
+              "TaxLineDetail": {
+                "TaxRateRef": {
+                  "value": "4"
+                },
+                "PercentBased": true,
+                "TaxPercent": 2,
+                "NetAmountTaxable": 100
+              }
+            }
+          ]
+        },
+        "TotalAmt": 109,
+        "Balance": 109
+      }
+    ],
+    "Bill": [
+      {
+        "Id": "201",
+        "DocNumber": "A-102",
+        "TxnDate": "2026-10-20",
+        "DueDate": "2026-11-30",
+        "VendorRef": {
+          "value": "56",
+          "name": "やまだ文具"
+        },
+        "APAccountRef": {
+          "value": "33",
+          "name": "買掛金"
+        },
+        "CurrencyRef": {
+          "value": "JPY"
+        },
+        "GlobalTaxCalculation": "TaxExcluded",
+        "Line": [
+          {
+            "Id": "1",
+            "Description": "コピー用紙",
+            "Amount": 3300,
+            "DetailType": "AccountBasedExpenseLineDetail",
+            "AccountBasedExpenseLineDetail": {
+              "AccountRef": {
+                "value": "7",
+                "name": "消耗品費"
+              },
+              "TaxCodeRef": {
+                "value": "6"
+              },
+              "BillableStatus": "NotBillable"
+            }
+          }
+        ],
+        "TxnTaxDetail": {
+          "TotalTax": 330,
+          "TaxLine": [
+            {
+              "Amount": 330,
+              "DetailType": "TaxLineDetail",
+              "TaxLineDetail": {
+                "TaxPercent": 10,
+                "NetAmountTaxable": 3300,
+                "PercentBased": true
+              }
+            }
+          ]
+        },
+        "TotalAmt": 3630,
+        "Balance": 0
+      }
+    ],
+    "startPosition": 1,
+    "maxResults": 4
+  },
+  "time": "2026-11-20T10:00:00.000-08:00"
+}

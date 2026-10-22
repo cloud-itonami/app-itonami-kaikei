@@ -12,6 +12,8 @@
             [kaikei.compat.native :as native]
             [kaikei.compat.xero :as xero]
             [kaikei.compat.qbo :as qbo]
+            [kaikei.compat.xero-invoices :as xero-invoices]
+            [kaikei.compat.qbo-invoices :as qbo-invoices]
             [kaikei.compat.yayoi :as yayoi]
             [kaikei.compat.mf :as mf]
             [kaikei.compat.freee :as freee]))
@@ -29,7 +31,20 @@
     "freee" (freee/write db)
     "qbo-csv" (qbo/write-csv db (cond-> {} date-order (assoc :date-order date-order)))
     "xero-csv" (xero/write-csv db (cond-> {} date-order (assoc :date-order date-order)))
+    "xero-invoices-json" (xero-invoices/write db)
+    "qbo-invoices-json" (qbo-invoices/write db)
     {:error (str "知らない形式です: " format-id)}))
+
+(defn- content-note
+  "形式に入らない中身（仕訳の形式に請求書、請求書の形式に仕訳）の注記。"
+  [db fmt]
+  (case (:content fmt)
+    :journal (when (seq (:invoices db))
+               (str "請求書 " (count (:invoices db)) " 件はこの形式に入りません（請求書の形式か kaikei 帳簿 JSON で書き出してください）。"
+                    "計上した請求書の仕訳は書き出しています"))
+    :invoices (when (seq (:entries db))
+                (str "仕訳 " (count (:entries db)) " 件はこの形式に入りません（請求書だけを書き出します）"))
+    nil))
 
 (defn export
   "db → 書き出し。opts: :encoding（省けば形式の既定。弥生・MF・freee は
@@ -49,7 +64,8 @@
            {:error (str (ingest/encoding-label encoding) " に無い文字があるので書き出しません: "
                         (text/join " " (take 10 (:chars encoded)))
                         "（UTF-8 を選ぶか、元の文字を直してください）")}
-           {:text text :bytes bytes :encoding encoding :notes (vec (remove nil? notes))
+           {:text text :bytes bytes :encoding encoding
+            :notes (vec (remove nil? (cons (content-note db fmt) notes)))
             :filename (:file fmt "kaikei.txt")
             :mime (str (:mime fmt "text/plain") "; charset=" (if (= encoding "shift_jis") "Shift_JIS" "UTF-8"))}))))))
 

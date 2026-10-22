@@ -611,9 +611,12 @@
    (reduce + 0 (map #(:amount % 0) (:lines inv)))])
 
 (defn- merge-invoices
-  "請求書を合流する。戻りは [db 元の id → 帳簿の id の表 追加した数 重複の数]。"
-  [db invoices]
-  (let [first-id (inc (reduce max 0 (map invoice-number (:invoices db))))
+  "請求書を合流する。戻りは [db 元の id → 帳簿の id の表 追加した数 重複の数]。
+  id は used（入れ替える前の請求書も含めて、使ったことのある id）の次から振る
+  —— 入れ替えた請求書の id を使い回すと、残った仕訳の :invoice-id が別の請求書を
+  指してしまうため。"
+  [db invoices used]
+  (let [first-id (inc (reduce max 0 (map invoice-number (concat (:invoices db) used))))
         [d m added dup _]
         (reduce (fn [[d m added dup seen] inv]
                   (let [fp (invoice-fingerprint inv)
@@ -630,8 +633,9 @@
 (defn merge-import
   "取り込み結果（{:currency :accounts [{:name …}] :entries […] :invoices […]}）を
   db に合流する。mode は :append（既定。同じ日付・同じ行の仕訳、同じ請求書は
-  重複として飛ばす）か :replace（仕訳と勘定科目を入れ替える。ただし画面で付けた
-  区分は残す。請求書は、取り込み結果が :invoices を持つときだけ入れ替える）。
+  重複として飛ばす）か :replace（取り込み結果が持つものを入れ替える。:entries が
+  あれば仕訳と勘定科目 —— ただし画面で付けた区分は残す。:invoices があれば
+  請求書）。
 
   行の :account-code（Xero の CSV のように勘定科目のコードしか無い形式が付ける）は、
   帳簿の勘定科目のコード（:code・:xero :code）で名前に引き直す。
@@ -641,26 +645,26 @@
   :invoice-id は外す。:business・:invoice-settings は、帳簿に無ければ取り込み
   結果のものを使う（:replace では取り込み結果のものが勝つ）。
 
-  通貨が違う帳簿へは合流しない（1 帳簿 1 通貨）。:replace で通貨が変わるとき、
-  残せなかった請求書の数を :invoices-dropped に返す。戻りは
+  通貨が違う帳簿へは合流しない（1 帳簿 1 通貨）。:replace で仕訳を入れ替えて
+  通貨が変わるとき、残せなかった請求書の数を :invoices-dropped に返す。戻りは
   {:db :added :duplicates :invoices-added :invoices-duplicates :invoices-dropped :error}。"
   ([db parsed] (merge-import db parsed :append))
   ([db parsed mode]
    (let [currency (or (:currency parsed) (:currency db))
          replace? (= mode :replace)
-         ;; :replace で取り込み結果が請求書を持たないとき、帳簿の請求書は残す。
-         ;; ただし通貨が変わるなら残せない（1 帳簿 1 通貨）ので落とし、数を返す。
-         keep-invoices? (and replace? (not (contains? parsed :invoices)) (= currency (:currency db)))
-         dropped (if (and replace? (not keep-invoices?) (not (contains? parsed :invoices)))
-                   (count (:invoices db))
+         ;; :replace は取り込み結果が持つものだけを入れ替える: :entries があれば
+         ;; 仕訳と勘定科目（画面で付けた区分は残す）、:invoices があれば請求書
+         replace-entries? (and replace? (contains? parsed :entries))
+         replace-invoices? (and replace? (contains? parsed :invoices))
+         base (cond-> db
+                replace-entries? (assoc :entries []
+                                        :accounts (into {} (filter #(= :user (:class-source (val %))) (:accounts db))))
+                replace-invoices? (assoc :invoices []))
+         ;; 仕訳を入れ替えて通貨が変わるとき、残る請求書は残せない（1 帳簿 1 通貨）
+         dropped (if (and replace-entries? (not= currency (:currency db)))
+                   (count (:invoices base))
                    0)
-         base (if replace?
-                (cond-> (assoc empty-db
-                               :accounts (into {} (filter #(= :user (:class-source (val %))) (:accounts db))))
-                  keep-invoices? (assoc :invoices (vec (:invoices db)))
-                  (:business db) (assoc :business (:business db))
-                  (:invoice-settings db) (assoc :invoice-settings (:invoice-settings db)))
-                db)]
+         base (cond-> base (pos? dropped) (assoc :invoices []))]
      (if (and (or (seq (:entries base)) (seq (:invoices base))) (not= currency (:currency base)))
        {:db db :added 0 :duplicates 0 :invoices-added 0 :invoices-duplicates 0
         :error (str "帳簿の通貨は " (:currency base) " です。" currency " の仕訳・請求書は合流しません（1 帳簿 1 通貨）。")}
@@ -669,7 +673,7 @@
                     (assoc :business (:business parsed))
                     (and (:invoice-settings parsed) (or replace? (nil? (:invoice-settings base))))
                     (assoc :invoice-settings (:invoice-settings parsed)))
-             [base invoice-ids inv-added inv-dup] (merge-invoices base (:invoices parsed))
+             [base invoice-ids inv-added inv-dup] (merge-invoices base (:invoices parsed) (:invoices db))
              with-accounts (reduce (fn [d a] (ensure-account d (:name a) (dissoc a :name)))
                                    base (:accounts parsed))
              by-code (into {} (for [[n a] (:accounts with-accounts)

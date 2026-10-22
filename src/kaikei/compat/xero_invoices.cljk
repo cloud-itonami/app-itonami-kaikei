@@ -1,0 +1,267 @@
+(ns kaikei.compat.xero-invoices
+  "Xero Accounting API の Invoices（売上の請求書 ACCREC・受け取った請求書 ACCPAY）の
+  JSON。形の正本は XeroAPI/Xero-OpenAPI（MIT）master 5a115f3 の
+  xero_accounting.yaml（Invoice L22386、LineItem L20731、TaxRate L25200）と、
+  Xero の developer docs の invoices・「Rounding in Xero」（2026-10-22 に読んだ）:
+
+  - `Type` は ACCREC（売上）・ACCPAY（仕入）。ほかの Type（クレジットノート・前受・
+    過払い）は数えて飛ばす。
+  - `LineAmountTypes` は Exclusive（LineAmount は税抜）・Inclusive（税込）・NoTax。
+  - `LineItems[].LineAmount` = Quantity × UnitAmount（値引き後）。`TaxAmount` は
+    行ごと。Xero は行ごとに 2 桁で丸めて足す —— 日本の「1 請求書・税率ごとに 1 回」
+    （基通 1-8-15）と違うので、取り込んだ売上の請求書は検査で差を出す。
+  - `TaxType` は組織ごとの税コード（OUTPUT2・TAX001 など）。税率は TaxRates の
+    `EffectiveRate`（%、4 桁）にある。同じ JSON に `TaxRates`（GET /TaxRates の
+    応答）があれば引く。無ければ NONE（税なし）・EXEMPT…（非課税）・ZERORATED…
+    （免税）だけを区分し、ほかは税率不明にする（推測しない）。
+  - `Status`: DRAFT・SUBMITTED（承認待ち。仕訳は無い）→ 下書き、AUTHORISED → 発行
+    済み、PAID → 入金・支払済み、VOIDED・DELETED → 取消。
+  - `Date`・`DueDate` は応答では MS date（/Date(…)/）、書くときは YYYY-MM-DD。
+  - `CurrencyCode` は請求書ごと。いちばん多い通貨を帳簿の通貨にし、違う通貨の
+    請求書は飛ばす（1 帳簿 1 通貨）。`Accounts` が同じ JSON にあれば AccountCode を
+    勘定科目名に引く。
+
+  ## 書き出し
+
+  {\"Invoices\": […], \"TaxRates\": […]}（Invoices は PUT /Invoices の本文の形）。
+  TaxAmount には、kaikei の税率ごとに 1 回の端数処理の税額を行に割り当てた額
+  （guest の tax-share）を書く（Xero は TaxAmount の上書きを許す。L20767）。
+  TaxType は Xero から来た行はそのまま、ほかの行は kaikei の仮のコード
+  （KAIKEI-10・KAIKEI-8-REDUCED・KAIKEI-EXEMPT など）を書き、TaxRates に税率を
+  添える —— 読み戻すと同じ税率に戻る。Xero に入れる前に、組織の TaxType に
+  置き換える（注記に出す）。登録番号の受け皿は無い。取消の請求書は書き出さない
+  （Xero では作れない）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.invoice :as invoice]
+            [kaikei.json :as json]
+            [kaikei.compat.common :as common]))
+
+(def ^:private type->kind {"ACCREC" :sales "ACCPAY" :purchase})
+(def ^:private kind->type {:sales "ACCREC" :purchase "ACCPAY"})
+
+(def ^:private status->kaikei
+  {"DRAFT" :draft "SUBMITTED" :draft "AUTHORISED" :issued "PAID" :paid "VOIDED" :void "DELETED" :void})
+
+(def ^:private kaikei->status {:draft "DRAFT" :issued "AUTHORISED" :paid "AUTHORISED"})
+
+(def ^:private line-amount-types {"Exclusive" :exclusive "Inclusive" :inclusive "NoTax" :none})
+(def ^:private kaikei->line-amount-types {:exclusive "Exclusive" :inclusive "Inclusive" :none "NoTax"})
+
+(defn detect? [data] (and (map? data) (sequential? (get data "Invoices"))))
+
+;; ───────── 取り込み ─────────
+
+(defn- tax-rate-index [data]
+  (into {} (for [r (get data "TaxRates" [])
+                 :when (map? r)
+                 :let [t (get r "TaxType")]
+                 :when t]
+             [t (common/percent->rate (or (get r "EffectiveRate") (get r "DisplayTaxRate")))])))
+
+(defn- system-category [tax-type]
+  (cond
+    (= tax-type "NONE") :out-of-scope
+    (text/starts-with? (str tax-type) "EXEMPT") :exempt
+    (text/starts-with? (str tax-type) "ZERORATED") :zero-rated
+    :else nil))
+
+(def ^:private pseudo-categories
+  {"ZERO-RATED" :zero-rated "EXEMPT" :exempt "OUT-OF-SCOPE" :out-of-scope})
+
+(defn- pseudo-tax-type
+  "kaikei の仮の TaxType（KAIKEI-10、KAIKEI-8-REDUCED、KAIKEI-EXEMPT …）。税率が
+  分からない行は nil。"
+  [l]
+  (let [category (:category l :taxable)]
+    (cond
+      (not= :taxable category) (str "KAIKEI-" (some (fn [[k v]] (when (= v category) k)) pseudo-categories))
+      (:rate l) (str "KAIKEI-" (common/rate->percent (:rate l)) (when (:reduced? l) "-REDUCED"))
+      :else nil)))
+
+(defn- read-pseudo-tax-type
+  "KAIKEI-… → {:category … :rate … :reduced? …}（違う形なら nil）。"
+  [tax-type]
+  (when-let [[_ body reduced] (some->> tax-type (text/re-matches #"KAIKEI-(.+?)(-REDUCED)?"))]
+    (if-let [category (pseudo-categories body)]
+      {:category category :rate 0}
+      (when-let [rate (common/percent->rate body)]
+        (cond-> {:category :taxable :rate rate} reduced (assoc :reduced? true))))))
+
+(defn- decimal-text [x]
+  (when (and (some? x) (not (text/blank? (str x)))) (str x)))
+
+(defn- read-line-item [{:keys [rates accounts exp mode]} where l]
+  (let [tax-type (common/blank->nil (get l "TaxType"))
+        qty (decimal-text (get l "Quantity"))
+        unit (decimal-text (get l "UnitAmount"))
+        {:keys [amount problem]}
+        (if (some? (get l "LineAmount"))
+          (common/read-amount (get l "LineAmount") exp (str where " LineAmount"))
+          (if unit
+            (let [{:keys [amount error]} (invoice/line-amount qty unit exp :half-up)]
+              (if error {:problem (str where ": Quantity × UnitAmount を読めません")} {:amount amount}))
+            {:amount 0}))
+        tax (when (some? (get l "TaxAmount"))
+              (common/read-amount (get l "TaxAmount") exp (str where " TaxAmount")))
+        code (common/blank->nil (get l "AccountCode"))
+        pseudo (read-pseudo-tax-type tax-type)
+        rate (or (:rate pseudo) (get rates tax-type))
+        category (cond
+                   (= mode :none) :out-of-scope
+                   pseudo (:category pseudo)
+                   rate :taxable
+                   :else (or (system-category tax-type) :taxable))]
+    (cond
+      problem {:problem problem}
+      (:problem tax) {:problem (:problem tax)}
+      :else
+      {:line (cond-> {:description (str (get l "Description" ""))
+                      :amount amount
+                      :category category}
+               (= category :taxable) (assoc :rate rate)
+               (not= category :taxable) (assoc :rate 0)
+               qty (assoc :quantity qty)
+               unit (assoc :unit-price unit)
+               (:reduced? pseudo) (assoc :reduced? true)
+               code (assoc :account (get accounts code code) :account-code code)
+               (and tax-type (not pseudo)) (assoc :tax {:scheme :xero :code tax-type}))
+       :tax (:amount tax)
+       :rate-unknown? (and (= category :taxable) (nil? rate))})))
+
+(defn- read-invoice [{:keys [currency exp] :as ctx} i inv]
+  (let [type (get inv "Type")
+        kind (type->kind type)
+        where (str "Invoice " (or (common/blank->nil (get inv "InvoiceNumber")) (inc i)))
+        code (get inv "CurrencyCode")]
+    (cond
+      (not (map? inv)) {:problem (str "Invoice " (inc i) ": オブジェクトではありません")}
+      (nil? kind) {:skip (str "Type が " (or type "空") " の請求書（ACCREC・ACCPAY 以外）")}
+      (and code (not= code currency)) {:skip (str "帳簿と違う通貨（" code "）の請求書")}
+      :else
+      (let [mode (get line-amount-types (get inv "LineAmountTypes") :exclusive)
+            ctx (assoc ctx :mode mode)
+            parts (map-indexed (fn [j l] (read-line-item ctx (str where " 行 " (inc j)) l))
+                               (filter map? (get inv "LineItems" [])))
+            p (common/first-problem parts)
+            date (core/parse-date (get inv "Date"))
+            lines (mapv :line parts)
+            taxes (mapv :tax parts)
+            money (fn [k] (when (some? (get inv k)) (:amount (core/parse-amount (get inv k) exp))))]
+        (cond
+          p {:problem (:problem p)}
+          (nil? date) {:problem (str where ": 日付 \"" (get inv "Date") "\" を読めません")}
+          :else
+          {:invoice (invoice/infer-rounding
+                     (cond-> {:kind kind
+                             :number (str (get inv "InvoiceNumber" ""))
+                             :date date
+                             :status (get status->kaikei (get inv "Status") :draft)
+                             :partner {:name (str (get-in inv ["Contact" "Name"] ""))}
+                             :tax-mode mode
+                             :rounding :half-up
+                             :lines lines
+                             :origin (cond-> {:format :xero-invoices-json :type type}
+                                       (get inv "InvoiceID") (assoc :id (get inv "InvoiceID")))}
+                      (core/parse-date (get inv "DueDate")) (assoc :due-date (core/parse-date (get inv "DueDate")))
+                      (and (= kind :sales) (common/blank->nil (get inv "Reference")))
+                      (assoc :subject (text/trim (get inv "Reference")))
+                      (some some? taxes)
+                      (assoc :stated (cond-> {:tax-by-rate (common/stated-tax-by-rate lines taxes)}
+                                       (money "TotalTax") (assoc :tax (money "TotalTax"))
+                                       (money "Total") (assoc :total (money "Total"))))
+                      (money "AmountPaid") (assoc :amount-paid (money "AmountPaid"))
+                      (money "AmountDue") (assoc :amount-due (money "AmountDue")))
+                     :half-up)
+           :rate-unknown? (some :rate-unknown? parts)})))))
+
+(defn read-data
+  "構文解析済みの JSON → 請求書の取り込み結果。通貨は請求書の CurrencyCode
+  （いちばん多いもの）、無ければ opts の :currency（既定 JPY）。"
+  [data {:keys [currency] :or {currency "JPY"}}]
+  (let [invoices (get data "Invoices" [])
+        currency (common/currency-of (map #(when (map? %) (get % "CurrencyCode")) invoices) currency)
+        exp (core/exponent currency)
+        accounts (into {} (for [a (get data "Accounts" []) :when (map? a) :when (get a "Code")]
+                            [(get a "Code") (or (common/blank->nil (get a "Name")) (get a "Code"))]))]
+    (if-not exp
+      {:format :xero-invoices-json :invoices [] :rejected 0
+       :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      (let [candidates (map-indexed (partial read-invoice {:currency currency :exp exp
+                                                           :rates (tax-rate-index data) :accounts accounts})
+                                    invoices)
+            unknown (count (filter :rate-unknown? candidates))]
+        (-> (merge {:format :xero-invoices-json :currency currency} (common/finish-invoices candidates))
+            (update :warnings into
+                    (when (pos? unknown)
+                      [(str "税率の分からない明細のある請求書が " unknown " 件あります。TaxType の税率は TaxRates にあります"
+                            "（GET /TaxRates の応答の TaxRates を同じ JSON に入れると引けます）")])))))))
+
+;; ───────── 書き出し ─────────
+
+(defn- decimal-string? [s] (boolean (and s (text/re-matches #"-?\d+(\.\d+)?" (str s)))))
+
+(defn- line-out [db exp money inv t i l]
+  (let [code (or (:account-code l)
+                 (get-in db [:accounts (:account l) :xero :code])
+                 (get-in db [:accounts (:account l) :code]))
+        tax-type (or (common/tax-code l :xero) (pseudo-tax-type l))]
+    (json/ordered
+     [["Description" (:description l)]
+      ["Quantity" (when (decimal-string? (:quantity l)) (json/decimal (:quantity l)))]
+      ["UnitAmount" (when (decimal-string? (:unit-price l)) (json/decimal (:unit-price l)))]
+      ["AccountCode" code]
+      ["TaxType" tax-type]
+      ["TaxAmount" (when-not (= :none (:tax-mode inv)) (money (get (:line-tax t) i 0)))]
+      ["LineAmount" (money (:amount l 0))]])))
+
+(defn data
+  "db → {\"Invoices\": […], \"TaxRates\": […]}。戻りは {:value :notes}。"
+  [db]
+  (let [exp (core/exponent (:currency db))
+        money #(json/decimal (core/format-amount % exp))
+        invoices (remove #(= :void (:status %)) (:invoices db))
+        voids (- (count (:invoices db)) (count invoices))
+        all-lines (mapcat :lines invoices)
+        pseudo (count (filter #(and (nil? (common/tax-code % :xero)) (pseudo-tax-type %)) all-lines))
+        no-rate (count (filter #(and (nil? (common/tax-code % :xero)) (nil? (pseudo-tax-type %))) all-lines))
+        rates (into (sorted-map) (for [l all-lines
+                                       :let [t (or (common/tax-code l :xero) (pseudo-tax-type l))]
+                                       :when (and t (:rate l))]
+                                   [t (:rate l)]))
+        value (json/ordered
+               [["Invoices"
+                 (vec (for [inv invoices
+                            :let [t (invoice/totals inv)]]
+                        (json/ordered
+                         [["Type" (kind->type (:kind inv))]
+                          ["InvoiceID" (when (= :xero-invoices-json (get-in inv [:origin :format])) (get-in inv [:origin :id]))]
+                          ["InvoiceNumber" (:number inv)]
+                          ["Reference" (when (= :sales (:kind inv)) (:subject inv))]
+                          ["Contact" (json/ordered [["Name" (get-in inv [:partner :name])]])]
+                          ["Date" (:date inv)]
+                          ["DueDate" (:due-date inv)]
+                          ["Status" (kaikei->status (:status inv))]
+                          ["LineAmountTypes" (kaikei->line-amount-types (:tax-mode inv) "Exclusive")]
+                          ["CurrencyCode" (:currency db)]
+                          ["LineItems" (vec (map-indexed (fn [i l] (line-out db exp money inv t i l)) (:lines inv)))]])))]
+                ["TaxRates" (when (seq rates)
+                              (vec (for [[tax-type rate] rates]
+                                     (json/ordered [["TaxType" tax-type]
+                                                    ["EffectiveRate" (json/decimal (common/rate->percent rate))]]))))]])]
+    {:value value
+     :notes (cond-> ["Xero の請求書には登録番号の受け皿がありません（自社・取引先とも）"]
+              (pos? pseudo)
+              (conj (str "Xero から来ていない明細 " pseudo " 行の TaxType は kaikei の仮のコード（KAIKEI-10 など）です。"
+                         "Xero に入れる前に、組織の TaxType に置き換えてください。"
+                         "TaxAmount には、kaikei の「1 請求書・税率ごとに 1 回」の税額を行に割り当てた額を書いています"))
+              (pos? no-rate)
+              (conj (str "税率の分からない明細 " no-rate " 行は TaxType を書いていません"))
+              (some #(= :paid (:status %)) invoices)
+              (conj "入金・支払済みの請求書は AUTHORISED と書きました（Xero では支払いを別に登録します）")
+              (pos? voids)
+              (conj (str "取消の請求書 " voids " 件は書き出していません（Xero では取消の請求書を作れません）")))}))
+
+(defn write [db]
+  (let [{:keys [value notes]} (data db)]
+    {:text (str (json/write value) "\n") :notes notes}))
