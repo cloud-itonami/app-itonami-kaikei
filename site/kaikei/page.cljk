@@ -1,0 +1,98 @@
+(ns kaikei.page
+  "itonami.cloud/sites/app/kaikei/ のページの殻（SSR）。
+
+  UI は DADS（デジタル庁デザインシステム、`kotoba-lang/jp-go-digital-design-system`）
+  の class と、下の app-css だけで作る —— app org の他の道具（mihari・dandori）と
+  同じ design system に載せる。
+
+  ## このページは何も送信しない
+
+  仕訳には取引先・金額・摘要など、事業の内部情報が入る。**入力は 1 バイトも
+  ネットワークに出ない** —— サーバも fetch も無く、保存はこの端末の
+  IndexedDB（使えなければ localStorage）だけ。外部リクエストもゼロにしてある: DADS の CSS は inline、
+  React / scittle は同一オリジンに vendor（site/vendor/PROVENANCE.edn）。
+
+  ## 本文は view と同じ関数
+
+  `<div id=\"app\">` の中身は `kaikei.view/root` を空の状態で描いたもの。
+  ブラウザでは site/app.cljk が同じ関数を Reagent で描き直す。"
+  (:require [jp-go-dds.page :as dds-page]
+            [kaikei.core :as core]
+            [kaikei.view :as view]))
+
+(def ^:private site-title "kaikei — 会計帳簿（MF・freee・弥生・QuickBooks・Xero 互換）")
+
+(def ^:private site-description
+  "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作ります。データは送信されません。")
+
+(def app-css
+  "DADS の上に載せる配置だけ。色は DADS の custom property から引く。"
+  ".kk-app{max-width:80rem;margin:0 auto;padding:1.5rem 1rem 3rem;}
+.kk-title{font-size:1.75rem;font-weight:700;margin:0;}
+.kk-title-sub{font-size:1rem;font-weight:400;margin-left:.5rem;color:var(--color-neutral-solid-gray-600,#666);}
+.kk-lead,.kk-help{color:var(--color-neutral-solid-gray-700,#555);line-height:1.7;}
+.kk-h2{font-size:1.125rem;font-weight:700;margin:0 0 .5rem;}
+.kk-h3{font-size:1rem;font-weight:700;margin:1rem 0 .5rem;}
+.kk-toolbar{display:flex;flex-wrap:wrap;gap:.75rem 1.5rem;align-items:center;margin:1rem 0;padding:.75rem 0;border-block:1px solid var(--color-neutral-solid-gray-200,#ddd);}
+.kk-toolbar-group,.kk-actions,.kk-confirm,.kk-tabs{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;max-width:100%;min-width:0;}
+.kk-app .dads-select,.kk-app .dads-select__control,.kk-app .dads-select__select{max-width:100%;min-width:0;}
+.kk-app .dads-form-control-label,.kk-app .dads-form-control-label>div{max-width:100%;min-width:0;}
+.kk-tabs{margin:1rem 0;}
+.kk-inline-label{font-weight:700;}
+.kk-panel,.kk-result,.kk-empty,.kk-report,.kk-checks{border:1px solid var(--color-neutral-solid-gray-200,#ddd);border-radius:.5rem;padding:1rem;margin:1rem 0;background:var(--color-neutral-white,#fff);}
+.kk-result--error,.kk-checks--warn{border-color:var(--color-primitive-orange-600,#c60);}
+.kk-checks ul,.kk-notes{margin:0;padding-left:1.25rem;line-height:1.8;}
+.kk-checks p{margin:0;}
+.kk-warnings{color:var(--color-primitive-red-800,#b00);}
+.kk-settings,.kk-period{display:flex;flex-wrap:wrap;gap:1rem;align-items:end;margin:.75rem 0;}
+.kk-panel .dads-textarea{width:100%;}
+.kk-report-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:.5rem 1rem;}
+.kk-table-wrap{overflow-x:auto;max-width:100%;}
+.kk-table{width:100%;border-collapse:collapse;font-size:.875rem;}
+.kk-table th,.kk-table td{padding:.375rem .5rem;border-bottom:1px solid var(--color-neutral-solid-gray-100,#eee);text-align:left;vertical-align:top;}
+.kk-table thead th{font-weight:700;border-bottom-width:2px;white-space:nowrap;}
+.kk-table tbody th{font-weight:400;}
+.kk-table tfoot th,.kk-table tfoot td,.kk-stage th,.kk-stage td{font-weight:700;border-top:2px solid var(--color-neutral-solid-gray-200,#ddd);}
+.kk-num{text-align:right !important;font-variant-numeric:tabular-nums;white-space:nowrap;}
+.kk-section th{font-weight:700 !important;background:var(--color-neutral-solid-gray-50,#f7f7f7);}
+.kk-subtotal th,.kk-subtotal td{color:var(--color-neutral-solid-gray-700,#555);}
+.kk-indent{padding-left:1.5rem !important;}
+.kk-statement{max-width:40rem;}
+.kk-statement caption{text-align:left;font-weight:700;padding:.25rem 0;}
+.kk-bs{display:grid;grid-template-columns:minmax(0,1fr);gap:1rem;}
+@media (min-width:64rem){.kk-bs{grid-template-columns:minmax(0,1fr) minmax(0,1fr);}}
+.kk-row--warn{background:var(--color-primitive-yellow-50,#fffbe6);}
+.kk-link{border:0;background:transparent;padding:0;font:inherit;color:var(--color-primitive-blue-900,#0031d8);text-decoration:underline;cursor:pointer;text-align:left;}
+.kk-entries{list-style:none;margin:0;padding:0;}
+.kk-entry{border-bottom:1px solid var(--color-neutral-solid-gray-200,#ddd);padding:.75rem 0;}
+.kk-entry--warn{background:var(--color-primitive-yellow-50,#fffbe6);}
+.kk-entry-head{display:flex;flex-wrap:wrap;gap:.25rem .75rem;align-items:center;font-size:.875rem;}
+.kk-date,.kk-number,.kk-origin{font-family:ui-monospace,monospace;color:var(--color-neutral-solid-gray-600,#666);}
+.kk-memo{flex:1 1 12rem;}
+.kk-lines{margin-top:.25rem;}
+.kk-check{display:flex;gap:.25rem;align-items:center;}
+.kk-danger{color:var(--color-primitive-red-800,#b00);}
+.kk-footer{margin-top:3rem;font-size:.8125rem;color:var(--color-neutral-solid-gray-600,#666);line-height:1.7;}
+.kk-noscript{font-weight:700;}")
+
+(def ssr-state
+  "SSR で描く状態。保存した仕訳はブラウザでしか分からないので、
+  「仕訳がありません」ではなく読み込み中（:booting?）を描く。"
+  {:data core/empty-db :ui (assoc view/initial-ui :booting? true)})
+
+(defn document
+  "完全な HTML 文書。opts（生成器が渡す。site/site.edn の契約）:
+  :css             vendored dds.css の中身（jp-go-dds.page は I/O を持たない）
+  :vendor-scripts  [\"vendor/react.production.min.js\" …]（この順で <script src>）
+  :scittle-scripts [\"kotoba/lang/text.cljs\" … \"app.cljs\"]（この順で scittle）"
+  [{:keys [css vendor-scripts scittle-scripts]}]
+  (dds-page/->page
+   {:title site-title
+    :description site-description
+    :css css
+    :app-css app-css
+    :head (vec (concat
+                (map (fn [src] [:script {:src (str "./" src)}]) vendor-scripts)
+                (map (fn [src] [:script {:type "application/x-scittle" :src (str "./" src)}])
+                     scittle-scripts)))}
+   [:div {:id "app"} (view/root ssr-state nil view/ssr-handlers)]))

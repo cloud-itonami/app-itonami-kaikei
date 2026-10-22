@@ -1,0 +1,143 @@
+(ns kaikei.compat.native
+  "kaikei の帳簿 JSON（\"kaikei.ledger.v1\"）。kaikei の値モデルをそのまま書く、
+  失う項目の無い形式。画面の「すべて書き出す」、MCP の tool 間の受け渡し、
+  形式をまたぐ変換の中継に使う。
+
+    {\"format\": \"kaikei.ledger.v1\",
+     \"currency\": \"JPY\",
+     \"accounts\": [{\"name\", \"class\", \"class_source\", \"code\", \"qbo\": {…}, \"xero\": {…}}],
+     \"entries\": [{\"id\", \"date\", \"number\", \"memo\", \"note\", \"adjustment\",
+                   \"lines\": [{\"account\", \"debit\", \"credit\", \"sub_account\", \"department\",
+                              \"partner\", \"partner_type\", \"description\", \"tax\": {\"scheme\", \"code\"},
+                              \"tax_amount\", \"invoice\": {\"scheme\", \"code\"},
+                              \"tracking\": [[\"名前\", \"選択肢\"]]}],
+                   \"origin\": {…}}]}
+
+  金額は最小通貨単位の整数。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.json :as json]))
+
+(def format-id "kaikei.ledger.v1")
+
+(defn- kw [s] (when (and (string? s) (not (text/blank? s))) (keyword s)))
+
+(defn- scheme-code [m]
+  (when (map? m)
+    (let [scheme (kw (get m "scheme")) code (get m "code")]
+      (when (and scheme (string? code)) {:scheme scheme :code code}))))
+
+(defn- read-origin [m]
+  (when (map? m)
+    (into {} (for [[k v] m] [(keyword k) (if (and (= k "format") (string? v)) (keyword v) v)]))))
+
+(defn- line-in [m]
+  (cond-> {:account (str (get m "account" ""))
+           :debit (get m "debit" 0)
+           :credit (get m "credit" 0)}
+    (get m "sub_account") (assoc :sub-account (get m "sub_account"))
+    (get m "department") (assoc :department (get m "department"))
+    (get m "partner") (assoc :partner (get m "partner"))
+    (get m "partner_type") (assoc :partner-type (get m "partner_type"))
+    (get m "description") (assoc :description (get m "description"))
+    (scheme-code (get m "tax")) (assoc :tax (scheme-code (get m "tax")))
+    (get m "tax_amount") (assoc :tax-amount (get m "tax_amount"))
+    (scheme-code (get m "invoice")) (assoc :invoice (scheme-code (get m "invoice")))
+    (seq (get m "tracking")) (assoc :tracking (mapv vec (get m "tracking")))))
+
+(defn- integer-amounts? [m]
+  (every? #(let [v (get m % 0)] (and (number? v) (integer? v))) ["debit" "credit"]))
+
+(defn- read-entry [i m]
+  (let [lines (get m "lines")]
+    (cond
+      (not (sequential? lines)) {:problem (str "仕訳 " (inc i) ": lines がありません")}
+      (not (every? #(and (map? %) (integer-amounts? %)) lines))
+      {:problem (str "仕訳 " (inc i) ": 金額は最小通貨単位の整数で書きます")}
+      :else
+      {:entry (cond-> {:date (or (core/parse-date (get m "date")) (str (get m "date" "")))
+                       :lines (mapv line-in lines)}
+                (get m "id") (assoc :id (get m "id"))
+                (get m "number") (assoc :number (get m "number"))
+                (get m "memo") (assoc :memo (get m "memo"))
+                (get m "note") (assoc :note (get m "note"))
+                (true? (get m "adjustment")) (assoc :adjustment? true)
+                (read-origin (get m "origin")) (assoc :origin (read-origin (get m "origin"))))})))
+
+(defn- read-account [m]
+  (let [class (kw (get m "class"))]
+    (cond-> {:name (str (get m "name"))}
+      (contains? core/class-code class) (assoc :class class
+                                               :class-source (or (kw (get m "class_source")) :vendor))
+      (get m "code") (assoc :code (get m "code"))
+      (map? (get m "qbo")) (assoc :qbo (into {} (for [[k v] (get m "qbo")] [(keyword k) v])))
+      (map? (get m "xero")) (assoc :xero (into {} (for [[k v] (get m "xero")] [(keyword k) v]))))))
+
+(defn detect? [data] (and (map? data) (= format-id (get data "format"))))
+
+(defn read-data
+  "構文解析済みの JSON（文字列キー）→ 取り込み結果。"
+  [data]
+  (if-not (detect? data)
+    {:format :kaikei-json :entries [] :accounts []
+     :warnings [(str "\"format\": \"" format-id "\" の JSON ではありません")] :rejected 0}
+    (let [currency (get data "currency" "JPY")
+          candidates (map-indexed read-entry (get data "entries" []))]
+      (if-not (core/exponent currency)
+        {:format :kaikei-json :entries [] :accounts []
+         :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")] :rejected 0}
+        {:format :kaikei-json
+         :currency currency
+         :accounts (mapv read-account (filter map? (get data "accounts" [])))
+         :entries (vec (keep :entry candidates))
+         :warnings (vec (keep :problem candidates))
+         :rejected (count (filter :problem candidates))}))))
+
+(defn- line-out [l]
+  (json/ordered
+   [["account" (:account l)]
+    ["debit" (:debit l 0)]
+    ["credit" (:credit l 0)]
+    ["sub_account" (:sub-account l)]
+    ["department" (:department l)]
+    ["partner" (:partner l)]
+    ["partner_type" (:partner-type l)]
+    ["description" (:description l)]
+    ["tax" (when-let [{:keys [scheme code]} (:tax l)] (json/ordered [["scheme" (name scheme)] ["code" code]]))]
+    ["tax_amount" (:tax-amount l)]
+    ["invoice" (when-let [{:keys [scheme code]} (:invoice l)] (json/ordered [["scheme" (name scheme)] ["code" code]]))]
+    ["tracking" (when (seq (:tracking l)) (mapv vec (:tracking l)))]]))
+
+(defn- origin-out [o]
+  (when (seq o)
+    (json/ordered (for [[k v] (sort-by (comp name key) o)]
+                    [(name k) (if (keyword? v) (name v) v)]))))
+
+(defn- vendor-out [m]
+  (when (seq m) (json/ordered (for [[k v] (sort-by (comp name key) m)] [(name k) v]))))
+
+(defn data
+  "db → kaikei.ledger.v1 の値（json/write に渡す形）。"
+  [db]
+  (json/ordered
+   [["format" format-id]
+    ["currency" (:currency db)]
+    ["accounts" (vec (for [n (sort (keys (:accounts db)))
+                           :let [a (get-in db [:accounts n])]]
+                       (json/ordered [["name" n]
+                                      ["class" (name (:class a :unclassified))]
+                                      ["class_source" (some-> (:class-source a) name)]
+                                      ["code" (:code a)]
+                                      ["qbo" (vendor-out (:qbo a))]
+                                      ["xero" (vendor-out (:xero a))]])))]
+    ["entries" (vec (for [e (:entries db)]
+                      (json/ordered [["id" (:id e)]
+                                     ["date" (:date e)]
+                                     ["number" (:number e)]
+                                     ["memo" (:memo e)]
+                                     ["note" (:note e)]
+                                     ["adjustment" (when (:adjustment? e) true)]
+                                     ["lines" (mapv line-out (:lines e))]
+                                     ["origin" (origin-out (:origin e))]])))]]))
+
+(defn write [db] (str (json/write (data db)) "\n"))

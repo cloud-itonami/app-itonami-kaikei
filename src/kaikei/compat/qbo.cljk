@@ -1,0 +1,502 @@
+(ns kaikei.compat.qbo
+  "QuickBooks Online Accounting API の形 —— Account と JournalEntry の JSON、
+  journal entries の取り込み CSV、帳票（Report）の JSON。形の正本は
+  intuit/QuickBooks-V3-Java-SDK（Apache-2.0）develop c4d5dfa の data クラス:
+
+  - `JournalEntry.Line[].JournalEntryLineDetail.PostingType` は Debit／Credit、
+    `Line[].Amount` は BigDecimal（正の数）。明細は AccountRef・Entity・ClassRef・
+    DepartmentRef・TaxCodeRef を持つ。
+  - `Account.Classification` は Asset／Equity／Expense／Liability／Revenue。
+    `Account.AccountType` は Bank … Non-Posting の 16 種。補助科目は
+    SubAccount true + ParentRef の Account で、FullyQualifiedName が
+    \"親:子\"。
+
+  ## 取り込み
+
+  query の応答（`{\"QueryResponse\": {\"Account\": […]}}`・
+  `{\"QueryResponse\": {\"JournalEntry\": […]}}`）、1 件の読み出し
+  （`{\"JournalEntry\": {…}}`）、JournalEntry の配列を受ける。JournalEntry は
+  手入力の仕訳だけで、請求書・支払いなどから起きた仕訳は入らない（帳簿の全体は
+  QBO の Journal／General Ledger の帳票にある。その形はまだ固定していないので、
+  このスライスでは読まない）。
+
+  補助科目の Account（ParentRef あり）は、FullyQualifiedName の最初の段を
+  勘定科目、残りを補助科目にする。
+
+  ## 書き出し
+
+  `{\"QueryResponse\": {\"Account\": […], \"JournalEntry\": […]}}`（kaikei が
+  読み戻せる形）。Account の Id は QBO から取り込んだものを保ち、無ければ
+  連番を振る —— 同じファイルの中で AccountRef が引ける Id で、QBO の会社の
+  Id ではない。POST するには、先方の勘定科目の Id に付け替える必要がある。
+
+  区分の写し方は kaikei の規則（`type->class`・`class->type`）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]
+            [kaikei.json :as json]
+            [kaikei.compat.common :as common]))
+
+;; ───────── 区分 ─────────
+
+(def type->class
+  {"Bank" :current-asset "Accounts Receivable" :current-asset "Other Current Asset" :current-asset
+   "Fixed Asset" :non-current-asset "Other Asset" :non-current-asset
+   "Accounts Payable" :current-liability "Credit Card" :current-liability
+   "Other Current Liability" :current-liability
+   "Long Term Liability" :non-current-liability
+   "Equity" :equity
+   "Income" :revenue
+   "Cost of Goods Sold" :cost-of-sales
+   "Expense" :operating-expense
+   "Other Income" :non-operating-income
+   "Other Expense" :non-operating-expense})
+
+(def ^:private classification->class
+  {"Asset" :current-asset "Liability" :current-liability "Equity" :equity
+   "Revenue" :revenue "Expense" :operating-expense})
+
+(def class->type
+  "kaikei の区分 → QBO の AccountType。特別損益・法人税等は Other Income／
+  Other Expense に寄せる。"
+  {:current-asset "Other Current Asset" :non-current-asset "Fixed Asset" :deferred-asset "Other Asset"
+   :current-liability "Other Current Liability" :non-current-liability "Long Term Liability"
+   :equity "Equity" :revenue "Income" :cost-of-sales "Cost of Goods Sold"
+   :operating-expense "Expense" :non-operating-income "Other Income"
+   :non-operating-expense "Other Expense" :extraordinary-gain "Other Income"
+   :extraordinary-loss "Other Expense" :income-tax "Other Expense"})
+
+(def class->classification
+  {:current-asset "Asset" :non-current-asset "Asset" :deferred-asset "Asset"
+   :current-liability "Liability" :non-current-liability "Liability" :equity "Equity"
+   :revenue "Revenue" :non-operating-income "Revenue" :extraordinary-gain "Revenue"
+   :cost-of-sales "Expense" :operating-expense "Expense" :non-operating-expense "Expense"
+   :extraordinary-loss "Expense" :income-tax "Expense"})
+
+(defn account-class [type classification]
+  (or (type->class type) (classification->class classification)))
+
+;; ───────── 取り込み ─────────
+
+(defn- as-vec [x] (cond (sequential? x) (vec x) (map? x) [x] :else []))
+
+(defn- entities [data k]
+  (cond
+    (map? (get data "QueryResponse")) (as-vec (get-in data ["QueryResponse" k]))
+    (map? data) (as-vec (get data k))
+    (and (= k "JournalEntry") (sequential? data)) (filterv #(and (map? %) (contains? % "Line")) data)
+    :else []))
+
+(defn- split-fqn
+  "\"普通預金:三井住友\" → [\"普通預金\" \"三井住友\"]。段が 1 つなら [名前 nil]。"
+  [fqn]
+  (let [[top & more] (text/split (str fqn) #":")]
+    [(text/trim top) (when (seq more) (text/trim (text/join ":" more)))]))
+
+(defn- account-index
+  "Account の列 → Id から [勘定科目名 補助科目] を引く表と、取り込む勘定科目。"
+  [accounts]
+  (let [by-id (into {} (for [a accounts :when (get a "Id")] [(get a "Id") a]))
+        fqn (fn fqn [a seen]
+              (or (common/blank->nil (get a "FullyQualifiedName"))
+                  (let [parent (get by-id (get-in a ["ParentRef" "value"]))]
+                    (if (and parent (not (contains? seen (get a "Id"))))
+                      (str (fqn parent (conj seen (get a "Id"))) ":" (get a "Name"))
+                      (str (get a "Name"))))))
+        refs (into {} (for [a accounts :when (get a "Id")] [(get a "Id") (split-fqn (fqn a #{}))]))
+        tops (for [a accounts
+                   :let [[top sub] (split-fqn (fqn a #{}))]
+                   :when (and (not (text/blank? top)) (nil? sub))
+                   :let [k (some-> (account-class (get a "AccountType") (get a "Classification"))
+                                   (core/refine-class top))]]
+               (cond-> {:name top
+                        :qbo (cond-> {}
+                               (get a "Id") (assoc :id (get a "Id"))
+                               (get a "AccountType") (assoc :type (get a "AccountType"))
+                               (get a "AccountSubType") (assoc :sub-type (get a "AccountSubType"))
+                               (get a "Classification") (assoc :classification (get a "Classification")))}
+                 (common/blank->nil (get a "AcctNum")) (assoc :code (get a "AcctNum"))
+                 k (assoc :class k :class-source :vendor)))]
+    {:refs refs :accounts (vec tops)}))
+
+(defn- ref-name [m] (common/blank->nil (get m "name")))
+
+(defn- line-in [refs exp where l]
+  (let [d (get l "JournalEntryLineDetail")
+        posting (get d "PostingType")
+        {:keys [amount problem]} (common/read-amount (get l "Amount" "") exp where)
+        [account sub] (or (get refs (get-in d ["AccountRef" "value"]))
+                          (split-fqn (or (ref-name (get d "AccountRef")) (get-in d ["AccountRef" "value"]) "")))
+        tax-amount (when-let [t (get d "TaxAmount")] (:amount (core/parse-amount t exp)))]
+    (cond
+      (not= "JournalEntryLineDetail" (get l "DetailType" "JournalEntryLineDetail"))
+      {:skip true}
+      problem {:problem problem}
+      (not (#{"Debit" "Credit"} posting)) {:problem (str where ": PostingType \"" posting "\" は Debit か Credit です")}
+      (neg? amount) {:problem (str where ": Amount は正の数です（向きは PostingType）")}
+      :else
+      {:line (cond-> {:account account
+                      :debit (if (= posting "Debit") amount 0)
+                      :credit (if (= posting "Credit") amount 0)}
+               sub (assoc :sub-account sub)
+               (common/blank->nil (get l "Description")) (assoc :description (text/trim (get l "Description")))
+               (ref-name (get d "DepartmentRef")) (assoc :department (ref-name (get d "DepartmentRef")))
+               (ref-name (get-in d ["Entity" "EntityRef"])) (assoc :partner (ref-name (get-in d ["Entity" "EntityRef"])))
+               (common/blank->nil (get-in d ["Entity" "Type"])) (assoc :partner-type (get-in d ["Entity" "Type"]))
+               (get-in d ["TaxCodeRef" "value"]) (assoc :tax {:scheme :qbo :code (str (get-in d ["TaxCodeRef" "value"]))})
+               (and tax-amount (not (zero? tax-amount))) (assoc :tax-amount tax-amount))})))
+
+(defn- read-entry [refs exp currency i je]
+  (let [where (str "JournalEntry " (or (get je "DocNumber") (get je "Id") (inc i)))
+        date (core/parse-date (get je "TxnDate"))
+        je-currency (get-in je ["CurrencyRef" "value"])
+        parts (vec (remove :skip (map-indexed (fn [j l] (line-in refs exp (str where " 行 " (inc j)) l))
+                                              (get je "Line" []))))
+        p (common/first-problem parts)]
+    (cond
+      (and je-currency (not= je-currency currency))
+      {:problem (str where ": 通貨 " je-currency " は帳簿の通貨 " currency " と違うので取り込みません（1 帳簿 1 通貨）")}
+      p {:problem (:problem p)}
+      (nil? date) {:problem (str where ": TxnDate \"" (get je "TxnDate") "\" を読めません")}
+      :else
+      {:entry (cond-> {:date date
+                       :lines (mapv :line parts)
+                       :origin (cond-> {:format :qbo-json}
+                                 (get je "Id") (assoc :id (get je "Id")))}
+                (common/blank->nil (get je "DocNumber")) (assoc :number (get je "DocNumber"))
+                (common/blank->nil (get je "PrivateNote")) (assoc :memo (text/trim (get je "PrivateNote")))
+                (true? (get je "Adjustment")) (assoc :adjustment? true))})))
+
+(defn detect? [data]
+  (or (and (map? data) (or (map? (get data "QueryResponse"))
+                           (contains? data "JournalEntry")
+                           (and (contains? data "Account") (not (contains? data "Accounts")))))
+      (and (sequential? data) (seq data) (every? #(and (map? %) (contains? % "Line") (contains? % "TxnDate")) data))))
+
+(defn read-data
+  "構文解析済みの JSON → 取り込み結果。通貨は JournalEntry の CurrencyRef、
+  無ければ opts の :currency（既定 JPY）。"
+  [data {:keys [currency] :or {currency "JPY"}}]
+  (let [accounts (filterv map? (entities data "Account"))
+        journal-entries (filterv map? (entities data "JournalEntry"))
+        currency (or (some #(get-in % ["CurrencyRef" "value"]) journal-entries)
+                     (some #(get-in % ["CurrencyRef" "value"]) accounts)
+                     currency)
+        exp (core/exponent currency)
+        {:keys [refs] :as idx} (account-index accounts)]
+    (if-not exp
+      {:format :qbo-json :entries [] :accounts [] :rejected 0
+       :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      (merge {:format :qbo-json :currency currency :accounts (:accounts idx)}
+             (common/finish (map-indexed (partial read-entry refs exp currency) journal-entries))))))
+
+;; ───────── 書き出し ─────────
+
+(defn- account-ids
+  "勘定科目名・[名前 補助科目] → Account の Id。QBO から来た Id を保ち、無ければ
+  使われていない連番を振る。"
+  [db names subs]
+  (let [taken (set (keep #(get-in db [:accounts % :qbo :id]) names))
+        counter (atom 0)
+        fresh (fn [] (loop [] (let [id (str (swap! counter inc))] (if (taken id) (recur) id))))
+        tops (into {} (for [n names] [n (or (get-in db [:accounts n :qbo :id]) (fresh))]))
+        sub-ids (into {} (for [s subs] [s (fresh)]))]
+    {:tops tops :subs sub-ids}))
+
+(defn data
+  "db → {\"QueryResponse\" {\"Account\" […] \"JournalEntry\" […]}} と注記。"
+  [db]
+  (let [exp (core/exponent (:currency db))
+        names (core/used-accounts db)
+        subs (sort (distinct (for [e (:entries db), l (:lines e) :when (:sub-account l)]
+                               [(:account l) (:sub-account l)])))
+        {:keys [tops] sub-ids :subs} (account-ids db names subs)
+        type-of (fn [n] (or (get-in db [:accounts n :qbo :type]) (class->type (core/account-class db n))))
+        classification-of (fn [n] (class->classification (core/account-class db n)))
+        account (fn [id nm fqn parent-id t c acct-num]
+                  (json/ordered [["Id" id]
+                                 ["Name" nm]
+                                 ["FullyQualifiedName" fqn]
+                                 ["SubAccount" (some? parent-id)]
+                                 ["ParentRef" (when parent-id (json/ordered [["value" parent-id]]))]
+                                 ["AcctNum" acct-num]
+                                 ["Classification" c]
+                                 ["AccountType" t]
+                                 ["Active" true]
+                                 ["CurrencyRef" (json/ordered [["value" (:currency db)]])]]))
+        accounts (vec (concat
+                       (for [n names]
+                         (account (tops n) n n nil (type-of n) (classification-of n) (get-in db [:accounts n :code])))
+                       (for [[n s :as k] subs]
+                         (account (sub-ids k) s (str n ":" s) (tops n) (type-of n) (classification-of n) nil))))
+        line (fn [i l]
+               (let [debit? (pos? (:debit l 0))
+                     ref-id (if (:sub-account l) (sub-ids [(:account l) (:sub-account l)]) (tops (:account l)))
+                     ref-name (if (:sub-account l) (str (:account l) ":" (:sub-account l)) (:account l))]
+                 (json/ordered
+                  [["Id" (str i)]
+                   ["Description" (:description l)]
+                   ["Amount" (json/decimal (core/format-amount (if debit? (:debit l 0) (:credit l 0)) exp))]
+                   ["DetailType" "JournalEntryLineDetail"]
+                   ["JournalEntryLineDetail"
+                    (json/ordered [["PostingType" (if debit? "Debit" "Credit")]
+                                   ["AccountRef" (json/ordered [["value" ref-id] ["name" ref-name]])]
+                                   ["Entity" (when (:partner l)
+                                               (json/ordered [["Type" (:partner-type l)]
+                                                              ["EntityRef" (json/ordered [["name" (:partner l)]])]]))]
+                                   ["DepartmentRef" (when (:department l) (json/ordered [["name" (:department l)]]))]
+                                   ["TaxCodeRef" (when-let [c (common/tax-code l :qbo)] (json/ordered [["value" c]]))]])]])))]
+    {:data
+     (json/ordered
+      [["QueryResponse"
+        (json/ordered
+         [["Account" accounts]
+          ["JournalEntry"
+           (vec (for [e (:entries db)]
+                  (json/ordered [["Id" (get-in e [:origin :id])]
+                                 ["DocNumber" (:number e)]
+                                 ["TxnDate" (:date e)]
+                                 ["PrivateNote" (:memo e)]
+                                 ["Adjustment" (boolean (:adjustment? e))]
+                                 ["CurrencyRef" (json/ordered [["value" (:currency db)]])]
+                                 ["Line" (vec (map-indexed line (:lines e)))]])))]
+          ["startPosition" 1]
+          ["maxResults" (count (:entries db))]])]])
+     :notes (cond-> ["Account の Id は、このファイルの中で AccountRef が引ける番号です。QBO に登録するときは、先方の勘定科目の Id に付け替えてください"]
+              (some #(or (:department %) (:partner %)) (for [e (:entries db), l (:lines e)] l))
+              (conj "DepartmentRef と Entity（取引先）は名前だけで書いています（QBO の Id は持っていません。取引先の Type は QBO から取り込んだものだけにあります）")
+              (common/lossy-note db :qbo {:tax "税区分（QBO 以外の形式のもの）"
+                                          :invoice "インボイス区分" :tracking "Xero の tracking"})
+              (conj (common/lossy-note db :qbo {:tax "税区分（QBO 以外の形式のもの）"
+                                                :invoice "インボイス区分" :tracking "Xero の tracking"})))}))
+
+(defn write [db]
+  (let [{:keys [data notes]} (data db)]
+    {:text (str (json/write data) "\n") :notes notes}))
+
+;; ───────── journal entries の取り込み CSV ─────────
+;;
+;; QuickBooks Help「Import journal entries」（米国版 2026-08-04 更新、英国版・
+;; シンガポール版）: 要る列は Journal No.・Journal Date・Account Name・
+;; Description（米国版の画面では Journal/Description）・Debits・Credits。売掛金・
+;; 買掛金の行には Name（取引先）、部門・クラスを使うなら Location・Class。
+;; 見出しは取り込みの画面で列に対応づける。1 行目は対応づけに使われ、取り込まれ
+;; ない。1 ファイル 1,000 行未満。補助科目は \"親:子\"。日付の形は取り込みの画面で
+;; 選ぶ（選べる形は未確認）。
+
+(def csv-columns ["Journal No." "Journal Date" "Account Name" "Debits" "Credits" "Description" "Name" "Location"])
+
+(defn- csv-norm [h] (text/lower (text/replace (str h) #"[^A-Za-z]" "")))
+
+(defn csv-detect? [rows]
+  (let [h (set (map csv-norm (first rows)))]
+    (every? h ["journalno" "journaldate" "accountname" "debits" "credits"])))
+
+(defn- csv-pick [rec & ks] (some #(common/blank->nil (get rec %)) ks))
+
+(defn read-csv
+  "parse 済みの CSV 行 → 取り込み結果。opts: :currency（既定 JPY）、
+  :date-order（\"mdy\"・\"dmy\"。無ければ日付の列から推し、推せなければ mdy）。"
+  [rows {:keys [currency date-order] :or {currency "JPY"}}]
+  (let [exp (core/exponent currency)
+        recs (csv/records (cons (mapv csv-norm (first rows)) (rest rows)))
+        guessed (common/detect-date-order (map #(get % "journaldate") recs))
+        order (or date-order guessed "mdy")
+        grouped (reduce (fn [acc rec]
+                          (let [no (csv-pick rec "journalno")
+                                prev (peek acc)]
+                            (if (and prev (or (nil? no) (= no (csv-pick (first prev) "journalno"))))
+                              (conj (pop acc) (conj prev rec))
+                              (conj acc [rec]))))
+                        [] recs)
+        read-group (fn [recs]
+                     (let [r (first recs)
+                           where (str "行 " (::csv/row r))
+                           date (common/parse-ordered-date (csv-pick r "journaldate") order)
+                           parts (vec (for [rec recs
+                                            :let [w (str "行 " (::csv/row rec))
+                                                  d (common/read-amount (get rec "debits" "") exp (str w " Debits"))
+                                                  c (common/read-amount (get rec "credits" "") exp (str w " Credits"))
+                                                  [account sub] (split-fqn (csv-pick rec "accountname"))
+                                                  desc (csv-pick rec "description" "journaldescription" "memo")]]
+                                        (cond
+                                          (:problem d) d
+                                          (:problem c) c
+                                          :else {:line (cond-> {:account (or account "") :debit (:amount d) :credit (:amount c)}
+                                                         sub (assoc :sub-account sub)
+                                                         desc (assoc :description desc)
+                                                         (csv-pick rec "name") (assoc :partner (csv-pick rec "name"))
+                                                         (csv-pick rec "location") (assoc :department (csv-pick rec "location")))})))
+                           p (common/first-problem parts)]
+                       (cond
+                         p {:problem (:problem p)}
+                         (nil? date) {:problem (str where ": Journal Date \"" (csv-pick r "journaldate") "\" を読めません（日付の並び " order "）")}
+                         :else {:entry (cond-> {:date date :lines (mapv :line parts) :origin {:format :qbo-csv}}
+                                         (csv-pick r "journalno") (assoc :number (csv-pick r "journalno")))})))]
+    (if-not exp
+      {:format :qbo-csv :entries [] :accounts [] :rejected 0
+       :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      (merge {:format :qbo-csv :currency currency :accounts []}
+             (update (common/finish (map read-group grouped)) :warnings
+                     (fn [w] (cond-> w
+                               (and (nil? date-order) (nil? guessed))
+                               (conj "日付の並びを判定できないので、月/日/年 と読みました（違うときは日付の並びを指定してください）"))))))))
+
+(defn write-csv
+  "db → journal entries の取り込み CSV。opts の :date-order は \"mdy\"（既定、
+  米国版）・\"dmy\"・\"ymd\"。"
+  ([db] (write-csv db {}))
+  ([db {:keys [date-order] :or {date-order "mdy"}}]
+   (let [exp (core/exponent (:currency db))
+         rows (cons csv-columns
+                    (apply concat
+                           (map-indexed
+                            (fn [i e]
+                              (for [l (:lines e)]
+                                [(or (:number e) (str (inc i)))
+                                 (common/format-ordered-date (:date e) date-order)
+                                 (if (:sub-account l) (str (:account l) ":" (:sub-account l)) (:account l))
+                                 (when (pos? (:debit l 0)) (core/format-amount (:debit l) exp))
+                                 (when (pos? (:credit l 0)) (core/format-amount (:credit l) exp))
+                                 (or (:description l) (:memo e))
+                                 (:partner l)
+                                 (:department l)]))
+                            (:entries db))))
+         n (dec (count rows))]
+     {:text (csv/write rows)
+      :notes (cond-> [(str "日付は " (case date-order "mdy" "月/日/年" "dmy" "日/月/年" "年-月-日")
+                           " で書きました。QBO の取り込みの画面で同じ並びを選んでください")]
+               (>= n 1000) (conj (str "行が " n " あります。QBO は 1 ファイル 1,000 行未満しか取り込まないので、分けてください"))
+               (common/lossy-note db :qbo-csv {:tax "税区分" :invoice "インボイス区分" :tracking "Xero の tracking"})
+               (conj (common/lossy-note db :qbo-csv {:tax "税区分" :invoice "インボイス区分" :tracking "Xero の tracking"})))})))
+
+;; ───────── 帳票（Report） ─────────
+;;
+;; 形の正本は intuit/QuickBooks-V3-Java-SDK c4d5dfa の Report.xsd と、Intuit の
+;; 開発者向け文書の見本（TrialBalance・ProfitAndLoss・BalanceSheet）:
+;; {Header{ReportName ReportBasis StartPeriod EndPeriod Currency Option[]}
+;;  Columns{Column[{ColTitle ColType MetaData[]}]}
+;;  Rows{Row[ Data は ColData[{value id}]、Section は Header{ColData} Rows Summary{ColData}、
+;;            type・group ]}}
+;; group は英国版の一覧（Income COGS GrossProfit Expenses NetOperatingIncome
+;; OtherIncome OtherExpenses NetOtherIncome NetIncome）を使う（米国版の一覧には
+;; OtherIncome が無い）。Header の Time は書かない（出力を入力だけで決める）。
+;; 区分の当て方は kaikei の規則: 営業外収益と特別利益を OtherIncome、営業外費用・
+;; 特別損失・法人税等を OtherExpenses に入れる。
+
+(defn- col [v & [id]] (json/ordered [["id" id] ["value" v]]))
+
+(defn- header [kind db from to]
+  (json/ordered [["ReportName" kind]
+                 ["ReportBasis" "Accrual"]
+                 ["StartPeriod" from]
+                 ["EndPeriod" to]
+                 ["Currency" (:currency db)]
+                 ["Option" [(json/ordered [["Name" "NoReportData"] ["Value" (str (empty? (:entries db)))]])]]]))
+
+(defn- money-columns [titles]
+  (json/ordered [["Column" (vec (cons (json/ordered [["ColTitle" ""] ["ColType" "Account"]
+                                                      ["MetaData" [(json/ordered [["Name" "ColKey"] ["Value" "account"]])]]])
+                                      (for [t titles]
+                                        (json/ordered [["ColTitle" t] ["ColType" "Money"]
+                                                       ["MetaData" [(json/ordered [["Name" "ColKey"] ["Value" (text/lower t)]])]]]))))]]))
+
+(defn report
+  "kaikei の帳簿 → QBO の Report の形（json/write に渡す値）。kind は
+  trial-balance・profit-and-loss・balance-sheet。"
+  [db kind from to]
+  (let [exp (core/exponent (:currency db))
+        money #(core/format-amount % exp)
+        f (core/date-int from)
+        t (core/date-int to)
+        id-of #(get-in db [:accounts % :qbo :id])
+        data-row (fn [account amount] (json/ordered [["type" "Data"] ["ColData" [(col account (id-of account)) (col (money amount))]]]))
+        section (fn [group title accounts total]
+                  (json/ordered [["type" "Section"] ["group" group]
+                                 ["Header" (json/ordered [["ColData" [(col title) (col "")]]])]
+                                 ["Rows" (json/ordered [["Row" (vec accounts)]])]
+                                 ["Summary" (json/ordered [["ColData" [(col (str "Total " title)) (col (money total))]]])]]))
+        summary (fn [group title amount]
+                  (json/ordered [["type" "Section"] ["group" group]
+                                 ["Summary" (json/ordered [["ColData" [(col title) (col (money amount))]]])]]))]
+    (case kind
+      "trial-balance"
+      (let [{:keys [rows]} (core/trial-balance db f t)
+            debit-total (reduce + 0 (keep #(when (pos? (:closing %)) (:closing %)) rows))
+            credit-total (reduce + 0 (keep #(when (neg? (:closing %)) (- (:closing %))) rows))]
+        (json/ordered
+         [["Header" (header "TrialBalance" db from to)]
+          ["Columns" (json/ordered [["Column" [(json/ordered [["ColTitle" ""] ["ColType" "Account"]])
+                                                (json/ordered [["ColTitle" "Debit"] ["ColType" "Money"]])
+                                                (json/ordered [["ColTitle" "Credit"] ["ColType" "Money"]])]]])]
+          ["Rows" (json/ordered
+                   [["Row" (vec (concat
+                                 (for [{:keys [account closing synthetic]} rows
+                                       :when (not (zero? closing))]
+                                   (json/ordered [["ColData" [(col account (when-not synthetic (id-of account)))
+                                                              (col (if (pos? closing) (money closing) ""))
+                                                              (col (if (neg? closing) (money (- closing)) ""))]]]))
+                                 [(json/ordered [["type" "Section"] ["group" "GrandTotal"]
+                                                 ["Summary" (json/ordered [["ColData" [(col "TOTAL") (col (money debit-total))
+                                                                                       (col (money credit-total))]]])]])]))]])]]))
+
+      "profit-and-loss"
+      (let [{:keys [sections stages]} (core/profit-and-loss db f t)
+            by (into {} (map (juxt :class identity) sections))
+            accounts (fn [ks] (for [k ks, a (:accounts (by k))] (data-row (:account a) (:amount a))))
+            total (fn [ks] (reduce + 0 (map #(:total (by %)) ks)))
+            other-in [:non-operating-income :extraordinary-gain]
+            other-out [:non-operating-expense :extraordinary-loss :income-tax]]
+        (json/ordered
+         [["Header" (header "ProfitAndLoss" db from to)]
+          ["Columns" (money-columns ["Total"])]
+          ["Rows" (json/ordered
+                   [["Row" [(section "Income" "Income" (accounts [:revenue]) (total [:revenue]))
+                            (section "COGS" "Cost of Goods Sold" (accounts [:cost-of-sales]) (total [:cost-of-sales]))
+                            (summary "GrossProfit" "Gross Profit" (:gross stages))
+                            (section "Expenses" "Expenses" (accounts [:operating-expense]) (total [:operating-expense]))
+                            (summary "NetOperatingIncome" "Net Operating Income" (:operating stages))
+                            (section "OtherIncome" "Other Income" (accounts other-in) (total other-in))
+                            (section "OtherExpenses" "Other Expenses" (accounts other-out) (total other-out))
+                            (summary "NetOtherIncome" "Net Other Income" (- (:net stages) (:operating stages)))
+                            (summary "NetIncome" "Net Income" (:net stages))]]])]]))
+
+      "balance-sheet"
+      (let [{:keys [sections totals retained net-income]} (core/balance-sheet db f t)
+            by (into {} (map (juxt :class identity) sections))
+            accounts (fn [ks] (for [k ks, a (:accounts (by k))] (data-row (:account a) (:amount a))))
+            total (fn [ks] (reduce + 0 (map #(:total (by %)) ks)))
+            nested (fn [group title rows total]
+                     (json/ordered [["type" "Section"] ["group" group]
+                                    ["Header" (json/ordered [["ColData" [(col title) (col "")]]])]
+                                    ["Rows" (json/ordered [["Row" (vec rows)]])]
+                                    ["Summary" (json/ordered [["ColData" [(col (str "Total " title)) (col (money total))]]])]]))]
+        (json/ordered
+         [["Header" (header "BalanceSheet" db from to)]
+          ["Columns" (money-columns ["Total"])]
+          ["Rows" (json/ordered
+                   [["Row"
+                     [(json/ordered
+                       [["type" "Section"] ["group" "TotalAssets"]
+                        ["Header" (json/ordered [["ColData" [(col "ASSETS") (col "")]]])]
+                        ["Rows" (json/ordered
+                                 [["Row" [(nested "CurrentAssets" "Current Assets" (accounts [:current-asset]) (total [:current-asset]))
+                                          (nested "FixedAssets" "Fixed Assets" (accounts [:non-current-asset]) (total [:non-current-asset]))
+                                          (nested "OtherAssets" "Other Assets" (accounts [:deferred-asset]) (total [:deferred-asset]))]]])]
+                        ["Summary" (json/ordered [["ColData" [(col "TOTAL ASSETS") (col (money (:assets totals)))]]])]])
+                      (json/ordered
+                       [["type" "Section"] ["group" "TotalLiabilitiesAndEquity"]
+                        ["Header" (json/ordered [["ColData" [(col "LIABILITIES AND EQUITY") (col "")]]])]
+                        ["Rows" (json/ordered
+                                 [["Row" [(nested "Liabilities" "Liabilities"
+                                                  [(nested "CurrentLiabilities" "Current Liabilities" (accounts [:current-liability]) (total [:current-liability]))
+                                                   (nested "LongTermLiabilities" "Long-Term Liabilities" (accounts [:non-current-liability]) (total [:non-current-liability]))]
+                                                  (:liabilities totals))
+                                          (nested "Equity" "Equity"
+                                                  (concat (accounts [:equity])
+                                                          [(json/ordered [["type" "Data"] ["ColData" [(col "Retained Earnings") (col (money retained))]]])
+                                                           (json/ordered [["type" "Data"] ["group" "NetIncome"]
+                                                                          ["ColData" [(col "Net Income") (col (money net-income))]]])])
+                                                  (:equity totals))]]])]
+                        ["Summary" (json/ordered [["ColData" [(col "TOTAL LIABILITIES AND EQUITY")
+                                                              (col (money (+ (:liabilities totals) (:equity totals))))]]])]])]]])]])))))

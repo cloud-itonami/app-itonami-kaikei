@@ -1,0 +1,113 @@
+(ns kaikei.export
+  "書き出し —— 帳簿を各形式の文字列・バイト列に、帳票を各社の帳票 JSON の形に。
+
+  `export` の戻り: {:text :bytes :encoding :filename :mime :notes} か {:error}。
+  :notes は形式に受け皿が無くて書き出さなかった項目などの注記。Shift_JIS に
+  無い文字があれば、置き換えずに {:error} を返す（UTF-8 を選べば書き出せる）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.json :as json]
+            [kaikei.encoding :as enc]
+            [kaikei.ingest :as ingest]
+            [kaikei.compat.native :as native]
+            [kaikei.compat.xero :as xero]
+            [kaikei.compat.qbo :as qbo]
+            [kaikei.compat.yayoi :as yayoi]
+            [kaikei.compat.mf :as mf]
+            [kaikei.compat.freee :as freee]))
+
+(defn write-text
+  "db → {:text :notes} か {:error}。opts の :date-order は QBO・Xero の CSV の
+  日付の並び。"
+  [db format-id {:keys [date-order]}]
+  (case format-id
+    "kaikei-json" {:text (native/write db) :notes []}
+    "xero-json" (xero/write db)
+    "qbo-json" (qbo/write db)
+    "yayoi" (yayoi/write db)
+    "mf" (mf/write db)
+    "freee" (freee/write db)
+    "qbo-csv" (qbo/write-csv db (cond-> {} date-order (assoc :date-order date-order)))
+    "xero-csv" (xero/write-csv db (cond-> {} date-order (assoc :date-order date-order)))
+    {:error (str "知らない形式です: " format-id)}))
+
+(defn export
+  "db → 書き出し。opts: :encoding（省けば形式の既定。弥生・MF・freee は
+  Shift_JIS）、:date-order（QBO・Xero の CSV）。"
+  ([db format-id] (export db format-id {}))
+  ([db format-id {:keys [encoding] :as opts}]
+   (let [fmt (ingest/format-by-id format-id)
+         encoding (or encoding (:encoding fmt) "utf-8")
+         {:keys [text notes error]} (write-text db format-id opts)]
+     (cond
+       error {:error error}
+       (and (:encodings fmt) (not (some #{encoding} (:encodings fmt))))
+       {:error (str (:label fmt) " は " (ingest/encoding-label encoding) " で書き出しません")}
+       :else
+       (let [{:keys [bytes] :as encoded} (enc/encode text encoding)]
+         (if (:error encoded)
+           {:error (str (ingest/encoding-label encoding) " に無い文字があるので書き出しません: "
+                        (text/join " " (take 10 (:chars encoded)))
+                        "（UTF-8 を選ぶか、元の文字を直してください）")}
+           {:text text :bytes bytes :encoding encoding :notes (vec (remove nil? notes))
+            :filename (:file fmt "kaikei.txt")
+            :mime (str (:mime fmt "text/plain") "; charset=" (if (= encoding "shift_jis") "Shift_JIS" "UTF-8"))}))))))
+
+;; ───────── 帳票 ─────────
+
+(def reports ["trial-balance" "profit-and-loss" "balance-sheet"])
+(def shapes ["kaikei" "qbo" "xero"])
+
+(defn- kaikei-report [db report from to]
+  (let [exp (core/exponent (:currency db))
+        amount #(json/decimal (core/format-amount % exp))
+        f (core/date-int from)
+        t (core/date-int to)]
+    (case report
+      "trial-balance"
+      (let [{:keys [rows totals]} (core/trial-balance db f t)]
+        (json/ordered
+         [["report" "trial-balance"] ["from" from] ["to" to] ["currency" (:currency db)]
+          ["rows" (vec (for [r rows]
+                         (json/ordered [["account" (:account r)] ["class" (name (:class r))]
+                                        ["opening" (amount (:opening r))] ["debit" (amount (:debit r))]
+                                        ["credit" (amount (:credit r))] ["closing" (amount (:closing r))]])))]
+          ["totals" (json/ordered [["debit" (amount (:debit totals))] ["credit" (amount (:credit totals))]
+                                   ["closing" (amount (:closing totals))]])]
+          ["note" "opening / closing は 借方 − 貸方 の純額。P/L の科目は期間の分だけ。"]]))
+      "profit-and-loss"
+      (let [{:keys [sections stages]} (core/profit-and-loss db f t)]
+        (json/ordered
+         [["report" "profit-and-loss"] ["from" from] ["to" to] ["currency" (:currency db)]
+          ["sections" (vec (for [{:keys [class accounts total]} sections]
+                             (json/ordered [["class" (name class)] ["label" (core/class-label class)]
+                                            ["accounts" (vec (for [a accounts]
+                                                               (json/ordered [["account" (:account a)]
+                                                                              ["amount" (amount (:amount a))]])))]
+                                            ["total" (amount total)]])))]
+          ["stages" (json/ordered (for [k core/stage-keys] [(name k) (amount (get stages k))]))]]))
+      "balance-sheet"
+      (let [{:keys [sections totals retained net-income]} (core/balance-sheet db f t)]
+        (json/ordered
+         [["report" "balance-sheet"] ["from" from] ["to" to] ["currency" (:currency db)]
+          ["sections" (vec (for [{:keys [class accounts total]} sections]
+                             (json/ordered [["class" (name class)] ["label" (core/class-label class)]
+                                            ["accounts" (vec (for [a accounts]
+                                                               (json/ordered [["account" (:account a)]
+                                                                              ["amount" (amount (:amount a))]])))]
+                                            ["total" (amount total)]])))]
+          ["retained" (amount retained)]
+          ["net_income" (amount net-income)]
+          ["totals" (json/ordered (for [k [:assets :liabilities :equity :difference]] [(name k) (amount (get totals k))]))]])))))
+
+(defn report
+  "帳票 → JSON に書く値（json/write に渡す形）。shape は kaikei／qbo／xero。
+  from・to は \"YYYY-MM-DD\"。"
+  [db report shape from to]
+  (case shape
+    "qbo" (qbo/report db report from to)
+    "xero" (xero/report db report from to)
+    (kaikei-report db report from to)))
+
+(defn report-text [db kind shape from to]
+  (str (json/write (report db kind shape from to)) "\n"))

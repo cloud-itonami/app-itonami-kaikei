@@ -1,0 +1,7 @@
+Journal No.,Journal Date,Account Name,Debits,Credits,Description,Name,Location
+1,04/01/2026,Checking,1000.00,,Owner investment,,
+1,04/01/2026,Opening Balance Equity,,1000.00,Owner investment,,
+2,04/15/2026,Accounts Receivable (A/R),330.00,,April services,Test Customer,
+2,04/15/2026,Services,,330.00,April services,Test Customer,
+3,04/30/2026,Truck:Original Cost,500.00,,Truck deposit,,North
+3,04/30/2026,Checking,,500.00,Truck deposit,,North

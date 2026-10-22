@@ -1,0 +1,262 @@
+;; kaikei のブラウザ側。scittle が読む（site/site.edn の :sources の最後）。
+;;
+;; Re-frame が状態・event・subscription・effect を持ち、Reagent が描く
+;; （cloud-itonami ADR-0052）。画面は kaikei.view の純関数で、SSR と同じもの。
+;; DOM を直接いじるのは effect（保存・ダウンロード・ファイル読み込み）の中だけ。
+;;
+;; ネットワークは使わない。fetch も XHR も無い。保存はこの端末の IndexedDB
+;; （itonami.kaikei の state ストア）で、使えなければ localStorage に落とす。
+;; 1 年分の仕訳帳は数 MB の文字列になり（実測: 5,000 仕訳・1 万行で約 270 万字）、
+;; localStorage の上限（ブラウザごとに違い、同じオリジンの mihari・dandori と
+;; 分け合う）では足りないことがあるため。読み書きの失敗は画面に出す。
+
+;; ns を宣言する —— scittle は各 script を同じ SCI 文脈で順に評価するので、
+;; 宣言しないと直前の script（kaikei.view）の ns のまま評価される。
+(ns kaikei.app
+  (:require [clojure.edn :as edn]
+            [reagent.dom :as rdom]
+            [re-frame.core :as rf]
+            [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.ingest :as ingest]
+            [kaikei.export :as export]
+            [kaikei.view :as view]))
+
+(def storage-key "itonami.kaikei.v1")
+
+;; ───────── effects / coeffects ─────────
+
+(def ^:private idb-name "itonami.kaikei")
+(def ^:private idb-store "state")
+
+(defn- idb-open
+  "IndexedDB を開く Promise（使えなければ reject）。"
+  []
+  (js/Promise.
+   (fn [resolve reject]
+     (try
+       (let [req (.open js/indexedDB idb-name 1)]
+         (set! (.-onupgradeneeded req) (fn [_] (.createObjectStore (.-result req) idb-store)))
+         (set! (.-onsuccess req) (fn [_] (resolve (.-result req))))
+         (set! (.-onerror req) (fn [_] (reject (.-error req)))))
+       (catch :default e (reject e))))))
+
+(defn- idb-request [mode f]
+  (-> (idb-open)
+      (.then (fn [idb]
+               (js/Promise.
+                (fn [resolve reject]
+                  (let [tx (.transaction idb idb-store mode)
+                        req (f (.objectStore tx idb-store))]
+                    (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve (.-result req))))
+                    (set! (.-onerror tx) (fn [_] (.close idb) (reject (.-error tx)))))))))))
+
+(defn- local-get [] (try (.getItem js/localStorage storage-key) (catch :default _ nil)))
+
+(rf/reg-fx
+ ::load
+ (fn [_]
+   ;; IndexedDB に無く localStorage にだけあるもの（前の版の保存）は、そちらを読む。
+   ;; 次の保存で IndexedDB へ移り、localStorage の分は消える。
+   (-> (idb-request "readonly" #(.get % storage-key))
+       (.then (fn [v] (rf/dispatch [::loaded (or v (local-get)) :indexeddb])))
+       (.catch (fn [_] (rf/dispatch [::loaded (local-get) :local-storage]))))))
+
+(rf/reg-fx
+ ::store
+ (fn [{:keys [saved backend]}]
+   (let [text (when saved (pr-str saved))
+         local! (fn []
+                  (try
+                    (if text
+                      (.setItem js/localStorage storage-key text)
+                      (.removeItem js/localStorage storage-key))
+                    (rf/dispatch [::stored-ok])
+                    (catch :default e (rf/dispatch [::store-failed (.-message e)]))))]
+     (if (= backend :local-storage)
+       (local!)
+       (-> (idb-request "readwrite" #(if text (.put % text storage-key) (.delete % storage-key)))
+           (.then (fn [_]
+                    (try (.removeItem js/localStorage storage-key) (catch :default _ nil))
+                    (rf/dispatch [::stored-ok])))
+           (.catch (fn [_] (local!))))))))
+
+(rf/reg-fx
+ ::download
+ (fn [{:keys [filename mime bytes]}]
+   (let [blob (js/Blob. #js [bytes] #js {:type mime})
+         url (.createObjectURL js/URL blob)
+         a (.createElement js/document "a")]
+     (set! (.-href a) url)
+     (set! (.-download a) filename)
+     (.click a)
+     (js/setTimeout #(.revokeObjectURL js/URL url) 1000))))
+
+(rf/reg-fx
+ ::read-file
+ (fn [file]
+   (when file
+     ;; バイト列のまま読む —— Shift_JIS の CSV を UTF-8 として読み壊さないため。
+     ;; 文字コードの判定は kaikei.encoding が持つ。
+     (-> (.arrayBuffer file)
+         (.then (fn [buf] (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file)])))))))
+
+;; ───────── events ─────────
+
+(defn- saved-state [db]
+  {:data (:data db) :settings (select-keys (:ui db) [:fy-start :pl-style])})
+
+(rf/reg-event-fx
+ :init
+ (fn [_ _]
+   {:db {:data core/empty-db :ui (assoc view/initial-ui :booting? true)}
+    ::load true}))
+
+(rf/reg-event-db
+ ::loaded
+ (fn [db [_ text backend]]
+   (let [stored (try (some-> text edn/read-string) (catch :default _ nil))
+         data (if (map? (:data stored)) (merge core/empty-db (:data stored)) core/empty-db)]
+     {:data data
+      :backend backend
+      :ui (merge (:ui db) {:booting? false} (select-keys (:settings stored) [:fy-start :pl-style]))})))
+
+(defn- reg-data-event
+  "data を変える event。handler は (fn [db event] db')。変えた data を ::store
+  effect で保存する（handler 自身は純関数のまま）。"
+  [id f]
+  (rf/reg-event-fx
+   id
+   (fn [{:keys [db]} event]
+     (let [db' (f db event)]
+       (cond-> {:db db'}
+         (or (not= (:data db) (:data db'))
+             (not= (saved-state db) (saved-state db')))
+         (assoc ::store {:backend (:backend db')
+                         :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db'))))
+                                  (saved-state db'))}))))))
+
+(defn- reg-ui-event [id f]
+  (rf/reg-event-db id (fn [db event] (f db event))))
+
+(rf/reg-event-db ::stored-ok (fn [db _] (assoc-in db [:ui :store-error] nil)))
+(rf/reg-event-db ::store-failed (fn [db [_ msg]] (assoc-in db [:ui :store-error] msg)))
+
+(reg-ui-event :set-mode (fn [db [_ m]] (assoc-in db [:ui :mode] m)))
+(reg-ui-event :toggle-import (fn [db _] (update-in db [:ui :import-open?] not)))
+(reg-ui-event :set-import (fn [db [_ field v]] (assoc-in db [:ui field] v)))
+(reg-ui-event :dismiss-import (fn [db _] (assoc-in db [:ui :import-result] nil)))
+(reg-ui-event :dismiss-export (fn [db _] (assoc-in db [:ui :export-result] nil)))
+(reg-ui-event :set-export-format (fn [db [_ v]] (update db :ui assoc :export-format v :export-encoding nil)))
+(reg-ui-event :set-export-encoding (fn [db [_ v]] (assoc-in db [:ui :export-encoding] v)))
+(reg-ui-event :ask-clear (fn [db _] (assoc-in db [:ui :confirm-clear?] true)))
+(reg-ui-event :cancel-clear (fn [db _] (assoc-in db [:ui :confirm-clear?] false)))
+(reg-ui-event :set-problems-only (fn [db [_ v]] (update db :ui assoc :problems-only? (boolean v) :journal-page 0)))
+(reg-ui-event :set-journal-page (fn [db [_ n]] (assoc-in db [:ui :journal-page] (max 0 n))))
+(reg-ui-event :show-problems (fn [db _] (update db :ui assoc :mode :journal :problems-only? true :journal-page 0)))
+(reg-ui-event :show-account (fn [db [_ a]] (update db :ui assoc :mode :accounts :account a)))
+
+(reg-ui-event :set-period-preset
+              (fn [db [_ v]]
+                (let [[from to] (text/split (str v) #"\|")]
+                  (if (and (core/parse-date from) (core/parse-date to))
+                    (update db :ui assoc :period {:from from :to to} :journal-page 0)
+                    db))))
+
+(reg-ui-event :set-period-date
+              (fn [db [_ k v]]
+                (let [current (view/period (:data db) (:ui db))]
+                  (if (and current (core/parse-date v))
+                    (update db :ui assoc :period (assoc current k (core/parse-date v)) :journal-page 0)
+                    db))))
+
+(reg-data-event :set-fy-start (fn [db [_ v]] (update db :ui assoc :fy-start (or (parse-long (str v)) 1) :period nil)))
+(reg-data-event :set-pl-style (fn [db [_ v]] (assoc-in db [:ui :pl-style] v)))
+
+(rf/reg-event-fx :import-file (fn [_ [_ file]] {::read-file file}))
+
+(defn- import-into [db result]
+  (let [mode (if (= "replace" (get-in db [:ui :import-mode])) :replace :append)
+        {data :db :keys [added duplicates error]} (core/merge-import (:data db) result mode)]
+    (-> db
+        (assoc :data data)
+        (update :ui assoc
+                :import-result (merge (select-keys result [:format :encoding :rejected :warnings])
+                                      {:added added :duplicates duplicates :error error})
+                :import-open? (zero? (or added 0))
+                :period nil
+                :journal-page 0))))
+
+(defn- import-opts [ui]
+  {:format (:import-format ui) :currency (:import-currency ui) :encoding (:import-encoding ui)})
+
+(reg-data-event
+ :run-import-bytes
+ (fn [db [_ bytes _filename]]
+   (import-into db (ingest/ingest-bytes bytes (import-opts (:ui db))))))
+
+(reg-data-event
+ :run-import-text
+ (fn [db _]
+   (let [db' (import-into db (ingest/ingest-text (get-in db [:ui :import-text]) (import-opts (:ui db))))]
+     (cond-> db'
+       (pos? (or (get-in db' [:ui :import-result :added]) 0)) (assoc-in [:ui :import-text] "")))))
+
+(reg-data-event
+ :load-sample
+ (fn [db _]
+   (-> db
+       (assoc :data (:db (core/merge-import (:data db) core/sample-import)))
+       (update :ui assoc :fy-start 4 :period nil))))
+
+(reg-data-event
+ :set-class
+ (fn [db [_ account v]]
+   (update db :data core/set-class account (keyword v))))
+
+(reg-data-event
+ :clear-all
+ (fn [db _]
+   (assoc db :data core/empty-db :ui view/initial-ui)))
+
+(rf/reg-event-fx
+ :export
+ (fn [{:keys [db]} _]
+   (let [ui (:ui db)
+         result (export/export (:data db) (:export-format ui)
+                               (cond-> {} (:export-encoding ui) (assoc :encoding (:export-encoding ui))))]
+     (cond-> {:db (assoc-in db [:ui :export-result] (select-keys result [:error :notes :filename]))}
+       (:bytes result) (assoc ::download (select-keys result [:filename :mime :bytes]))))))
+
+;; ───────── subscription / 描画 ─────────
+
+(rf/reg-sub ::data (fn [db _] (:data db)))
+(rf/reg-sub ::ui (fn [db _] (:ui db)))
+
+;; 期間は値（{:from :to}）なので、ui の他の欄が変わっても帳票は計算し直さない
+(rf/reg-sub ::period :<- [::data] :<- [::ui] (fn [[data ui] _] (view/period data ui)))
+(rf/reg-sub ::derived :<- [::data] :<- [::period] (fn [[data p] _] (view/derive data p)))
+
+(defn- handlers
+  "kaikei.view の h。ev は re-frame の event ベクタ。"
+  [kind ev]
+  (case kind
+    :click (fn [_] (rf/dispatch ev))
+    :value (fn [e] (rf/dispatch (conj ev (.. e -target -value))))
+    :checked (fn [e] (rf/dispatch (conj ev (.. e -target -checked))))
+    :file (fn [e] (rf/dispatch (conj ev (aget (.. e -target -files) 0))))
+    nil))
+
+(defn root []
+  (let [data @(rf/subscribe [::data])
+        ui @(rf/subscribe [::ui])
+        derived @(rf/subscribe [::derived])]
+    [:<>
+     (when-let [e (:store-error ui)]
+       [:p {:class "kk-warnings kk-app" :role "alert"}
+        (str "この端末に保存できませんでした（" e "）。書き出して手元に残してください。")])
+     ;; :booting? の間は SSR と同じ「読み込んでいます」を描く（保存の読み出しは非同期）
+     (view/root {:data data :ui ui} derived handlers)]))
+
+(rf/dispatch-sync [:init])
+(rdom/render [root] (.getElementById js/document "app"))

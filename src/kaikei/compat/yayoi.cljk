@@ -1,0 +1,180 @@
+(ns kaikei.compat.yayoi
+  "弥生会計の仕訳日記帳「弥生インポート形式」。形の正本は弥生のサポート
+  「仕訳データの項目と記述形式」（https://support.yayoi-kk.co.jp/subcontents.html?page_id=18545、
+  2026-10-22 に確認）と、同じページ群の記述ルール（page_id=18586）・項目数と
+  文字コード（faq page_id=31478）・税区分の記述形式（faq page_id=18111）:
+
+  - 1 行 1 仕訳行、**25 項目（A〜Y）**、見出し行は無い。`#` で始まる行は注釈で
+    取り込まれない。
+    識別フラグ 伝票No. 決算 取引日付
+    借方勘定科目 借方補助科目 借方部門 借方税区分 借方金額 借方税金額
+    貸方勘定科目 貸方補助科目 貸方部門 貸方税区分 貸方金額 貸方税金額
+    摘要 番号 期日 タイプ 生成元 仕訳メモ 付箋1 付箋2 調整
+  - 識別フラグ: 2000 = 伝票以外の仕訳（1 行）、2111 = 1 行の伝票、
+    2110／2100／2101 = 複数行の伝票の 先頭／中間／最終 行。複数行の伝票は
+    先頭行の日付・決算・伝票No.・タイプを使う。
+  - 決算: 空 = 通常、中決 = 中間決算、本決 = 本決算。
+  - 取引日付: 20190701・2019/07/01・2019/7/1・R01/07/01・R01/7/1。
+  - 税区分は必須（勘定科目の無い側も 対象外）。インボイスの区分は税区分の
+    文字列の末尾に付く（例 課対仕入内10%適格、課対仕入内10%区分80%）。
+  - 金額は整数、税込（仕入税額控除の前）。勘定科目の無い側は 0。
+  - タイプ: 0 仕訳、1 出金伝票、2 入金伝票、3 振替伝票。調整: yes／no。
+  - 文字コードは「ANSI」（Excel の「CSV（コンマ区切り）」）。日本語版
+    Windows の ANSI は Shift_JIS（CP932）だというのは kaikei の推定で、弥生の
+    記述ではない。
+
+  書き出しは freee の弥生形式の書き出し（support.freee.co.jp 204599604）と同じ
+  値の選び方: 1 行の仕訳は 2000・タイプ 0、複数行は 2110〜2101・タイプ 3、
+  決算整理は 本決、付箋は 0、調整は no。kaikei の行に弥生の税区分が無いときは
+  対象外 と書き、その行数を注記する（税区分を推測しない）。
+
+  弥生会計 オンラインの 27 項目版（取引先名の 2 列が足される）も読む。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]
+            [kaikei.compat.common :as common]))
+
+(def columns
+  ["識別フラグ" "伝票No." "決算" "取引日付"
+   "借方勘定科目" "借方補助科目" "借方部門" "借方税区分" "借方金額" "借方税金額"
+   "貸方勘定科目" "貸方補助科目" "貸方部門" "貸方税区分" "貸方金額" "貸方税金額"
+   "摘要" "番号" "期日" "タイプ" "生成元" "仕訳メモ" "付箋1" "付箋2" "調整"])
+
+(def ^:private flags #{"2000" "2111" "2110" "2100" "2101"})
+
+(defn- data-rows [rows]
+  (remove #(text/starts-with? (text/trim (str (first %))) "#") rows))
+
+(defn detect?
+  "見出しの無い行で、先頭の欄が識別フラグ、項目が 25（オンラインは 27）あれば弥生。"
+  [rows]
+  (let [rs (take 5 (data-rows rows))]
+    (and (seq rs)
+         (every? #(and (flags (text/trim (str (first %)))) (#{25 27} (count %))) rs))))
+
+(defn- cell [row i] (common/blank->nil (get row i)))
+
+(defn- side [row base where]
+  ;; base = 4（借方）か 10（貸方）。並び: 勘定科目 補助科目 部門 税区分 金額 税金額
+  (let [account (cell row base)
+        amount-text (get row (+ base 4) "")
+        {:keys [amount problem]} (common/read-amount amount-text 0 (str where (if (= base 4) " 借方金額" " 貸方金額")))
+        tax (common/read-amount (get row (+ base 5) "") 0 (str where " 税金額"))
+        tax-code (cell row (+ base 3))]
+    (cond
+      problem {:problem problem}
+      (:problem tax) {:problem (:problem tax)}
+      (and (nil? account) (zero? amount)) nil
+      :else
+      {:line (cond-> {:account (or account "")
+                      :debit (if (= base 4) amount 0)
+                      :credit (if (= base 10) amount 0)}
+               (cell row (+ base 1)) (assoc :sub-account (cell row (+ base 1)))
+               (cell row (+ base 2)) (assoc :department (cell row (+ base 2)))
+               (and tax-code (or account (not= tax-code "対象外"))) (assoc :tax {:scheme :yayoi :code tax-code})
+               (pos? (:amount tax)) (assoc :tax-amount (:amount tax))
+               (and (= 27 (count row)) (cell row (if (= base 4) 25 26))) (assoc :partner (cell row (if (= base 4) 25 26))))})))
+
+(defn- read-group [rows]
+  (let [first-row (first rows)
+        line-no (::line (meta first-row))
+        where (str "行 " line-no)
+        date (core/parse-date (get first-row 3))
+        settle (cell first-row 2)
+        parts (vec (for [row rows
+                         :let [w (str "行 " (::line (meta row)))
+                               memo (cell row 16)]
+                         base [4 10]
+                         :let [s (side row base w)]
+                         :when s]
+                     (if (:line s) {:line (cond-> (:line s) memo (assoc :description memo))} s)))
+        p (common/first-problem parts)]
+    (cond
+      p {:problem (:problem p)}
+      (nil? date) {:problem (str where ": 取引日付 \"" (get first-row 3) "\" を読めません")}
+      :else
+      {:entry (cond-> {:date date
+                       :lines (mapv :line parts)
+                       :origin (cond-> {:format :yayoi :flag (cell first-row 0)}
+                                 (cell first-row 19) (assoc :type (cell first-row 19))
+                                 settle (assoc :settlement settle))}
+                (cell first-row 1) (assoc :number (cell first-row 1))
+                (cell first-row 16) (assoc :memo (cell first-row 16))
+                (cell first-row 21) (assoc :note (cell first-row 21))
+                (#{"中決" "本決"} settle) (assoc :adjustment? true))})))
+
+(defn- groups
+  "識別フラグで仕訳にまとめる。2000・2111 は 1 行で 1 仕訳、2110 で始まり
+  2101 で終わる行が 1 仕訳。形の壊れた並びは問題として返す。"
+  [rows]
+  (loop [rows rows, open nil, out []]
+    (if-let [row (first rows)]
+      (let [flag (text/trim (str (first row)))
+            line-no (::line (meta row))]
+        (case flag
+          ("2000" "2111") (recur (rest rows) nil (cond-> out open (conj {:problem (str "行 " line-no ": 2101 で閉じていない複数行の伝票があります")}) true (conj [row])))
+          "2110" (recur (rest rows) [row] (cond-> out open (conj {:problem (str "行 " line-no ": 2101 で閉じていない複数行の伝票があります")})))
+          "2100" (if open
+                   (recur (rest rows) (conj open row) out)
+                   (recur (rest rows) nil (conj out {:problem (str "行 " line-no ": 2110 の無い中間行（2100）です")})))
+          "2101" (if open
+                   (recur (rest rows) nil (conj out (conj open row)))
+                   (recur (rest rows) nil (conj out {:problem (str "行 " line-no ": 2110 の無い最終行（2101）です")})))
+          (recur (rest rows) open (conj out {:problem (str "行 " line-no ": 識別フラグ \"" flag "\" を知りません")}))))
+      (cond-> out open (conj {:problem "最後の複数行の伝票が 2101 で閉じていません"})))))
+
+(defn read-rows
+  "parse 済みの CSV 行 → 取り込み結果（通貨は JPY）。"
+  [rows]
+  (let [rows (keep-indexed (fn [i r] (when-not (text/starts-with? (text/trim (str (first r))) "#")
+                                       (with-meta (vec r) {::line (inc i)})))
+                           rows)
+        bad-width (filter #(not (#{25 27} (count %))) rows)
+        candidates (map #(if (:problem %) % (read-group %)) (groups (remove (set bad-width) rows)))]
+    (merge {:format :yayoi :currency "JPY" :accounts []}
+           (update (common/finish candidates) :warnings
+                   (fn [w] (cond-> w
+                             (seq bad-width)
+                             (conj (str "項目が 25（オンライン版は 27）でない行 " (count bad-width)
+                                        " 行は読んでいません（例: 行 " (::line (meta (first bad-width))) "）"))))))))
+
+(defn rows [db]
+  (let [filled (atom 0)
+        tax-or-fill (fn [l]
+                      (or (common/tax-code l :yayoi)
+                          (do (when l (swap! filled inc)) "対象外")))
+        out (apply concat
+                   (for [e (:entries db)
+                         :let [pairs (vec (common/pair-rows e))
+                               n (count pairs)
+                               settle (if (:adjustment? e) (or (get-in e [:origin :settlement]) "本決") "")
+                               from-yayoi? (= :yayoi (get-in e [:origin :format]))
+                               single-flag (if (and from-yayoi? (= "2111" (get-in e [:origin :flag]))) "2111" "2000")
+                               kind (or (when from-yayoi? (get-in e [:origin :type])) (if (= n 1) "0" "3"))]]
+                     (map-indexed
+                      (fn [i [d c]]
+                        (let [flag (cond (= n 1) single-flag (zero? i) "2110" (= i (dec n)) "2101" :else "2100")
+                              first? (zero? i)
+                              side (fn [l]
+                                     [(:account l) (:sub-account l) (:department l) (tax-or-fill l)
+                                      (str (+ (:debit l 0) (:credit l 0))) (some-> (:tax-amount l) str)])]
+                          (vec (concat [flag (if first? (:number e) nil) (if first? settle nil)
+                                        (core/slash-date (:date e))]
+                                       (side d) (side c)
+                                       [(or (:description d) (:description c) (:memo e)) nil nil
+                                        kind nil (when first? (:note e)) "0" "0" "no"]))))
+                      pairs)))
+        out (doall out)]
+    {:rows out :filled @filled}))
+
+(defn write [db]
+  (if (not= "JPY" (:currency db))
+    {:error (str "弥生インポート形式は円の金額です。帳簿の通貨が " (:currency db) " なので書き出しません")}
+    (let [{:keys [rows filled]} (rows db)]
+      {:text (csv/write rows)
+       :notes (cond-> []
+                (pos? filled) (conj (str "弥生の税区分が無い " filled " 行は 対象外 と書きました（弥生は税区分が必須です。税区分を推測していません）"))
+                (common/lossy-note db :yayoi {:partner "取引先" :tracking "Xero の tracking"
+                                              :invoice "インボイス区分（弥生は税区分の末尾に付けます）"})
+                (conj (common/lossy-note db :yayoi {:partner "取引先" :tracking "Xero の tracking"
+                                                    :invoice "インボイス区分（弥生は税区分の末尾に付けます）"})))})))

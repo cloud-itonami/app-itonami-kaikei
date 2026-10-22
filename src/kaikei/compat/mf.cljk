@@ -1,0 +1,167 @@
+(ns kaikei.compat.mf
+  "マネーフォワード クラウド会計の仕訳帳 CSV。列（A〜AA の 27 列、1 行目は
+  見出し）の正本は、マネーフォワード クラウド会計 使い方ガイド「仕訳帳の
+  インポート」（https://biz.moneyforward.com/support/account/guide/import-books/ib01.html、
+  2026-10-22 に確認）:
+
+    取引No 取引日
+    借方勘定科目 借方補助科目 借方部門 借方取引先 借方税区分 借方インボイス 借方金額(円) 借方税額
+    貸方勘定科目 貸方補助科目 貸方部門 貸方取引先 貸方税区分 貸方インボイス 貸方金額(円) 貸方税額
+    摘要 仕訳メモ タグ MF仕訳タイプ 決算整理仕訳 作成日時 作成者 最終更新日時 最終更新者
+
+  - 1 行は借方 1 つ・貸方 1 つ（片側が空の行もある）。
+  - 取引No と取引日が同じ連続した行が 1 つの仕訳（MF の複合仕訳の条件）。
+  - インボイス列は 適格／80％控除／70％控除（2026-10-01〜）／…／控除なし（％ は
+    全角）。空欄は適格として扱われる（MF の規則）。
+  - 決算整理仕訳は何か書いてあれば決算整理。MF仕訳タイプは | 区切りで、空は
+    インポート。
+  - 税区分は MF の正式名称か省略名（課税売上 10%・課仕 10% など）。
+  - 取り込みが受ける文字コードは未確認（MF の書き出しは「各種設定 → 事業者 →
+    文字コード」の Shift-JIS か UTF-8 に従う）。
+  - 作成日時〜最終更新者は MF が付けるもので、取り込みでは入力不要。書き出しでは
+    空にする。
+
+  見出しは前後の空白・全角括弧・「No.」の点の違いを吸収して照合する。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]
+            [kaikei.compat.common :as common]))
+
+(def columns
+  ["取引No" "取引日"
+   "借方勘定科目" "借方補助科目" "借方部門" "借方取引先" "借方税区分" "借方インボイス" "借方金額(円)" "借方税額"
+   "貸方勘定科目" "貸方補助科目" "貸方部門" "貸方取引先" "貸方税区分" "貸方インボイス" "貸方金額(円)" "貸方税額"
+   "摘要" "仕訳メモ" "タグ" "MF仕訳タイプ" "決算整理仕訳" "作成日時" "作成者" "最終更新日時" "最終更新者"])
+
+(defn normalize-header
+  "見出しの表記ゆれを畳む: 空白を除き、全角括弧を半角に、「No.」の点を外す。"
+  [h]
+  (-> (str h) text/trim
+      (text/replace #"[\s　]" "")
+      (text/replace "（" "(") (text/replace "）" ")")
+      (text/replace #"(?i)no\." "No")))
+
+(def ^:private column-set (set (map normalize-header columns)))
+
+(defn detect?
+  "CSV の行（parse 済み）が MF の仕訳帳か。見出しに 取引No・取引日・借方勘定科目・
+  借方金額(円) があれば MF とみなす。"
+  [rows]
+  (let [h (set (map normalize-header (first rows)))]
+    (every? h (map normalize-header ["取引No" "取引日" "借方勘定科目" "借方金額(円)"]))))
+
+(defn- side [rec prefix exp where]
+  (let [get* (fn [k] (common/blank->nil (get rec (normalize-header (str prefix k)))))
+        account (get* "勘定科目")
+        amount-text (get rec (normalize-header (str prefix "金額(円)")) "")]
+    (when (or account (common/blank->nil amount-text))
+      (let [{:keys [amount problem]} (common/read-amount amount-text 0 (str where " " prefix "金額"))
+            tax (common/read-amount (get rec (normalize-header (str prefix "税額")) "") 0 (str where " " prefix "税額"))]
+        (cond
+          problem {:problem problem}
+          (:problem tax) {:problem (:problem tax)}
+          :else
+          {:line (cond-> {:account (or account "")
+                          :debit (if (= prefix "借方") amount 0)
+                          :credit (if (= prefix "貸方") amount 0)}
+                   (get* "補助科目") (assoc :sub-account (get* "補助科目"))
+                   (get* "部門") (assoc :department (get* "部門"))
+                   (get* "取引先") (assoc :partner (get* "取引先"))
+                   (get* "税区分") (assoc :tax {:scheme :mf :code (get* "税区分")})
+                   (get* "インボイス") (assoc :invoice {:scheme :mf :code (get* "インボイス")})
+                   (pos? (:amount tax)) (assoc :tax-amount (:amount tax)))})))))
+
+(defn- read-group [rows]
+  (let [first-rec (first rows)
+        no (common/blank->nil (get first-rec (normalize-header "取引No")))
+        where (str "行 " (::csv/row first-rec) (when no (str "（取引No " no "）")))
+        date-text (get first-rec (normalize-header "取引日"))
+        date (core/parse-date date-text)
+        parts (vec (for [rec rows
+                         :let [w (str "行 " (::csv/row rec))
+                               memo (common/blank->nil (get rec (normalize-header "摘要")))]
+                         prefix ["借方" "貸方"]
+                         :let [s (side rec prefix 0 w)]
+                         :when s]
+                     (if (:line s)
+                       {:line (cond-> (:line s) memo (assoc :description memo))}
+                       s)))
+        p (common/first-problem parts)
+        get1 (fn [k] (common/blank->nil (get first-rec (normalize-header k))))
+        adjustment (get1 "決算整理仕訳")]
+    (cond
+      p {:problem (:problem p)}
+      (nil? date) {:problem (str where ": 取引日 \"" date-text "\" を読めません")}
+      :else
+      {:entry (cond-> {:date date
+                       :lines (mapv :line parts)
+                       :origin (cond-> {:format :mf}
+                                 no (assoc :id no)
+                                 (get1 "タグ") (assoc :tags (get1 "タグ"))
+                                 (get1 "MF仕訳タイプ") (assoc :mf-type (get1 "MF仕訳タイプ"))
+                                 adjustment (assoc :adjustment-text adjustment))}
+                no (assoc :number no)
+                (get1 "摘要") (assoc :memo (get1 "摘要"))
+                (get1 "仕訳メモ") (assoc :note (get1 "仕訳メモ"))
+                adjustment (assoc :adjustment? true))})))
+
+(defn- groups
+  "取引No と取引日が同じ連続した行をまとめる（MF の複合仕訳の条件）。取引No が
+  空の行は 1 行で 1 仕訳。"
+  [recs]
+  (let [k (normalize-header "取引No")
+        d (normalize-header "取引日")
+        key-of (fn [rec] (when-let [no (common/blank->nil (get rec k))] [no (common/blank->nil (get rec d))]))]
+    (reduce (fn [acc rec]
+              (let [kk (key-of rec)
+                    prev (peek acc)]
+                (if (and kk prev (= kk (key-of (first prev))))
+                  (conj (pop acc) (conj prev rec))
+                  (conj acc [rec]))))
+            [] recs)))
+
+(defn read-rows
+  "parse 済みの CSV 行 → 取り込み結果（通貨は JPY）。"
+  [rows]
+  (let [header (mapv normalize-header (first rows))
+        unknown (remove column-set header)
+        recs (csv/records (cons header (rest rows)))]
+    (merge {:format :mf :currency "JPY" :accounts []}
+           (update (common/finish (map read-group (groups recs))) :warnings
+                   (fn [w] (cond-> w
+                             (seq (remove text/blank? unknown))
+                             (conj (str "知らない列を読み飛ばしました: " (text/join "、" (remove text/blank? unknown))))))))))
+
+(defn rows
+  "db → MF の仕訳帳 CSV の行（見出し込み）。取引No は仕訳ごとの連番。"
+  [db]
+  (cons columns
+        (apply concat
+               (map-indexed
+                (fn [i e]
+                  (for [[d c] (common/pair-rows e)]
+                    (let [cols (fn [l]
+                                 (if l
+                                   [(:account l) (:sub-account l) (:department l) (:partner l)
+                                    (common/tax-code l :mf) (common/invoice-code l :mf)
+                                    (str (+ (:debit l 0) (:credit l 0))) (some-> (:tax-amount l) str)]
+                                   (repeat 8 nil)))]
+                      (vec (concat [(str (inc i)) (core/slash-date (:date e))]
+                                   (cols d) (cols c)
+                                   [(or (:description d) (:description c) (:memo e))
+                                    (:note e)
+                                    (get-in e [:origin :tags])
+                                    (when (= :mf (get-in e [:origin :format])) (get-in e [:origin :mf-type]))
+                                    (when (:adjustment? e) (or (get-in e [:origin :adjustment-text]) "決算整理"))
+                                    nil nil nil nil])))))
+                (:entries db)))))
+
+(defn write [db]
+  (if (not= "JPY" (:currency db))
+    {:error (str "MF の仕訳帳は円の金額です。帳簿の通貨が " (:currency db) " なので書き出しません")}
+    {:text (csv/write (rows db))
+     :notes (cond-> []
+            (common/lossy-note db :mf {:tax "税区分（MF 以外の形式のもの）" :invoice "インボイス区分（MF 以外の形式のもの）"
+                                       :tracking "Xero の tracking"})
+            (conj (common/lossy-note db :mf {:tax "税区分（MF 以外の形式のもの）" :invoice "インボイス区分（MF 以外の形式のもの）"
+                                             :tracking "Xero の tracking"})))}))

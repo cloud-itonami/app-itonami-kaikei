@@ -1,0 +1,105 @@
+;; kaikei の parity fixture — guest（aiueos/kaikei_journal.cljk）と adapter
+;; （src/kaikei/core.cljk）が同じ入力に同じ i64 を返すことの表。
+;;
+;; 3 か所がこの表を読む / 写す:
+;;   1. test/kaikei/parity_test.cljk       — adapter で全行を照合する（kbb）
+;;   2. aiueos/kaikei_journal.cljk の test-* — 同じ行を手で写す（amu test、3 target）
+;;   3. test/guest_parity.mjs              — 同じ表を wasm（kototama-browser-host-v1）で回す
+;;
+;; 行を足したら 2 も足す。件数は parity_test が数えて guest の docstring と照合する。
+;;
+;; :buffers の名前（keyword）は :args の中でその buffer に置き換わる。
+;; :sample は guest の sample-ledger と同じ帳簿（[date class debit credit] × 20 行）。
+;; 区分: 1 流動資産 … 6 純資産、7 売上高 … 14 法人税等（guest の docstring）。
+{:buffers
+ {:sample [20260331 1 1000000 0       20260331 6 0 1000000
+           20260401 1 200000 0        20260401 5 0 200000
+           20260410 1 330000 0        20260410 7 0 330000
+           20260420 8 110000 0        20260420 1 0 110000
+           20260525 9 80000 0         20260525 1 0 80000
+           20260630 1 500 0           20260630 10 0 500
+           20260715 11 2000 0         20260715 1 0 2000
+           20260801 13 10000 0        20260801 1 0 10000
+           20260901 1 5000 0          20260901 12 0 5000
+           20270331 14 30000 0        20270331 4 0 30000]
+  :unclassified [20260101 0 100 0 20260101 1 0 100]
+  :unbalanced [20260101 1 100 0 20260101 7 0 90]}
+
+ :rows
+ [;; validate-entry [debit credit] × n → エラービット
+  {:fn "validate-entry" :args [[100 0 0 100]] :expect 0}
+  {:fn "validate-entry" :args [[]] :expect 1}
+  {:fn "validate-entry" :args [[100 0 50]] :expect 2}
+  {:fn "validate-entry" :args [[100 0 -100 0]] :expect 4}
+  {:fn "validate-entry" :args [[100 0 0 100 0 0]] :expect 8}
+  {:fn "validate-entry" :args [[100 0 50 100 0 50]] :expect 16}
+  {:fn "validate-entry" :args [[100 0 0 90]] :expect 32}
+
+  ;; entry-balanced?
+  {:fn "entry-balanced?" :args [[300 0 0 200 0 100]] :expect 1}
+  {:fn "entry-balanced?" :args [[100 0 0 90]] :expect 0}
+
+  ;; ledger-balanced? [account debit credit] × n
+  {:fn "ledger-balanced?" :args [[1 300 0 2 0 300]] :expect 1}
+  {:fn "ledger-balanced?" :args [[1 300 0 2 0 200]] :expect 0}
+
+  ;; account-net
+  {:fn "account-net" :args [[1 300 0 2 0 300 1 0 50] 1] :expect 250}
+
+  ;; class-valid?
+  {:fn "class-valid?" :args [0] :expect 0}
+  {:fn "class-valid?" :args [1] :expect 1}
+  {:fn "class-valid?" :args [14] :expect 1}
+  {:fn "class-valid?" :args [15] :expect 0}
+
+  ;; normal-sign — 借方が正 1、貸方が正 -1、未分類・範囲外 0
+  {:fn "normal-sign" :args [1] :expect 1}
+  {:fn "normal-sign" :args [4] :expect -1}
+  {:fn "normal-sign" :args [7] :expect -1}
+  {:fn "normal-sign" :args [0] :expect 0}
+
+  ;; period-net [buf class from to] — 借方 − 貸方
+  {:fn "period-net" :args [:sample 1 0 99991231] :expect 1333500}
+  {:fn "period-net" :args [:sample 1 20260401 20270331] :expect 333500}
+  {:fn "period-net" :args [:sample 7 20260401 20270331] :expect -330000}
+  {:fn "period-net" :args [:sample 6 0 20260331] :expect -1000000}
+  {:fn "period-net" :args [:sample 9 20260601 20260630] :expect 0}
+
+  ;; class-balance — 正の側で見た残高
+  {:fn "class-balance" :args [:sample 7 20260401 20270331] :expect 330000}
+  {:fn "class-balance" :args [:sample 1 0 99991231] :expect 1333500}
+  {:fn "class-balance" :args [:sample 4 0 99991231] :expect 30000}
+  {:fn "class-balance" :args [:sample 8 20260401 20270331] :expect 110000}
+
+  ;; profit-stage [buf stage from to]
+  {:fn "profit-stage" :args [:sample 1 20260401 20270331] :expect 220000}
+  {:fn "profit-stage" :args [:sample 2 20260401 20270331] :expect 140000}
+  {:fn "profit-stage" :args [:sample 3 20260401 20270331] :expect 138500}
+  {:fn "profit-stage" :args [:sample 4 20260401 20270331] :expect 133500}
+  {:fn "profit-stage" :args [:sample 5 20260401 20270331] :expect 103500}
+  {:fn "profit-stage" :args [:sample 0 20260401 20270331] :expect 0}
+  {:fn "profit-stage" :args [:sample 6 20260401 20270331] :expect 0}
+  {:fn "profit-stage" :args [:sample 5 20260401 20260630] :expect 140500}
+
+  ;; unclassified-count
+  {:fn "unclassified-count" :args [:sample] :expect 0}
+  {:fn "unclassified-count" :args [:unclassified] :expect 1}
+  {:fn "unclassified-count" :args [[]] :expect 0}
+
+  ;; bs-difference [buf to] — 資産 − (負債 + 純資産 + 損益の累計)
+  {:fn "bs-difference" :args [:sample 20270331] :expect 0}
+  {:fn "bs-difference" :args [:sample 20260331] :expect 0}
+  {:fn "bs-difference" :args [:unclassified 20261231] :expect -100}
+
+  ;; statement-balanced?
+  {:fn "statement-balanced?" :args [:sample 20270331] :expect 1}
+  {:fn "statement-balanced?" :args [:unclassified 20261231] :expect 0}
+  {:fn "statement-balanced?" :args [:unbalanced 20261231] :expect 0}
+
+  ;; statement-buffer-valid?
+  {:fn "statement-buffer-valid?" :args [:sample] :expect 1}
+  {:fn "statement-buffer-valid?" :args [[]] :expect 1}
+  {:fn "statement-buffer-valid?" :args [[20260101 1 100]] :expect 0}
+  {:fn "statement-buffer-valid?" :args [[20260101 15 100 0]] :expect 0}
+  {:fn "statement-buffer-valid?" :args [[20260101 1 -100 0]] :expect 0}
+  {:fn "statement-buffer-valid?" :args [[-1 1 100 0]] :expect 0}]}

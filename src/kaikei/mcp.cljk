@@ -1,0 +1,321 @@
+(ns kaikei.mcp
+  "kaikei を itonami agent の tool にする MCP の中身（Linear JUN-304）。
+
+  `bin/kaikei-mcp` が stdio の JSON-RPC をここへ渡し、ここが応答を返す。この
+  ns は I/O をしない —— 1 通のメッセージ（文字列キーの map）を受けて、応答の
+  map（通知なら nil）を返す純関数だけを持つ。判定は画面と同じ adapter
+  （kaikei.core / ingest / export）で、書き直さない。
+
+  tool は 5 つ。どれも送信せず、保存せず、各社（MoneyForward・freee・弥生・
+  QuickBooks・Xero）の API にも接続しない:
+
+    kaikei_import    仕訳のファイル（テキストか base64 のバイト列）→ kaikei の帳簿 JSON
+    kaikei_validate  帳簿 JSON の検査（貸借一致・未分類の勘定科目・問題のある仕訳）
+    kaikei_report    帳簿 JSON → 試算表・P/L・B/S（kaikei・QBO・Xero の形）
+    kaikei_export    帳簿 JSON → 各形式のテキスト（Shift_JIS は base64）
+    kaikei_convert   仕訳のファイル → 別の形式（import と export を 1 回で）
+
+  帳簿 JSON は kaikei.ledger.v1（kaikei.compat.native）。tool の間で受け渡す。
+
+  入力の不正は JSON-RPC の error ではなく tool の結果（isError true、本文は
+  {\"error\" \"<名前>\" …}）で返す。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.encoding :as enc]
+            [kaikei.export :as export]
+            [kaikei.ingest :as ingest]
+            [kaikei.json :as json]
+            [kaikei.compat.common :as common]
+            [kaikei.compat.native :as native]))
+
+(def server-name "kaikei")
+(def server-version "0.1.0")
+(def default-protocol-version "2024-11-05")
+
+(def max-bytes
+  "取り込む文字列・バイト列の上限（UTF-8 バイト）。"
+  (* 5 1024 1024))
+
+;; ───────── 入力の検査 ─────────
+
+(defn- tool-error [code & {:as detail}]
+  (ex-info code {::tool-error (merge {"error" code} detail)}))
+
+(defn- reject-unknown [args allowed]
+  (when-let [extra (seq (remove (set allowed) (keys args)))]
+    (throw (tool-error "unknown-argument" "arguments" (vec (sort extra))))))
+
+(defn- enum-arg [args k allowed default]
+  (let [v (get args k default)]
+    (if (some #(= v %) allowed)
+      v
+      (throw (tool-error "invalid-argument" "argument" k "expected" (vec allowed))))))
+
+(defn- date-arg [args k]
+  (let [v (get args k)]
+    (or (when (string? v) (core/parse-date v))
+        (throw (tool-error "invalid-date" "argument" k "expected" "YYYY-MM-DD")))))
+
+(defn- input-bytes
+  "text か bytes_base64 のどちらか 1 つ → Uint8Array。"
+  [args]
+  (let [t (get args "text")
+        b (get args "bytes_base64")]
+    (cond
+      (and t b) (throw (tool-error "invalid-argument" "detail" "give text or bytes_base64, not both"))
+      (string? t) (let [bytes (:bytes (enc/encode t "utf-8"))]
+                    (if (> (enc/bytes-length bytes) max-bytes)
+                      (throw (tool-error "input-too-large" "limit_bytes" max-bytes))
+                      bytes))
+      (string? b) (let [bytes (try (enc/base64->bytes b)
+                                   (catch #?(:cljs :default :clj Exception) _
+                                     (throw (tool-error "invalid-base64" "argument" "bytes_base64"))))]
+                    (if (> (enc/bytes-length bytes) max-bytes)
+                      (throw (tool-error "input-too-large" "limit_bytes" max-bytes))
+                      bytes))
+      :else (throw (tool-error "invalid-argument" "detail" "text or bytes_base64 is required")))))
+
+(defn- ledger-arg
+  "帳簿 JSON（kaikei.ledger.v1 のオブジェクト）→ db。"
+  [args]
+  (let [v (get args "ledger")]
+    (when-not (native/detect? v)
+      (throw (tool-error "invalid-argument" "argument" "ledger"
+                         "expected" "kaikei.ledger.v1 object (kaikei_import output)")))
+    (let [{:keys [warnings] :as parsed} (native/read-data v)]
+      (when (seq warnings)
+        (throw (tool-error "invalid-ledger" "detail" (vec warnings))))
+      (:db (core/merge-import core/empty-db parsed)))))
+
+;; ───────── 出力の形 ─────────
+
+(defn- ledger-out [db] (json/parse (native/write db)))
+
+(defn- checks-out [db]
+  (let [to (or (some-> (core/date-range db) second core/date-int) core/max-date)
+        c (core/checks db to)]
+    {"balanced" (:balanced? c)
+     "bs_difference" (:bs-difference c)
+     "unclassified_accounts" (:unclassified-accounts c)
+     "unclassified_lines" (:unclassified-lines c)
+     "invalid_entries" (:invalid-entries c)}))
+
+(defn- import-opts [args]
+  (cond-> {:format (enum-arg args "format" (cons "auto" ingest/format-ids) "auto")
+           :encoding (enum-arg args "encoding" ["auto" "utf-8" "shift_jis"] "auto")
+           :currency (enum-arg args "currency" (sort (keys core/currency-exponent)) "JPY")}
+    (get args "date_order") (assoc :date-order (enum-arg args "date_order" ["mdy" "dmy"] nil))))
+
+(defn- read-input [args]
+  (let [parsed (ingest/ingest-bytes (input-bytes args) (import-opts args))
+        {:keys [db error]} (core/merge-import core/empty-db parsed)]
+    (when error (throw (tool-error "currency-mismatch" "detail" error)))
+    {:parsed parsed :db db}))
+
+(defn- export-out [db fmt args]
+  (let [{:keys [error text bytes encoding notes]}
+        (export/export db fmt (cond-> {}
+                                (get args "encoding") (assoc :encoding (get args "encoding"))
+                                (get args "output_date_order") (assoc :date-order (get args "output_date_order"))))]
+    (when error (throw (tool-error "cannot-export" "detail" error)))
+    (cond-> {"format" fmt "encoding" encoding "notes" (vec notes)}
+      (= encoding "shift_jis") (assoc "bytes_base64" (enc/bytes->base64 bytes))
+      (not= encoding "shift_jis") (assoc "text" text))))
+
+;; ───────── tools ─────────
+
+(defn import-tool [args]
+  (reject-unknown args ["text" "bytes_base64" "format" "encoding" "currency" "date_order"])
+  (let [{:keys [parsed db]} (read-input args)]
+    {"format" (some-> (:format parsed) name)
+     "encoding" (:encoding parsed)
+     "entries" (count (:entries db))
+     "rejected" (:rejected parsed 0)
+     "warnings" (vec (:warnings parsed))
+     "checks" (checks-out db)
+     "ledger" (ledger-out db)}))
+
+(defn validate-tool [args]
+  (reject-unknown args ["ledger"])
+  (let [db (ledger-arg args)
+        bad (core/invalid-entries db)]
+    (assoc (checks-out db)
+           "problems" (vec (for [e (take 100 bad)]
+                             {"id" (:id e) "date" (:date e)
+                              "problems" (vec (sort (map name (core/entry-problems e))))})))))
+
+(defn report-tool [args]
+  (reject-unknown args ["ledger" "report" "shape" "from" "to"])
+  (let [db (ledger-arg args)
+        kind (enum-arg args "report" export/reports nil)
+        shape (enum-arg args "shape" export/shapes "kaikei")
+        from (date-arg args "from")
+        to (date-arg args "to")]
+    (when (pos? (compare from to))
+      (throw (tool-error "invalid-argument" "detail" "from must not be after to")))
+    {"report" kind "shape" shape "from" from "to" to
+     "checks" (checks-out db)
+     "data" (json/parse (export/report-text db kind shape from to))}))
+
+(defn export-tool [args]
+  (reject-unknown args ["ledger" "format" "encoding" "output_date_order"])
+  (let [db (ledger-arg args)
+        fmt (enum-arg args "format" ingest/format-ids nil)]
+    (when (get args "encoding") (enum-arg args "encoding" enc/encodings nil))
+    (when (get args "output_date_order") (enum-arg args "output_date_order" common/date-orders nil))
+    (export-out db fmt args)))
+
+(defn convert-tool [args]
+  (reject-unknown args ["text" "bytes_base64" "from" "to" "input_encoding" "encoding" "currency"
+                        "date_order" "output_date_order"])
+  (let [to-fmt (enum-arg args "to" ingest/format-ids nil)
+        {:keys [parsed db]} (read-input (cond-> (select-keys args ["text" "bytes_base64" "currency" "date_order"])
+                                          (get args "from") (assoc "format" (get args "from"))
+                                          (get args "input_encoding") (assoc "encoding" (get args "input_encoding"))))]
+    (when (get args "encoding") (enum-arg args "encoding" enc/encodings nil))
+    (when (get args "output_date_order") (enum-arg args "output_date_order" common/date-orders nil))
+    (merge (export-out db to-fmt args)
+           {"from" (some-> (:format parsed) name)
+            "entries" (count (:entries db))
+            "rejected" (:rejected parsed 0)
+            "warnings" (vec (:warnings parsed))})))
+
+;; ───────── tool の宣言 ─────────
+
+(def ^:private input-schema
+  {"text" {"type" "string" "description" "The file as text (UTF-8), up to 5 MiB."}
+   "bytes_base64" {"type" "string" "description" "The file's bytes in base64 (use this for Shift_JIS files), up to 5 MiB decoded."}})
+
+(def ^:private ledger-schema
+  {"type" "object" "description" "A kaikei.ledger.v1 object, as returned by kaikei_import."})
+
+(def ^:private currency-schema
+  {"type" "string" "enum" (vec (sort (keys core/currency-exponent))) "default" "JPY"
+   "description" "Ledger currency when the file does not say (Xero responses, QBO without CurrencyRef, Xero/QBO CSV)."})
+
+(def tools
+  [{"name" "kaikei_import"
+    "description" (str "Read a journal export (MoneyForward 仕訳帳 CSV, freee 仕訳 CSV, 弥生インポート形式, "
+                       "QuickBooks Online Account/JournalEntry JSON or journal CSV, Xero Accounts/Journals/ManualJournals JSON "
+                       "or manual journal CSV, or a kaikei ledger) into a kaikei ledger with checks. "
+                       "Pure: nothing is sent, stored or fetched; it does not call any accounting API.")
+    "inputSchema" {"type" "object"
+                   "properties" (merge input-schema
+                                       {"format" {"type" "string" "enum" (vec (cons "auto" ingest/format-ids)) "default" "auto"}
+                                        "encoding" {"type" "string" "enum" ["auto" "utf-8" "shift_jis"] "default" "auto"}
+                                        "currency" currency-schema
+                                        "date_order" {"type" "string" "enum" ["mdy" "dmy"]
+                                                      "description" "Numeric date order in QBO/Xero CSV; guessed when omitted."}})
+                   "additionalProperties" false}
+    "run" import-tool}
+   {"name" "kaikei_validate"
+    "description" (str "Check a kaikei ledger: whether the balance sheet balances, which accounts have no class "
+                       "(they are left out of P/L and B/S, never guessed), and which entries are invalid "
+                       "(unbalanced, negative, missing account, bad date).")
+    "inputSchema" {"type" "object" "properties" {"ledger" ledger-schema} "required" ["ledger"]
+                   "additionalProperties" false}
+    "run" validate-tool}
+   {"name" "kaikei_report"
+    "description" (str "Trial balance, profit and loss or balance sheet for a period, as kaikei JSON or shaped like the "
+                       "QuickBooks Online Report or Xero Reports API responses. Class mapping and the staged-profit and "
+                       "retained-earnings rules are kaikei's, not a vendor's internal calculation.")
+    "inputSchema" {"type" "object"
+                   "properties" {"ledger" ledger-schema
+                                 "report" {"type" "string" "enum" export/reports}
+                                 "shape" {"type" "string" "enum" export/shapes "default" "kaikei"}
+                                 "from" {"type" "string" "description" "Period start, YYYY-MM-DD."}
+                                 "to" {"type" "string" "description" "Period end (balance sheet date), YYYY-MM-DD."}}
+                   "required" ["ledger" "report" "from" "to"]
+                   "additionalProperties" false}
+    "run" report-tool}
+   {"name" "kaikei_export"
+    "description" (str "Write a kaikei ledger in one of the import formats. Shift_JIS output comes back as bytes_base64, "
+                       "UTF-8 as text. Fields the format cannot hold are listed in notes. Pure: writes no file.")
+    "inputSchema" {"type" "object"
+                   "properties" {"ledger" ledger-schema
+                                 "format" {"type" "string" "enum" ingest/format-ids}
+                                 "encoding" {"type" "string" "enum" enc/encodings
+                                             "description" "Defaults per format (Shift_JIS for 弥生・MF・freee)."}
+                                 "output_date_order" {"type" "string" "enum" common/date-orders
+                                                      "description" "Date order for QBO/Xero CSV (default mdy for QBO, dmy for Xero)."}}
+                   "required" ["ledger" "format"]
+                   "additionalProperties" false}
+    "run" export-tool}
+   {"name" "kaikei_convert"
+    "description" "kaikei_import followed by kaikei_export in one call: convert a journal file from one format to another."
+    "inputSchema" {"type" "object"
+                   "properties" (merge input-schema
+                                       {"from" {"type" "string" "enum" (vec (cons "auto" ingest/format-ids)) "default" "auto"}
+                                        "to" {"type" "string" "enum" ingest/format-ids}
+                                        "input_encoding" {"type" "string" "enum" ["auto" "utf-8" "shift_jis"] "default" "auto"}
+                                        "encoding" {"type" "string" "enum" enc/encodings}
+                                        "currency" currency-schema
+                                        "date_order" {"type" "string" "enum" ["mdy" "dmy"]}
+                                        "output_date_order" {"type" "string" "enum" common/date-orders}})
+                   "required" ["to"]
+                   "additionalProperties" false}
+    "run" convert-tool}])
+
+(def ^:private tool-by-name (into {} (map (juxt #(get % "name") identity)) tools))
+
+;; ───────── JSON-RPC ─────────
+
+(defn- result [id r] {"jsonrpc" "2.0" "id" id "result" r})
+
+(defn- rpc-error [id code message]
+  {"jsonrpc" "2.0" "id" id "error" {"code" code "message" message}})
+
+(defn- to-json [v]
+  #?(:cljs (.stringify js/JSON (clj->js v))
+     :clj (pr-str v)))
+
+(defn call-tool
+  "tools/call の result。入力の不正は isError の結果にする。"
+  [tool args]
+  (try
+    (let [out ((get tool "run") (or args {}))]
+      {"content" [{"type" "text" "text" (to-json out)}]
+       "structuredContent" out
+       "isError" false})
+    (catch #?(:cljs :default :clj Exception) e
+      (if-let [err (::tool-error (ex-data e))]
+        {"content" [{"type" "text" "text" (to-json err)}] "isError" true}
+        {"content" [{"type" "text" "text" (to-json {"error" "internal-error" "detail" (ex-message e)})}]
+         "isError" true}))))
+
+(defn handle
+  "JSON-RPC の 1 通（文字列キーの map）→ 応答の map。通知（id の無いもの）は nil。"
+  [msg]
+  (let [id (get msg "id")
+        method (get msg "method")
+        params (get msg "params" {})
+        notification? (not (contains? msg "id"))]
+    (cond
+      notification? nil
+      (= method "initialize")
+      (result id {"protocolVersion" (let [v (get params "protocolVersion")]
+                                      (if (and (string? v) (not (text/blank? v))) v default-protocol-version))
+                  "capabilities" {"tools" {}}
+                  "serverInfo" {"name" server-name "version" server-version}})
+      (= method "ping") (result id {})
+      (= method "tools/list")
+      (result id {"tools" (mapv #(dissoc % "run") tools)})
+      (= method "tools/call")
+      (let [tool (tool-by-name (get params "name"))
+            args (get params "arguments" {})]
+        (cond
+          (nil? tool) (rpc-error id -32602 (str "Unknown tool: " (get params "name")))
+          (not (map? args)) (rpc-error id -32602 "arguments must be an object")
+          :else (result id (call-tool tool args))))
+      :else (rpc-error id -32601 (str "Method not found: " method)))))
+
+(defn handle-line
+  "stdin の 1 行 → 書き出す 1 行（JSON 文字列）か nil。空行は無視、読めない行は
+  JSON-RPC の parse error（id null）にする。"
+  [line]
+  (when-not (text/blank? line)
+    (let [msg (try (json/parse line) (catch #?(:cljs :default :clj Exception) _ ::bad))]
+      (cond
+        (= msg ::bad) (to-json (rpc-error nil -32700 "Parse error"))
+        (not (map? msg)) (to-json (rpc-error nil -32600 "Invalid Request"))
+        :else (some-> (handle msg) to-json)))))

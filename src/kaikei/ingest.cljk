@@ -1,0 +1,119 @@
+(ns kaikei.ingest
+  "取り込み —— 形式の一覧、形式の判定、バイト列・文字列からの取り込み。
+
+  形式（:id は MCP の format 引数と同じ文字列）:
+
+    kaikei-json  kaikei の帳簿 JSON（失う項目が無い）
+    xero-json    Xero Accounting API の Accounts・Journals・ManualJournals
+    qbo-json     QuickBooks Online の Account・JournalEntry（query の応答）
+    yayoi        弥生会計の仕訳日記帳 インポート形式
+    mf           マネーフォワード クラウド会計の仕訳帳 CSV
+    freee        freee 会計の仕訳 CSV（汎用形式）
+    qbo-csv      QuickBooks Online の journal entries 取り込み CSV
+    xero-csv     Xero の manual journal 取り込み CSV
+
+  この ns はネットワークに触れない。JSON の構文解析はホスト（JSON.parse）、
+  文字コードの解読はホストの TextDecoder（kaikei.encoding）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.csv :as csv]
+            [kaikei.json :as json]
+            [kaikei.encoding :as enc]
+            [kaikei.compat.native :as native]
+            [kaikei.compat.xero :as xero]
+            [kaikei.compat.qbo :as qbo]
+            [kaikei.compat.yayoi :as yayoi]
+            [kaikei.compat.mf :as mf]
+            [kaikei.compat.freee :as freee]))
+
+(def formats
+  [{:id "kaikei-json" :label "kaikei 帳簿 JSON（すべての項目）" :kind :json :encoding "utf-8"
+    :file "kaikei-ledger.json" :mime "application/json"}
+   {:id "xero-json" :label "Xero API JSON（Accounts・ManualJournals）" :kind :json :encoding "utf-8"
+    :file "kaikei-xero.json" :mime "application/json"}
+   {:id "qbo-json" :label "QuickBooks Online API JSON（Account・JournalEntry）" :kind :json :encoding "utf-8"
+    :file "kaikei-quickbooks.json" :mime "application/json"}
+   {:id "yayoi" :label "弥生会計 インポート形式（仕訳日記帳）" :kind :csv :encoding "shift_jis"
+    :encodings ["shift_jis" "utf-8"] :file "kaikei-yayoi.txt" :mime "text/plain"}
+   {:id "mf" :label "マネーフォワード クラウド会計 仕訳帳 CSV" :kind :csv :encoding "shift_jis"
+    :encodings ["shift_jis" "utf-8" "utf-8-bom"] :file "kaikei-moneyforward.csv" :mime "text/csv"}
+   {:id "freee" :label "freee 会計 仕訳 CSV（汎用形式）" :kind :csv :encoding "shift_jis"
+    :encodings ["shift_jis" "utf-8" "utf-8-bom"] :file "kaikei-freee.csv" :mime "text/csv"}
+   {:id "qbo-csv" :label "QuickBooks Online journal entries CSV" :kind :csv :encoding "utf-8"
+    :encodings ["utf-8" "utf-8-bom"] :file "kaikei-quickbooks-journal.csv" :mime "text/csv"}
+   {:id "xero-csv" :label "Xero manual journal CSV" :kind :csv :encoding "utf-8"
+    :encodings ["utf-8" "utf-8-bom"] :file "kaikei-xero-manual-journal.csv" :mime "text/csv"}])
+
+(def format-ids (mapv :id formats))
+
+(defn format-by-id [id] (first (filter #(= id (:id %)) formats)))
+
+(defn encoding-label [e]
+  (case e "utf-8" "UTF-8" "utf-8-bom" "UTF-8（BOM 付き）" "shift_jis" "Shift_JIS" (str e)))
+
+;; ───────── 判定 ─────────
+
+(defn- json-text? [s] (boolean (text/re-find #"^\s*[\[{]" (or s ""))))
+
+(defn detect-json [data]
+  (cond
+    (native/detect? data) "kaikei-json"
+    (xero/detect? data) "xero-json"
+    (qbo/detect? data) "qbo-json"
+    :else nil))
+
+(defn detect-csv [rows]
+  (cond
+    (mf/detect? rows) "mf"
+    (freee/detect? rows) "freee"
+    (qbo/csv-detect? rows) "qbo-csv"
+    (xero/csv-detect? rows) "xero-csv"
+    (yayoi/detect? rows) "yayoi"
+    :else nil))
+
+;; ───────── 取り込み ─────────
+
+(defn- empty-result [fmt warning]
+  {:format (some-> fmt keyword) :entries [] :accounts [] :rejected 0 :warnings [warning]})
+
+(defn ingest-text
+  "文字列 → 取り込み結果（kaikei.compat.common の形）。opts:
+  :format   \"auto\"（既定）か format-ids のどれか
+  :currency Xero／QBO の取り込みで、応答に通貨が無いときの帳簿の通貨（既定 JPY）
+  :date-order QBO・Xero の CSV の数だけの日付の並び（\"mdy\"・\"dmy\"。無ければ推す）"
+  [s {:keys [format currency date-order] :or {format "auto" currency "JPY"}}]
+  (let [opts (cond-> {:currency currency} date-order (assoc :date-order date-order))
+        json-format? (= :json (:kind (format-by-id format)))
+        data (when (or json-format? (and (= format "auto") (json-text? s)))
+               (try (json/parse s) (catch #?(:cljs :default :clj Exception) e ::bad)))
+        ;; 形式を指定したら、その形式の種類（JSON か CSV）で読む。判定に任せるときは、
+        ;; [ で始まっても JSON として読めないもの（freee の [表題行]）を CSV として読む。
+        json? (if (= format "auto") (and (some? data) (not= data ::bad)) json-format?)]
+    (if json?
+      (if (= data ::bad)
+        (empty-result format "JSON として読めません")
+        (let [fmt (if (= format "auto") (detect-json data) format)]
+          (case fmt
+            "kaikei-json" (native/read-data data)
+            "xero-json" (xero/read-data data opts)
+            "qbo-json" (qbo/read-data data opts)
+            (empty-result fmt (if (nil? fmt)
+                                "JSON の形を判定できません（kaikei の帳簿 JSON、Xero の Accounts・Journals・ManualJournals、QBO の query の応答のどれでもありません）"
+                                (str (:label (format-by-id fmt)) " は JSON ではありません"))))))
+      (let [rows (csv/parse s)
+            fmt (if (= format "auto") (detect-csv rows) format)]
+        (case fmt
+          "mf" (mf/read-rows rows)
+          "freee" (freee/read-rows rows)
+          "yayoi" (yayoi/read-rows rows)
+          "qbo-csv" (qbo/read-csv rows opts)
+          "xero-csv" (xero/read-csv rows opts)
+          (empty-result fmt (if (nil? fmt)
+                              "CSV の形を判定できません。形式を選んでから取り込んでください"
+                              (str (:label (format-by-id fmt)) " は CSV ではありません"))))))))
+
+(defn ingest-bytes
+  "バイト列（Uint8Array）→ 取り込み結果 + :encoding。opts は ingest-text と同じに
+  :encoding（\"auto\" か \"utf-8\" か \"shift_jis\"）を足したもの。"
+  [b {:keys [encoding] :or {encoding "auto"} :as opts}]
+  (let [{:keys [text] :as decoded} (enc/decode b (when-not (= encoding "auto") encoding))]
+    (assoc (ingest-text text opts) :encoding (:encoding decoded))))

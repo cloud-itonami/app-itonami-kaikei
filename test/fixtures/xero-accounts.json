@@ -1,0 +1,27 @@
+{
+  "Id": "00000000-0000-4000-8000-000000000001",
+  "Status": "OK",
+  "ProviderName": "kaikei test fixture",
+  "DateTimeUTC": "/Date(1775001600000)/",
+  "Accounts": [
+    {"AccountID": "00000000-0000-4000-8000-000000000090", "Code": "090", "Name": "Business Bank Account", "Type": "BANK",
+     "TaxType": "NONE", "EnablePaymentsToAccount": false, "BankAccountNumber": "0000000000", "BankAccountType": "BANK",
+     "CurrencyCode": "JPY", "Class": "ASSET"},
+    {"AccountID": "00000000-0000-4000-8000-000000000610", "Code": "610", "Name": "Accounts Receivable", "Type": "CURRENT",
+     "Class": "ASSET", "SystemAccount": "DEBTORS"},
+    {"AccountID": "00000000-0000-4000-8000-000000000200", "Code": "200", "Name": "Sales", "Type": "REVENUE",
+     "TaxType": "OUTPUT", "Description": "Income from any normal business activity", "Class": "REVENUE"},
+    {"AccountID": "00000000-0000-4000-8000-000000000429", "Code": "429", "Name": "General Expenses", "Type": "OVERHEADS",
+     "Class": "EXPENSE"},
+    {"AccountID": "00000000-0000-4000-8000-000000000437", "Code": "437", "Name": "Interest Expense", "Type": "EXPENSE",
+     "Class": "EXPENSE"},
+    {"AccountID": "00000000-0000-4000-8000-000000000469", "Code": "469", "Name": "Rent", "Type": "OVERHEADS",
+     "Class": "EXPENSE"},
+    {"AccountID": "00000000-0000-4000-8000-000000000820", "Code": "820", "Name": "Accrued Liabilities", "Type": "CURRLIAB",
+     "Class": "LIABILITY"},
+    {"AccountID": "00000000-0000-4000-8000-000000000900", "Code": "900", "Name": "Loan", "Type": "TERMLIAB",
+     "Class": "LIABILITY"},
+    {"AccountID": "00000000-0000-4000-8000-000000000970", "Code": "970", "Name": "Owner A Funds Introduced", "Type": "EQUITY",
+     "Class": "EQUITY"}
+  ]
+}

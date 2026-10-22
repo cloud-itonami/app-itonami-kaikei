@@ -1,0 +1,68 @@
+(ns kaikei.view-test
+  "画面の純関数。SSR では関数が 1 つも混ざらないこと、帳票が描けること、
+  handler を渡せば付くこと。"
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
+            [kaikei.core :as core]
+            [kaikei.view :as view]))
+
+(defn- nodes [tree]
+  (let [acc (atom [])]
+    (walk/postwalk (fn [x] (swap! acc conj x) x) tree)
+    @acc))
+
+(defn- texts [tree] (filter string? (nodes tree)))
+
+(defn- has-text? [tree s] (some #(.includes % s) (texts tree)))
+
+(def sample-db (:db (core/merge-import core/empty-db core/sample-import)))
+
+(defn- render [data ui h]
+  (view/root {:data data :ui ui} (view/derive data (view/period data ui)) h))
+
+(deftest ssr-has-no-functions
+  (doseq [booting? [true false]]
+    (let [tree (render core/empty-db (assoc view/initial-ui :booting? booting?) view/ssr-handlers)]
+      (testing (str ":booting? " booting?)
+        (is (not-any? fn? (nodes tree)))
+        (testing "JS 無しでも何の道具か・送信しないこと・商標の断りが読める"
+          (is (has-text? tree "試算表・損益計算書・貸借対照表"))
+          (is (has-text? tree "送信されず"))
+          (is (has-text? tree "商標"))
+          (is (has-text? tree "電子帳簿保存法への適合を主張せず")))))))
+
+(deftest ssr-does-not-claim-empty
+  (let [tree (render core/empty-db (assoc view/initial-ui :booting? true) view/ssr-handlers)]
+    (is (has-text? tree "読み込んでいます"))
+    (is (not (has-text? tree "まだ仕訳がありません")))))
+
+(deftest every-mode-renders
+  (doseq [mode [:trial-balance :profit-and-loss :balance-sheet :journal :accounts]]
+    (let [tree (render sample-db (assoc view/initial-ui :mode mode :account "普通預金") view/ssr-handlers)]
+      (testing (str mode)
+        (is (not-any? fn? (nodes tree)))
+        (is (has-text? tree "完全"))))))
+
+(deftest reports-show-the-numbers
+  (let [pl (render sample-db (assoc view/initial-ui :mode :profit-and-loss) view/ssr-handlers)
+        us (render sample-db (assoc view/initial-ui :mode :profit-and-loss :pl-style :us) view/ssr-handlers)
+        bs (render sample-db (assoc view/initial-ui :mode :balance-sheet) view/ssr-handlers)]
+    (is (has-text? pl "当期純利益"))
+    (is (has-text? pl "103,500"))
+    (is (has-text? us "Net Income"))
+    (is (has-text? bs "1,333,500"))))
+
+(deftest unclassified-accounts-are-flagged
+  (let [{db :db} (core/merge-import sample-db {:currency "JPY" :accounts []
+                                               :entries [{:date "2026-06-01"
+                                                          :lines [{:account "謎の科目" :debit 100 :credit 0}
+                                                                  {:account "普通預金" :debit 0 :credit 100}]}]})
+        tree (render db view/initial-ui view/ssr-handlers)]
+    (is (has-text? tree "不完全"))
+    (is (has-text? tree "区分の無い勘定科目が "))))
+
+(deftest handlers-attach
+  (let [h (fn [kind ev] (when (= kind :click) (fn [_] ev)))
+        tree (render sample-db view/initial-ui h)
+        buttons (filter #(and (vector? %) (= :button (first %)) (map? (second %)) (:on-click (second %))) (nodes tree))]
+    (is (seq buttons))))

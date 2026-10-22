@@ -1,0 +1,476 @@
+(ns kaikei.compat.xero
+  "Xero Accounting API の形 —— Accounts・Journals・ManualJournals の JSON と、
+  帳票（Reports）の JSON。形の正本は XeroAPI/Xero-OpenAPI（MIT）master
+  5a115f3 の xero_accounting.yaml:
+
+  - `ManualJournal.JournalLines[].LineAmount` と `Journal.JournalLines[].NetAmount`
+    は「借方が正、貸方が負」の number（double）。
+  - `Date`・`JournalDate` は MS date（`/Date(1775001600000+0000)/`）で返る。
+    書くときは YYYY-MM-DD。
+  - `Account.Type` は BANK／CURRENT／CURRLIAB／DEPRECIATN／DIRECTCOSTS／EQUITY／
+    EXPENSE／FIXED／INVENTORY／LIABILITY／NONCURRENT／OTHERINCOME／OVERHEADS／
+    PREPAYMENT／REVENUE／SALES／TERMLIAB／PAYG。`Account.Class` は ASSET／
+    EQUITY／EXPENSE／LIABILITY／REVENUE。
+
+  ## 取り込み
+
+  - **Journals**（GET /Journals）が帳簿の全体。請求書・支払いなど、どの取引から
+    起きた仕訳も、税の行も含めて入る。試算表を作るならこれを使う。
+  - **ManualJournals**（GET /ManualJournals）は手入力の仕訳だけ。POSTED だけを
+    取り込み、DRAFT・VOIDED・DELETED は数えて飛ばす。LineAmountTypes が NoTax
+    でなく税額のある仕訳は、Xero が別に起こす税の行がここに無いので、警告する。
+  - 両方が入っていたら Journals を使い、ManualJournals は飛ばす（Journals の
+    SourceType MANJOURNAL と二重になるため）。
+  - Accounts があれば AccountCode を勘定科目名と区分に引く。無ければコードを
+    名前にして、区分は未分類（既定の表に当たれば既定）。
+
+  ## 書き出し
+
+  {\"Accounts\": […], \"ManualJournals\": […]}。ManualJournals は POST
+  /ManualJournals の本文にそのまま使える形（Narration・Date・LineAmountTypes・
+  Status・JournalLines）。kaikei の行は税の行まで起こした完全な仕訳なので、
+  LineAmountTypes は NoTax で書く（Xero から取り込んだ仕訳は元の値を保つ）。
+  Xero は銀行口座・売掛金・買掛金などのシステム科目を手入力の仕訳に使わせない
+  ことがある（未確認、第三者の資料による）ので、帳簿全体を ManualJournals で
+  書き出したものは、そのまま全部が登録できるとは限らない。
+
+  区分の写し方は kaikei の規則（`type->class`・`class->type`）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]
+            [kaikei.json :as json]
+            [kaikei.compat.common :as common]))
+
+;; ───────── 区分 ─────────
+
+(def type->class
+  {"BANK" :current-asset "CURRENT" :current-asset "INVENTORY" :current-asset
+   "PREPAYMENT" :current-asset
+   "FIXED" :non-current-asset "NONCURRENT" :non-current-asset "DEPRECIATN" :non-current-asset
+   "CURRLIAB" :current-liability "LIABILITY" :current-liability "PAYG" :current-liability
+   "TERMLIAB" :non-current-liability
+   "EQUITY" :equity
+   "REVENUE" :revenue "SALES" :revenue
+   "DIRECTCOSTS" :cost-of-sales
+   "EXPENSE" :operating-expense "OVERHEADS" :operating-expense
+   "OTHERINCOME" :non-operating-income})
+
+(def ^:private xero-class->class
+  {"ASSET" :current-asset "LIABILITY" :current-liability "EQUITY" :equity
+   "REVENUE" :revenue "EXPENSE" :operating-expense})
+
+(def class->type
+  "kaikei の区分 → Xero の Type。Xero に営業外費用・特別損益・法人税等の型は
+  無いので、収益側は OTHERINCOME、費用側は EXPENSE に寄せる。"
+  {:current-asset "CURRENT" :non-current-asset "FIXED" :deferred-asset "NONCURRENT"
+   :current-liability "CURRLIAB" :non-current-liability "TERMLIAB" :equity "EQUITY"
+   :revenue "REVENUE" :cost-of-sales "DIRECTCOSTS" :operating-expense "EXPENSE"
+   :non-operating-income "OTHERINCOME" :non-operating-expense "EXPENSE"
+   :extraordinary-gain "OTHERINCOME" :extraordinary-loss "EXPENSE" :income-tax "EXPENSE"})
+
+(defn account-class [type xero-class]
+  (or (type->class type) (xero-class->class xero-class)))
+
+;; ───────── 取り込み ─────────
+
+(defn- read-accounts [accounts]
+  (vec (for [a accounts
+             :when (map? a)
+             :let [nm (or (common/blank->nil (get a "Name")) (common/blank->nil (get a "Code")))
+                   k (some-> (account-class (get a "Type") (get a "Class")) (core/refine-class nm))]
+             :when nm]
+         (cond-> {:name nm
+                  :xero (cond-> {}
+                          (get a "Code") (assoc :code (get a "Code"))
+                          (get a "Type") (assoc :type (get a "Type"))
+                          (get a "AccountID") (assoc :id (get a "AccountID"))
+                          (get a "Class") (assoc :class (get a "Class")))}
+           (get a "Code") (assoc :code (get a "Code"))
+           k (assoc :class k :class-source :vendor)))))
+
+(defn- account-name [by-code by-id line]
+  (or (common/blank->nil (get line "AccountName"))
+      (get by-code (get line "AccountCode"))
+      (get by-id (get line "AccountID"))
+      (common/blank->nil (get line "AccountCode"))
+      ""))
+
+(defn- tracking [line]
+  (let [t (or (get line "Tracking") (get line "TrackingCategories"))]
+    (not-empty (vec (for [c t :when (map? c)] [(str (get c "Name" "")) (str (get c "Option" ""))])))))
+
+(defn- read-line-amount [v exp where]
+  (let [{:keys [amount problem]} (common/read-amount (if (nil? v) "" v) exp where)]
+    (if problem
+      {:problem problem}
+      {:line (if (neg? amount) {:debit 0 :credit (- amount)} {:debit amount :credit 0})})))
+
+(defn- journal-line [names exp where l amount-key]
+  (let [{:keys [line problem]} (read-line-amount (get l amount-key) exp where)
+        tax-amount (when-let [t (get l "TaxAmount")] (:amount (core/parse-amount t exp)))
+        account (names l)
+        code (common/blank->nil (get l "AccountCode"))]
+    (if problem
+      {:problem problem}
+      {:line (cond-> (assoc line :account account)
+               ;; 名前を引けずにコードを名前にした行は、帳簿の勘定科目のコードで引き直す
+               (and code (= account code)) (assoc :account-code code)
+               (common/blank->nil (get l "Description")) (assoc :description (text/trim (get l "Description")))
+               (common/blank->nil (get l "TaxType")) (assoc :tax {:scheme :xero :code (get l "TaxType")})
+               (and tax-amount (not (zero? tax-amount))) (assoc :tax-amount tax-amount)
+               (tracking l) (assoc :tracking (tracking l)))})))
+
+(defn- read-manual-journal [names exp i mj]
+  (let [where (str "ManualJournal " (inc i))
+        date (core/parse-date (get mj "Date"))
+        parts (map-indexed (fn [j l] (journal-line names exp (str where " 行 " (inc j)) l "LineAmount"))
+                           (get mj "JournalLines" []))
+        p (common/first-problem parts)
+        lat (get mj "LineAmountTypes")]
+    (cond
+      p {:problem (:problem p)}
+      (nil? date) {:problem (str where ": 日付 \"" (get mj "Date") "\" を読めません")}
+      :else
+      {:entry (cond-> {:date date
+                       :lines (mapv :line parts)
+                       :origin (cond-> {:format :xero-json}
+                                 (get mj "ManualJournalID") (assoc :id (get mj "ManualJournalID"))
+                                 lat (assoc :line-amount-types lat))}
+                (common/blank->nil (get mj "Narration")) (assoc :memo (text/trim (get mj "Narration"))))
+       :taxed? (and lat (not= lat "NoTax")
+                    (some #(not (zero? (or (:amount (core/parse-amount (get % "TaxAmount" 0) exp)) 0)))
+                          (get mj "JournalLines" [])))})))
+
+(defn- read-journal [names exp i j]
+  (let [where (str "Journal " (or (get j "JournalNumber") (inc i)))
+        date (core/parse-date (get j "JournalDate"))
+        parts (map-indexed (fn [k l] (journal-line names exp (str where " 行 " (inc k)) l "NetAmount"))
+                           (get j "JournalLines" []))
+        p (common/first-problem parts)]
+    (cond
+      p {:problem (:problem p)}
+      (nil? date) {:problem (str where ": 日付 \"" (get j "JournalDate") "\" を読めません")}
+      :else
+      {:entry (cond-> {:date date
+                       :lines (mapv :line parts)
+                       :origin (cond-> {:format :xero-json}
+                                 (get j "JournalID") (assoc :id (get j "JournalID"))
+                                 (get j "SourceType") (assoc :source-type (get j "SourceType")))}
+                (get j "JournalNumber") (assoc :number (str (get j "JournalNumber")))
+                (common/blank->nil (get j "Reference")) (assoc :memo (text/trim (get j "Reference"))))})))
+
+(defn detect? [data]
+  (and (map? data) (some #(sequential? (get data %)) ["Accounts" "Journals" "ManualJournals"])))
+
+(defn read-data
+  "構文解析済みの JSON → 取り込み結果。opts の :currency は帳簿の通貨（Xero の
+  仕訳は組織の基準通貨で、応答に通貨が無い）。"
+  [data {:keys [currency] :or {currency "JPY"}}]
+  (let [exp (core/exponent currency)
+        accounts (read-accounts (get data "Accounts" []))
+        by-code (into {} (for [a (get data "Accounts" []) :when (map? a) :when (get a "Code")]
+                           [(get a "Code") (or (common/blank->nil (get a "Name")) (get a "Code"))]))
+        by-id (into {} (for [a (get data "Accounts" []) :when (map? a) :when (get a "AccountID")]
+                         [(get a "AccountID") (or (common/blank->nil (get a "Name")) (get a "Code"))]))
+        names (partial account-name by-code by-id)
+        journals (get data "Journals")
+        manual (get data "ManualJournals")
+        use-journals? (sequential? journals)
+        posted (when-not use-journals?
+                 (filterv #(contains? #{"POSTED" nil} (get % "Status")) manual))
+        skipped (when-not use-journals? (- (count manual) (count posted)))
+        candidates (if use-journals?
+                     (vec (map-indexed (partial read-journal names exp) journals))
+                     (vec (map-indexed (partial read-manual-journal names exp) posted)))
+        {:keys [entries warnings rejected]} (common/finish candidates)
+        taxed (count (filter :taxed? candidates))
+        journal-classes (when use-journals?
+                          (vec (for [j journals, l (get j "JournalLines" [])
+                                     :let [nm (names l)
+                                           k (some-> (type->class (get l "AccountType")) (core/refine-class nm))]
+                                     :when (and k (not (text/blank? nm)))]
+                                 {:name nm :class k :class-source :vendor})))]
+    (if-not exp
+      {:format :xero-json :entries [] :accounts [] :rejected 0
+       :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      {:format :xero-json
+       :currency currency
+       :accounts (vec (concat accounts (distinct journal-classes)))
+       :entries entries
+       :rejected rejected
+       :warnings (cond-> warnings
+                   (and use-journals? (seq manual))
+                   (conj (str "Journals と ManualJournals の両方があるので、帳簿の全体である Journals を使い、"
+                              "ManualJournals " (count manual) " 件は飛ばしました（Journals に同じ仕訳が入っています）"))
+                   (pos? (or skipped 0))
+                   (conj (str "POSTED でない ManualJournals " skipped " 件（DRAFT・VOIDED・DELETED など）は取り込んでいません"))
+                   (pos? taxed)
+                   (conj (str "税額のある ManualJournals " taxed " 件は、Xero が別に起こす税の行を含みません。"
+                              "帳簿の全体が要るときは GET /Journals の応答を取り込んでください")))})))
+
+;; ───────── 書き出し ─────────
+
+(defn- xero-code [db n] (or (get-in db [:accounts n :xero :code]) (get-in db [:accounts n :code])))
+
+(defn data
+  "db → {\"Accounts\" […] \"ManualJournals\" […]}（json/write に渡す形）と注記。"
+  [db]
+  (let [exp (core/exponent (:currency db))
+        names (core/used-accounts db)
+        {:keys [codes generated]} (common/generate-codes db names (partial xero-code db))
+        amount (fn [n] (json/decimal (core/format-amount n exp)))]
+    {:data
+     (json/ordered
+      [["Accounts"
+        (vec (for [n names
+                   :let [k (core/account-class db n)
+                         t (or (get-in db [:accounts n :xero :type]) (class->type k))]]
+               (json/ordered [["Code" (codes n)]
+                              ["Name" n]
+                              ["Type" t]
+                              ["AccountID" (get-in db [:accounts n :xero :id])]])))]
+       ["ManualJournals"
+        (vec (for [e (:entries db)]
+               (json/ordered
+                [["Narration" (or (:memo e) (:description (first (:lines e))) (str "kaikei " (:id e)))]
+                 ["Date" (:date e)]
+                 ["LineAmountTypes" (or (get-in e [:origin :line-amount-types]) "NoTax")]
+                 ["Status" "POSTED"]
+                 ["JournalLines"
+                  (vec (for [l (:lines e)]
+                         (json/ordered
+                          [["LineAmount" (amount (- (:debit l 0) (:credit l 0)))]
+                           ["AccountCode" (codes (:account l))]
+                           ["Description" (:description l)]
+                           ["TaxType" (common/tax-code l :xero)]
+                           ["Tracking" (when (seq (:tracking l))
+                                         (mapv (fn [[nm opt]] (json/ordered [["Name" nm] ["Option" opt]]))
+                                               (:tracking l)))]])))]])))]])
+     :notes (cond-> []
+              (pos? generated) (conj (str "Xero のコードが無い勘定科目 " generated " 件に、区分ごとの番号を振りました"))
+              (common/lossy-note db :xero {:sub-account "補助科目" :partner "取引先" :department "部門"
+                                           :tax "税区分（Xero 以外の形式のもの）" :invoice "インボイス区分"})
+              (conj (common/lossy-note db :xero {:sub-account "補助科目" :partner "取引先" :department "部門"
+                                                 :tax "税区分（Xero 以外の形式のもの）" :invoice "インボイス区分"})))}))
+
+(defn write [db]
+  (let [{:keys [data notes]} (data db)]
+    {:text (str (json/write data) "\n") :notes notes}))
+
+;; ───────── manual journal の取り込み CSV ─────────
+;;
+;; Xero Central「Add, import and post manual journals」（英国版・米国版）の
+;; テンプレートの欄: Narration（必須、仕訳の 1 行目だけ）・Date（必須、1 行目
+;; だけ）・Description・AccountCode（コードだけ）・TaxRate（Xero に表示される
+;; 税率の名前。取り込みでは空でもよく、登録の前に要る）・TrackingName1・
+;; TrackingOption1・TrackingName2・TrackingOption2・Amount（必須、借方が正、
+;; 貸方が負）。Date と Narration が両方空の行は、上の行と同じ仕訳。取り込むと
+;; 下書きの仕訳になる。日付は英国版 dd/mm/yyyy・dd mmm yyyy、米国版
+;; mm/dd/yyyy・mmm dd yyyy。
+;;
+;; テンプレートの見出しの正確な文字列（必須の欄に * が付くか）は Xero の
+;; ログインが要るので未確認。kaikei は必須の欄に * を付けて書き、読むときは
+;; * と空白を無視して照合する。TaxRate は API の TaxType（コード）と別の
+;; 値なので、税区分は :xero-rate として扱う。
+
+(def csv-columns ["*Narration" "*Date" "Description" "*AccountCode" "*TaxRate" "*Amount"
+                  "TrackingName1" "TrackingOption1" "TrackingName2" "TrackingOption2"])
+
+(defn- csv-norm [h] (text/lower (text/replace (str h) #"[\s*]" "")))
+
+(defn csv-detect? [rows]
+  (let [h (set (map csv-norm (first rows)))]
+    (every? h ["narration" "date" "accountcode" "amount"])))
+
+(defn- csv-pick [rec k] (common/blank->nil (get rec k)))
+
+(defn read-csv
+  "parse 済みの CSV 行 → 取り込み結果。勘定科目はコードのまま（Xero の CSV は
+  名前を持たない）。opts: :currency（既定 JPY）、:date-order（\"dmy\"・\"mdy\"。
+  無ければ日付から推し、推せなければ dmy）。"
+  [rows {:keys [currency date-order] :or {currency "JPY"}}]
+  (let [exp (core/exponent currency)
+        recs (csv/records (cons (mapv csv-norm (first rows)) (rest rows)))
+        guessed (common/detect-date-order (keep #(csv-pick % "date") recs))
+        order (or date-order guessed "dmy")
+        grouped (reduce (fn [acc rec]
+                          (if (and (peek acc) (nil? (csv-pick rec "date")) (nil? (csv-pick rec "narration")))
+                            (conj (pop acc) (conj (peek acc) rec))
+                            (conj acc [rec])))
+                        [] recs)
+        read-group (fn [recs]
+                     (let [r (first recs)
+                           where (str "行 " (::csv/row r))
+                           date (common/parse-ordered-date (csv-pick r "date") order)
+                           parts (vec (for [rec recs
+                                            :let [w (str "行 " (::csv/row rec))
+                                                  {:keys [amount problem]} (common/read-amount (get rec "amount" "") exp (str w " Amount"))
+                                                  tracking (not-empty (vec (for [i [1 2]
+                                                                                 :let [n (csv-pick rec (str "trackingname" i))
+                                                                                       o (csv-pick rec (str "trackingoption" i))]
+                                                                                 :when (and n o)]
+                                                                             [n o])))]]
+                                        (if problem
+                                          {:problem problem}
+                                          {:line (cond-> {:account (or (csv-pick rec "accountcode") "")
+                                                          :debit (max amount 0) :credit (max (- amount) 0)}
+                                                   (csv-pick rec "accountcode") (assoc :account-code (csv-pick rec "accountcode"))
+                                                   (csv-pick rec "description") (assoc :description (csv-pick rec "description"))
+                                                   (csv-pick rec "taxrate") (assoc :tax {:scheme :xero-rate :code (csv-pick rec "taxrate")})
+                                                   tracking (assoc :tracking tracking))})))
+                           p (common/first-problem parts)]
+                       (cond
+                         p {:problem (:problem p)}
+                         (nil? date) {:problem (str where ": Date \"" (csv-pick r "date") "\" を読めません（日付の並び " order "）")}
+                         :else {:entry (cond-> {:date date :lines (mapv :line parts) :origin {:format :xero-csv}}
+                                         (csv-pick r "narration") (assoc :memo (csv-pick r "narration")))})))]
+    (if-not exp
+      {:format :xero-csv :entries [] :accounts [] :rejected 0
+       :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      (merge {:format :xero-csv :currency currency :accounts []}
+             (update (common/finish (map read-group grouped)) :warnings
+                     (fn [w] (cond-> (conj w "Xero の CSV は勘定科目のコードしか持たないので、帳簿にコードの登録が無い勘定科目はコードを名前にして取り込みました")
+                               (and (nil? date-order) (nil? guessed))
+                               (conj "日付の並びを判定できないので、日/月/年 と読みました（違うときは日付の並びを指定してください）"))))))))
+
+(defn write-csv
+  "db → manual journal の取り込み CSV。opts の :date-order は \"dmy\"（既定）・
+  \"mdy\"・\"ymd\"。"
+  ([db] (write-csv db {}))
+  ([db {:keys [date-order] :or {date-order "dmy"}}]
+   (let [exp (core/exponent (:currency db))
+         names (core/used-accounts db)
+         {:keys [codes generated]} (common/generate-codes db names (partial xero-code db))
+         rows (cons csv-columns
+                    (for [e (:entries db)
+                          [i l] (map-indexed vector (:lines e))
+                          :let [[[t1 o1] [t2 o2]] (:tracking l)]]
+                      [(when (zero? i) (or (:memo e) (:description (first (:lines e))) (str "kaikei " (:id e))))
+                       (when (zero? i) (common/format-ordered-date (:date e) date-order))
+                       (:description l)
+                       (codes (:account l))
+                       (common/tax-code l :xero-rate)
+                       (core/format-amount (- (:debit l 0) (:credit l 0)) exp)
+                       t1 o1 t2 o2]))]
+     {:text (csv/write rows)
+      :notes (cond-> [(str "日付は " (case date-order "mdy" "月/日/年" "dmy" "日/月/年" "年-月-日") " で書きました")
+                      "見出しの * は Xero のテンプレートの必須欄の印と見て付けています（テンプレートの見出しは未確認）"]
+               (pos? generated) (conj (str "Xero のコードが無い勘定科目 " generated " 件に、区分ごとの番号を振りました"))
+               (common/lossy-note db :xero-rate {:sub-account "補助科目" :partner "取引先" :department "部門"
+                                                 :tax "税区分（Xero の税率名でないもの）" :invoice "インボイス区分"})
+               (conj (common/lossy-note db :xero-rate {:sub-account "補助科目" :partner "取引先" :department "部門"
+                                                       :tax "税区分（Xero の税率名でないもの）" :invoice "インボイス区分"})))})))
+
+;; ───────── 帳票（Reports） ─────────
+;;
+;; 形の正本は xero_accounting.yaml（5a115f3）の ReportWithRows と、その
+;; TrialBalance（L18273）・BalanceSheet（L17393）の見本。ProfitAndLoss の見本は
+;; yaml に無く、Xero の開発者向け文書のものを参考にした（区分の見出しの文字列は
+;; 未確認）。{Reports [{ReportID ReportName ReportType ReportTitles ReportDate
+;; Rows [{RowType Header|Section|Row|SummaryRow Title Cells [{Value Attributes}] Rows}]}]}。
+;; UpdatedDateUTC は書かない（出力を入力だけで決める）。勘定科目の行の
+;; Attributes は Xero から取り込んだ AccountID があるときだけ付ける。
+;;
+;; 試算表の Debit／Credit は期間の増減、YTD Debit／YTD Credit は残高（B/S の
+;; 科目は累計、P/L の科目は期間の分）。区分の当て方は kaikei の規則。
+
+(defn- cell
+  ([v] (json/ordered [["Value" v]]))
+  ([v account-id] (json/ordered [["Value" v]
+                                 ["Attributes" (when account-id [(json/ordered [["Value" account-id] ["Id" "account"]])])]])))
+
+(defn- xero-report [kind report-name type titles date rows]
+  (json/ordered
+   [["Reports" [(json/ordered [["ReportID" kind] ["ReportName" report-name] ["ReportType" type]
+                               ["ReportTitles" titles] ["ReportDate" date]
+                               ["Rows" (vec rows)]])]]]))
+
+(defn report
+  "kaikei の帳簿 → Xero の Reports の形（json/write に渡す値）。"
+  [db kind from to]
+  (let [exp (core/exponent (:currency db))
+        money #(core/format-amount % exp)
+        f (core/date-int from)
+        t (core/date-int to)
+        id-of #(get-in db [:accounts % :xero :id])
+        label #(if-let [c (xero-code db %)] (str % " (" c ")") %)
+        row (fn [account & values] (json/ordered [["RowType" "Row"] ["Cells" (vec (cons (cell (label account) (id-of account))
+                                                                                         (map #(cell % (id-of account)) values)))]]))
+        summary (fn [& values] (json/ordered [["RowType" "SummaryRow"] ["Cells" (mapv cell values)]]))
+        section (fn [title rows] (json/ordered [["RowType" "Section"] ["Title" title] ["Rows" (vec rows)]]))
+        period-title (str (common/month-name-date from) " to " (common/month-name-date to))
+        as-at (str "As at " (common/month-name-date to))]
+    (case kind
+      "trial-balance"
+      (let [{:keys [rows]} (core/trial-balance db f t)
+            group-of (fn [k] (cond (#{:revenue :non-operating-income :extraordinary-gain} k) "Revenue"
+                                   (core/pl-class? k) "Expenses"
+                                   (#{:current-asset :non-current-asset :deferred-asset} k) "Assets"
+                                   (#{:current-liability :non-current-liability} k) "Liabilities"
+                                   (= :equity k) "Equity"
+                                   :else "Unclassified"))
+            split (fn [n] [(if (pos? n) (money n) "") (if (neg? n) (money (- n)) "")])
+            totals (reduce (fn [acc {:keys [debit credit closing]}]
+                             (-> acc (update 0 + debit) (update 1 + credit)
+                                 (update 2 + (max closing 0)) (update 3 + (max (- closing) 0))))
+                           [0 0 0 0] rows)]
+        (xero-report "TrialBalance" "Trial Balance" "TrialBalance" ["Trial Balance" "kaikei" as-at]
+                     (common/month-name-date to)
+                     (concat
+                      [(json/ordered [["RowType" "Header"]
+                                      ["Cells" (mapv cell ["Account" "Debit" "Credit" "YTD Debit" "YTD Credit"])]])]
+                      (for [g ["Revenue" "Expenses" "Assets" "Liabilities" "Equity" "Unclassified"]
+                            :let [rs (filter #(= g (group-of (:class %))) rows)]
+                            :when (seq rs)]
+                        (section g (for [{:keys [account debit credit closing synthetic]} rs
+                                         :let [[yd yc] (split closing)
+                                               [pd pc] (split (- debit credit))]]
+                                     (if synthetic
+                                       (json/ordered [["RowType" "Row"] ["Cells" (mapv cell [account pd pc yd yc])]])
+                                       (row account pd pc yd yc)))))
+                      [(section "" [(apply summary "Total" (map money totals))])])))
+
+      "profit-and-loss"
+      (let [{:keys [sections stages]} (core/profit-and-loss db f t)
+            by (into {} (map (juxt :class identity) sections))
+            rows-of (fn [ks] (for [k ks, a (:accounts (by k))] (row (:account a) (money (:amount a)))))
+            total (fn [ks] (reduce + 0 (map #(:total (by %)) ks)))
+            other-in [:non-operating-income :extraordinary-gain]
+            other-out [:operating-expense :non-operating-expense :extraordinary-loss :income-tax]]
+        (xero-report "ProfitAndLoss" "Profit and Loss" "ProfitAndLoss" ["Profit & Loss" "kaikei" period-title]
+                     (common/month-name-date to)
+                     [(json/ordered [["RowType" "Header"] ["Cells" [(cell "") (cell (common/month-name-date to))]]])
+                      (section "Income" (concat (rows-of [:revenue]) [(summary "Total Income" (money (total [:revenue])))]))
+                      (section "Less Cost of Sales" (concat (rows-of [:cost-of-sales])
+                                                            [(summary "Total Cost of Sales" (money (total [:cost-of-sales])))]))
+                      (section "" [(json/ordered [["RowType" "Row"] ["Cells" [(cell "Gross Profit") (cell (money (:gross stages)))]]])])
+                      (section "Plus Other Income" (concat (rows-of other-in) [(summary "Total Other Income" (money (total other-in)))]))
+                      (section "Less Operating Expenses" (concat (rows-of other-out)
+                                                                 [(summary "Total Operating Expenses" (money (total other-out)))]))
+                      (section "" [(json/ordered [["RowType" "Row"] ["Cells" [(cell "Net Profit") (cell (money (:net stages)))]]])])]))
+
+      "balance-sheet"
+      (let [{:keys [sections totals retained net-income]} (core/balance-sheet db f t)
+            by (into {} (map (juxt :class identity) sections))
+            rows-of (fn [ks] (for [k ks, a (:accounts (by k))] (row (:account a) (money (:amount a)))))
+            total (fn [ks] (reduce + 0 (map #(:total (by %)) ks)))
+            assets [:current-asset :non-current-asset :deferred-asset]]
+        (xero-report "BalanceSheet" "Balance Sheet" "BalanceSheet" ["Balance Sheet" "kaikei" as-at]
+                     (common/month-name-date to)
+                     [(json/ordered [["RowType" "Header"] ["Cells" [(cell "") (cell (common/month-name-date to))]]])
+                      (section "Assets" [])
+                      (section "Current Assets" (concat (rows-of [:current-asset]) [(summary "Total Current Assets" (money (total [:current-asset])))]))
+                      (section "Fixed Assets" (concat (rows-of [:non-current-asset :deferred-asset])
+                                                      [(summary "Total Fixed Assets" (money (total [:non-current-asset :deferred-asset])))]))
+                      (section "" [(summary "Total Assets" (money (:assets totals)))])
+                      (section "Liabilities" [])
+                      (section "Current Liabilities" (concat (rows-of [:current-liability])
+                                                             [(summary "Total Current Liabilities" (money (total [:current-liability])))]))
+                      (section "Non-Current Liabilities" (concat (rows-of [:non-current-liability])
+                                                                 [(summary "Total Non-Current Liabilities" (money (total [:non-current-liability])))]))
+                      (section "" [(summary "Total Liabilities" (money (:liabilities totals)))])
+                      (section "" [(json/ordered [["RowType" "Row"] ["Cells" [(cell "Net Assets") (cell (money (- (:assets totals) (:liabilities totals))))]]])])
+                      (section "Equity" (concat (rows-of [:equity])
+                                                [(json/ordered [["RowType" "Row"] ["Cells" [(cell "Retained Earnings") (cell (money retained))]]])
+                                                 (json/ordered [["RowType" "Row"] ["Cells" [(cell "Current Year Earnings") (cell (money net-income))]]])
+                                                 (summary "Total Equity" (money (:equity totals)))]))])))))

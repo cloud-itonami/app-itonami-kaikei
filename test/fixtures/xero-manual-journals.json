@@ -1,0 +1,40 @@
+{
+  "Id": "00000000-0000-4000-8000-000000000002",
+  "Status": "OK",
+  "ProviderName": "kaikei test fixture",
+  "DateTimeUTC": "/Date(1775001600000)/",
+  "ManualJournals": [
+    {"Date": "/Date(1775001600000+0000)/", "Status": "POSTED", "LineAmountTypes": "NoTax",
+     "UpdatedDateUTC": "/Date(1775001600000+0000)/", "ManualJournalID": "00000000-0000-4000-8000-0000000000a1",
+     "Narration": "Owner funds introduced",
+     "JournalLines": [
+       {"Description": "Owner funds", "TaxType": "NONE", "TaxAmount": 0, "LineAmount": 1000000,
+        "AccountCode": "090", "Tracking": [], "AccountID": "00000000-0000-4000-8000-000000000090", "IsBlank": false},
+       {"Description": "Owner funds", "TaxType": "NONE", "TaxAmount": 0, "LineAmount": -1000000,
+        "AccountCode": "970", "Tracking": [], "AccountID": "00000000-0000-4000-8000-000000000970", "IsBlank": false}],
+     "ShowOnCashBasisReports": true, "HasAttachments": false},
+    {"Date": "/Date(1777507200000+0000)/", "Status": "POSTED", "LineAmountTypes": "NoTax",
+     "ManualJournalID": "00000000-0000-4000-8000-0000000000a2",
+     "Narration": "Accrued rent for April",
+     "JournalLines": [
+       {"Description": "Rent", "TaxType": "NONE", "TaxAmount": 0, "LineAmount": 120000, "AccountCode": "469",
+        "Tracking": [{"Name": "Region", "Option": "North"}]},
+       {"Description": "Accrued rent", "TaxType": "NONE", "TaxAmount": 0, "LineAmount": -120000, "AccountCode": "820",
+        "Tracking": []}]},
+    {"Date": "/Date(1777507200000+0000)/", "Status": "DRAFT", "LineAmountTypes": "NoTax",
+     "ManualJournalID": "00000000-0000-4000-8000-0000000000a3", "Narration": "Draft, not posted",
+     "JournalLines": [
+       {"LineAmount": 500, "AccountCode": "429"},
+       {"LineAmount": -500, "AccountCode": "090"}]},
+    {"Date": "/Date(1777507200000+0000)/", "Status": "VOIDED", "LineAmountTypes": "NoTax",
+     "ManualJournalID": "00000000-0000-4000-8000-0000000000a4", "Narration": "Voided",
+     "JournalLines": [
+       {"LineAmount": 700, "AccountCode": "429"},
+       {"LineAmount": -700, "AccountCode": "090"}]},
+    {"Date": "/Date(1780185600000+0000)/", "Status": "POSTED", "LineAmountTypes": "Exclusive",
+     "ManualJournalID": "00000000-0000-4000-8000-0000000000a5", "Narration": "Expense with tax",
+     "JournalLines": [
+       {"Description": "Supplies", "TaxType": "INPUT", "TaxAmount": 1000, "LineAmount": 10000, "AccountCode": "429"},
+       {"Description": "Paid from bank", "TaxType": "NONE", "TaxAmount": 0, "LineAmount": -11000, "AccountCode": "090"}]}
+  ]
+}

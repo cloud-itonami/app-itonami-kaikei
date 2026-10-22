@@ -1,0 +1,49 @@
+(ns kaikei.encoding-test
+  "文字コード。Shift_JIS の符号化は、Python の cp932 で作った fixture
+  （test/fixtures/yayoi-sjis.txt）と 1 バイトずつ一致することで確かめる
+  （kaikei の表とは別の実装）。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [kaikei.encoding :as enc]))
+
+(defn- bytes-of [f] (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" f))))
+
+(defn- same-bytes? [a b]
+  (and (= (.-length a) (.-length b))
+       (every? #(= (aget a %) (aget b %)) (range (.-length a)))))
+
+(deftest shift-jis-matches-cp932
+  (let [text (str (fs/readFileSync "test/fixtures/yayoi.csv" "utf8"))
+        {:keys [bytes error]} (enc/encode text "shift_jis")]
+    (is (nil? error))
+    (is (same-bytes? (bytes-of "yayoi-sjis.txt") bytes))))
+
+(deftest decoding
+  (testing "BOM が無くても UTF-8 として正しければ UTF-8、壊れていれば Shift_JIS"
+    (is (= "utf-8" (:encoding (enc/decode (bytes-of "yayoi.csv")))))
+    (is (= "shift_jis" (:encoding (enc/decode (bytes-of "yayoi-sjis.txt")))))
+    (is (= (str (fs/readFileSync "test/fixtures/yayoi.csv" "utf8"))
+           (:text (enc/decode (bytes-of "yayoi-sjis.txt"))))))
+  (testing "BOM 付きの UTF-8 は BOM を外して読む（CSV の読みが外す）"
+    (let [b (:bytes (enc/encode "取引No" "utf-8-bom"))]
+      (is (= 0xEF (aget b 0)))
+      (is (= "utf-8" (:encoding (enc/decode b)))))))
+
+(deftest known-codes
+  (testing "WHATWG の Shift_JIS エンコーダと同じ規則"
+    (let [hex (fn [s] (vec (array-seq (js/Array.from (:bytes (enc/encode s "shift_jis"))))))]
+      (is (= [0x82 0xA0] (hex "あ")))
+      (is (= [0x87 0x40] (hex "①")) "NEC 特殊文字は 0x87 行")
+      (is (= [0xFB 0xFC] (hex "髙")) "IBM 拡張は 0xED・0xEE ではなく 0xFA〜0xFC")
+      (is (= [0x81 0x7C] (hex "−")) "U+2212 は U+FF0D として引く")
+      (is (= [0x5C] (hex "¥")))
+      (is (= [0xB1] (hex "ｱ")) "半角カナは 1 バイト"))))
+
+(deftest unmappable-characters-are-refused
+  (let [{:keys [error chars]} (enc/encode "〜😀" "shift_jis")]
+    (is (= :unmappable error))
+    (is (= ["〜" "😀"] chars) "サロゲート対は 1 文字として報告する")))
+
+(deftest base64
+  (let [b (:bytes (enc/encode "普通預金" "shift_jis"))]
+    (is (same-bytes? b (enc/base64->bytes (enc/bytes->base64 b))))))

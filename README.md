@@ -1,10 +1,48 @@
-# kaikei — 会計エージェントの edge surface
+# kaikei — 会計帳簿の itonami dapp（ブラウザ内完結）
 
-**kaikei（会計）は accounting を指す。このリポジトリが持っているのは会計そのもの
-ではなく、会計エージェントの入口 1 枚**——Cloudflare Worker（assets のみ、動的
-コードは今日は無い）1 本だけである。
+**kaikei（会計）は accounting を指す。** 会計ソフトから書き出した仕訳を取り込み、
+試算表・損益計算書・貸借対照表を**ブラウザの中だけで**作る itonami dapp。
+次の形式を読み書きする（2026-10-22 から。Linear JUN-304）:
 
-仕訳も試算表も P/L も B/S も、**ここには 1 行も無い**。
+- マネーフォワード クラウド会計の仕訳帳 CSV
+- freee 会計の仕訳 CSV（汎用形式）
+- 弥生会計のインポート形式（仕訳日記帳）
+- QuickBooks Online の Account・JournalEntry（API の JSON）と journal entries CSV
+- Xero の Accounts・Journals・ManualJournals（API の JSON）と manual journal CSV
+
+データは送信されない。保存はこの端末の IndexedDB だけ。
+
+| | 置き場所 |
+|---|---|
+| 判断コア（guest） | `aiueos/kaikei_journal.cljk`（仕訳の検証・試算表・段階利益・B/S の照合。`:effects #{}`） |
+| adapter・形式・帳票 | `src/kaikei/`（`core` `ingest` `export` `compat/*` `view` `mcp`） |
+| 画面 | `site/`（scittle + Re-frame／Reagent、DADS）。公開先は `https://itonami.cloud/sites/app/kaikei/` |
+| agent の tool | `bin/kaikei-mcp`（stdio MCP、tool 5 つ、pure） |
+| 設計の正本 | `docs/aiueos-dapp.md` |
+| 旧来の入口（Cloudflare Worker、静的） | `appview/kaikei-core-kaikei01/`（下の歴史の節） |
+
+```bash
+npm test
+```
+
+`npm test` は kbb で adapter・形式・帳票・画面・MCP を確かめる。guest は
+`npm run test:guest`（amu、3 target）と `npm run test:guest-parity`（wasm）で確かめる。
+
+**主張しないこと:**
+
+- 計算は kaikei の規則で、各社の計算の再現ではない。
+- 各社の API にはつながない。
+- 電子帳簿保存法への適合は主張しない。
+- 申告書を作らず、提出もしない。
+
+各社の名前はそれぞれの権利者の商標で、kaikei は形式の互換を名乗るだけ。
+
+---
+
+以下は 2026-10-22 より前の、このリポジトリが「会計エージェントの入口 1 枚」
+だった頃の記録（歴史として残す）。
+
+当時の表:
 
 | | 置き場所 |
 |---|---|
@@ -115,8 +153,12 @@ Compliance Rider v3.1 を宣言するが、**`CHARTER-RIDER.md` も `LICENSE` �
 
 ## aiueos 上の分散型 dapp 設計（2026-10-19〜）
 
-kaikei を aiueos アプリ（分散型 dapp、itonami agent 前提）として実現する設計と
-第 1 スライス（判断コア guest）が `docs/aiueos-dapp.md` にある。実装は
-`aiueos/`（guest + 記述子）と `appview/.../cljs/src/kaikei/journal.cljk`
-（parity adapter）。`npm test` は kbb runner に差し替え（shadow 経路は
-`test:shadow`。理由と実測は `docs/aiueos-dapp.md` の「実測した『動かない』」）。
+kaikei を aiueos アプリ（分散型 dapp、itonami agent 前提）として実現する設計が
+`docs/aiueos-dapp.md` にある。
+
+- 第 1 スライス（JUN-115）: 判断コア guest。
+- 第 2 スライス（JUN-304）: 5 社の形式・帳票・画面・MCP。
+
+adapter の正本は `src/kaikei/core.cljk`。`appview/.../cljs/src/kaikei/journal.cljk` は
+第 1 スライスの adapter で、旧 SPA のビルドの再配線を決めるまで残してある。
+appview の `npm test` はその adapter を kbb で回す（shadow 経路は `test:shadow`）。

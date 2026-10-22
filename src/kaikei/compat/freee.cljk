@@ -1,0 +1,157 @@
+(ns kaikei.compat.freee
+  "freee 会計の仕訳 CSV。形の正本は freee ヘルプセンター「その他の会計ソフトから
+  仕訳データを移行する」（https://support.freee.co.jp/hc/ja/articles/204847430、
+  2026-10-15 更新）に添付の取り込みテンプレート（仕訳インポート（Shift-JIS）.csv
+  と仕訳インポート（UTF-8）.csv。見出しは 33 列で同じ）:
+
+    [表題行] 日付 伝票番号 決算整理仕訳
+    借方勘定科目 借方科目コード 借方補助科目 借方取引先 借方取引先コード 借方部門 借方品目
+    借方メモタグ 借方セグメント1 借方セグメント2 借方セグメント3 借方金額 借方税区分 借方税額
+    貸方…（同じ 14 列） 摘要
+
+  - 見出し行の最初の欄は [表題行]、データ行の最初の欄は [明細行]。
+  - 日付は YYYY/MM/DD（月日は 1〜2 桁）。伝票番号が同じ行が 1 つの仕訳で、
+    先頭行の日付を使う。決算整理仕訳は 1。
+  - 金額の負は -1000（▲・括弧は不可）。借方・貸方ともに負の行は、借方と
+    貸方を入れ替えて取り込む（freee の規則。kaikei も同じにする）。
+  - 税区分の率は名前の後ろ（課税売上10%、課税売上8%（軽）。括弧は全角）。
+  - 文字コードは Windows なら Shift-JIS、Mac・Google スプレッドシートなら
+    UTF-8（BOM なし）とテンプレートの説明にある。
+
+  読みは見出しの名前で列を引くので、テンプレートのほか、freee の仕訳帳の
+  書き出し（旧 CSV・新 CSV の、日付が「取引日」、番号が「No.」「仕訳番号」、
+  補助科目が「借方補助科目名」の形）や、借貸 1 列の型（貸借金額・貸借税額）も
+  読む。書き出しの見出しの正確な文字列は未確認（freee のログインが要る）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]
+            [kaikei.compat.common :as common]))
+
+(def side-columns
+  ["勘定科目" "科目コード" "補助科目" "取引先" "取引先コード" "部門" "品目" "メモタグ"
+   "セグメント1" "セグメント2" "セグメント3" "金額" "税区分" "税額"])
+
+(def columns
+  (vec (concat ["[表題行]" "日付" "伝票番号" "決算整理仕訳"]
+               (map #(str "借方" %) side-columns)
+               (map #(str "貸方" %) side-columns)
+               ["摘要"])))
+
+(defn- norm [h] (-> (str h) text/trim (text/replace #"[\s　]" "")))
+
+(defn- header-row [rows] (mapv norm (first rows)))
+
+(defn detect? [rows]
+  (let [h (set (header-row rows))]
+    (and (or (h "借方勘定科目"))
+         (or (h "日付") (h "取引日") (h "発生日"))
+         (or (h "借方金額") (h "貸借金額")))))
+
+(defn- pick
+  "rec から、候補の見出しのうち最初にある列の値（空なら nil）。"
+  [rec & names]
+  (some #(common/blank->nil (get rec %)) names))
+
+(defn- side [rec prefix where]
+  (let [account (pick rec (str prefix "勘定科目"))
+        amount-text (or (pick rec (str prefix "金額")) (pick rec "貸借金額") "")
+        tax-text (or (pick rec (str prefix "税額") (str prefix "税金額")) (pick rec "貸借税額") "")
+        {:keys [amount problem]} (common/read-amount amount-text 0 (str where " " prefix "金額"))
+        tax (common/read-amount tax-text 0 (str where " " prefix "税額"))]
+    (cond
+      (and (nil? account) (text/blank? amount-text)) nil
+      problem {:problem problem}
+      (:problem tax) {:problem (:problem tax)}
+      :else
+      {:amount amount
+       :line (cond-> {:account (or account "")}
+               (pick rec (str prefix "補助科目") (str prefix "補助科目名"))
+               (assoc :sub-account (pick rec (str prefix "補助科目") (str prefix "補助科目名")))
+               (pick rec (str prefix "部門")) (assoc :department (pick rec (str prefix "部門")))
+               (pick rec (str prefix "取引先") (str prefix "取引先名"))
+               (assoc :partner (pick rec (str prefix "取引先") (str prefix "取引先名")))
+               (pick rec (str prefix "税区分")) (assoc :tax {:scheme :freee :code (pick rec (str prefix "税区分"))})
+               (pos? (:amount tax)) (assoc :tax-amount (:amount tax)))})))
+
+(defn- row-lines
+  "1 行 → 仕訳行（0〜2 本）。借方・貸方ともに負なら入れ替える（freee の規則）。"
+  [rec where]
+  (let [d (side rec "借方" where)
+        c (side rec "貸方" where)
+        swap? (and (:amount d) (:amount c) (neg? (:amount d)) (neg? (:amount c)))
+        [d c] (if swap? [(update c :amount -) (update d :amount -)] [d c])
+        memo (pick rec "摘要" "備考")]
+    (for [[s debit?] [[d true] [c false]]
+          :when s]
+      (if (:problem s)
+        s
+        {:line (cond-> (assoc (:line s) :debit (if debit? (:amount s) 0) :credit (if debit? 0 (:amount s)))
+                 memo (assoc :description memo))}))))
+
+(defn- read-group [recs]
+  (let [r (first recs)
+        where (str "行 " (::csv/row r))
+        date-text (pick r "日付" "取引日" "発生日")
+        date (core/parse-date date-text)
+        parts (vec (mapcat #(row-lines % (str "行 " (::csv/row %))) recs))
+        p (common/first-problem parts)
+        number (pick r "伝票番号" "仕訳番号" "No." "No")
+        settle (pick r "決算整理仕訳")]
+    (cond
+      p {:problem (:problem p)}
+      (nil? date) {:problem (str where ": 日付 \"" date-text "\" を読めません")}
+      :else
+      {:entry (cond-> {:date date
+                       :lines (mapv :line parts)
+                       :origin {:format :freee}}
+                number (assoc :number number)
+                (pick r "摘要" "備考") (assoc :memo (pick r "摘要" "備考"))
+                (and settle (not= settle "0")) (assoc :adjustment? true))})))
+
+(defn- groups [recs]
+  (reduce (fn [acc rec]
+            (let [no (pick rec "伝票番号" "仕訳番号" "No." "No")
+                  prev (peek acc)]
+              (if (and no prev (= no (pick (first prev) "伝票番号" "仕訳番号" "No." "No")))
+                (conj (pop acc) (conj prev rec))
+                (conj acc [rec]))))
+          [] recs))
+
+(defn read-rows [rows]
+  (let [marker? (= "[表題行]" (first (header-row rows)))
+        rows (if marker?
+               (cons (header-row rows)
+                     (keep (fn [r] (when (= "[明細行]" (text/trim (str (first r)))) r)) (rest rows)))
+               (cons (header-row rows) (rest rows)))
+        recs (csv/records rows)]
+    (merge {:format :freee :currency "JPY" :accounts []}
+           (common/finish (map read-group (groups recs))))))
+
+(defn rows [db]
+  (cons columns
+        (apply concat
+               (map-indexed
+                (fn [i e]
+                  (map-indexed
+                   (fn [j [d c]]
+                     (let [cols (fn [l]
+                                  [(:account l) nil (:sub-account l) (:partner l) nil (:department l) nil nil
+                                   nil nil nil
+                                   (when l (str (+ (:debit l 0) (:credit l 0))))
+                                   (common/tax-code l :freee) (some-> (:tax-amount l) str)])]
+                       (vec (concat ["[明細行]" (core/slash-date (:date e)) (str (inc i))
+                                     (when (:adjustment? e) "1")]
+                                    (cols d) (cols c)
+                                    [(when (zero? j) (or (:memo e) (:description d) (:description c)))]))))
+                   (common/pair-rows e)))
+                (:entries db)))))
+
+(defn write [db]
+  (if (not= "JPY" (:currency db))
+    {:error (str "freee の仕訳 CSV は円の金額です。帳簿の通貨が " (:currency db) " なので書き出しません")}
+    {:text (csv/write (rows db))
+     :notes (cond-> ["伝票番号は書き出した仕訳の連番です（freee は同じ日付・同じ伝票番号の仕訳がすでにあると取り込みません）"]
+              (common/lossy-note db :freee {:tax "税区分（freee 以外の形式のもの）" :invoice "インボイス区分"
+                                            :tracking "Xero の tracking"})
+              (conj (common/lossy-note db :freee {:tax "税区分（freee 以外の形式のもの）" :invoice "インボイス区分"
+                                                  :tracking "Xero の tracking"})))}))

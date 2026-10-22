@@ -1,0 +1,548 @@
+(ns kaikei.view
+  "kaikei の画面 —— 状態（{:data db :ui ui}）と導出値（`derive`）→ hiccup の
+  純関数。
+
+  同じ関数を 2 か所が描く:
+  - **SSR**（site/kaikei/page.cljk）: 空の状態で 1 回描き、JS 無しでも
+    「何の道具か・データは送信されない」が読める HTML にする。
+  - **ブラウザ**（site/app.cljk）: Reagent が同じ hiccup を描き直す。
+
+  帳票（試算表・P/L・B/S）は `derive` が帳簿と期間から 1 度だけ作る。画面は
+  描くたびに計算し直さない（ブラウザでは re-frame の subscription が、帳簿か
+  期間が変わったときだけ derive を呼ぶ）。
+
+  イベントは引数の `h` から取る: `(h :click ev)` `(h :value ev)`
+  `(h :checked ev)` `(h :file ev)` が handler（または nil）を返す。SSR は常に
+  nil を返す h を渡すので、HTML に関数は混ざらない。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.ingest :as ingest]))
+
+;; ───────── 小部品（dandori.view と同じ形） ─────────
+
+(defn- with-handler [m k f] (if f (assoc m k f) m))
+
+(defn- btn
+  ([h ev label] (btn h ev label {}))
+  ([h ev label {:keys [type size disabled class aria-pressed]}]
+   [:button (with-handler (cond-> {:type "button" :class (str "dads-button" (when class (str " " class)))
+                                   :data-type (or type "outline") :data-size (or size "sm")}
+                            disabled (assoc :disabled true)
+                            (some? aria-pressed) (assoc :aria-pressed (str aria-pressed)))
+              :on-click (h :click ev))
+    label]))
+
+(defn- text-input [h ev value opts]
+  [:span {:class "dads-input-text"}
+   [:input (with-handler (merge {:class "dads-input-text__input" :data-size "sm" :type "text"
+                                 :value (or value "")}
+                                opts)
+             :on-change (h :value ev))]])
+
+(defn- text-area [h ev value opts]
+  [:span {:class "dads-textarea"}
+   [:textarea (with-handler (merge {:class "dads-textarea__textarea" :rows 4 :value (or value "")} opts)
+                :on-change (h :value ev))]])
+
+(defn- select-el [h ev value options opts]
+  [:span {:class "dads-select"}
+   [:span {:class "dads-select__control"}
+    (into [:select (with-handler (merge {:class "dads-select__select" :data-size "sm"
+                                         :value (str value)}
+                                        opts)
+                     :on-change (h :value ev))]
+          (map (fn [[v label]] [:option {:value (str v)} label]) options))
+    [:svg {:class "dads-select__chevron" :width 16 :height 16 :viewBox "0 0 24 24" :aria-hidden "true"}
+     [:path {:d "M12 17L3 8L4 7L12 15L20 7L21 8L12 17Z" :fill "currentcolor"}]]]])
+
+(defn- field [id label control & [support]]
+  [:div {:class "dads-form-control-label" :data-size "sm"}
+   [:label {:class "dads-form-control-label__label" :for id} label]
+   (when support [:p {:class "dads-form-control-label__support-text"} support])
+   [:div control]])
+
+(defn- chip [label color]
+  [:span {:class "dads-chip-label" :data-style "text" :data-color color} label])
+
+;; ───────── 状態の初期値・導出 ─────────
+
+(def initial-ui
+  {:booting? false
+   :mode :trial-balance
+   :import-open? false :import-text "" :import-format "auto" :import-currency "JPY"
+   :import-encoding "auto" :import-mode "append" :import-result nil
+   :fy-start 4 :period nil :pl-style :jp
+   :export-format "kaikei-json" :export-encoding nil :export-result nil
+   :journal-page 0 :problems-only? false :account nil
+   :confirm-clear? false})
+
+(def page-size 100)
+
+(defn period
+  "画面の期間 {:from :to}（\"YYYY-MM-DD\"）。:period が無ければ、いちばん新しい
+  会計年度。仕訳が無ければ nil。"
+  [data ui]
+  (or (:period ui)
+      (some-> (first (core/fiscal-years data (:fy-start ui 4))) (select-keys [:from :to]))))
+
+(defn derive
+  "帳簿と期間 → 画面が描く帳票と検査。重い計算はここだけ。"
+  [data p]
+  (when p
+    (let [from (core/date-int (:from p))
+          to (core/date-int (:to p))]
+      {:period p
+       :trial-balance (core/trial-balance data from to)
+       :profit-and-loss (core/profit-and-loss data from to)
+       :balance-sheet (core/balance-sheet data from to)
+       :checks (core/checks data to)})))
+
+;; ───────── 見出し・足 ─────────
+
+(defn header []
+  [:header {:class "kk-header"}
+   [:h1 {:class "kk-title"} "kaikei " [:span {:class "kk-title-sub"} "会計"]]
+   [:p {:class "kk-lead"}
+    "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をこのブラウザの中だけで作ります。"
+    "マネーフォワード クラウド会計・freee 会計・弥生会計・QuickBooks Online・Xero の形式を読み書きします。"
+    "データはどこにも送信されず、この端末のブラウザの中（IndexedDB）にだけ保存されます。"]])
+
+(defn footer []
+  [:footer {:class "kk-footer"}
+   [:p "互換はデータ形式（各社の仕訳帳 CSV、QuickBooks Online と Xero の API のリソース JSON）の互換です。"
+    "勘定科目の区分への写し方、段階利益と繰越損益の数え方は kaikei の規則で、各社の計算の再現ではありません。"
+    "各社の API には接続しません。"]
+   [:p "この道具は帳簿の確認と移行のためのものです。電子帳簿保存法への適合を主張せず、申告書の作成・提出もしません。"]
+   [:p "マネーフォワード、freee、弥生、QuickBooks、Xero はそれぞれの権利者の商標です。"
+    "kaikei は形式の互換を名乗るだけで、各社との提携も同一性も主張しません。"]
+   [:p "ソース: cloud-itonami/kaikei（Apache License 2.0 + etzhayyim Charter Compliance Rider v3.1。NOTICE を参照）"]])
+
+;; ───────── ツールバー ─────────
+
+(def ^:private modes
+  [[:trial-balance "試算表"] [:profit-and-loss "損益計算書"] [:balance-sheet "貸借対照表"]
+   [:journal "仕訳帳"] [:accounts "勘定科目"]])
+
+(defn toolbar [{:keys [data ui]} h]
+  (let [empty? (empty? (:entries data))]
+    [:div {:class "kk-toolbar" :role "toolbar" :aria-label "操作"}
+     [:div {:class "kk-toolbar-group"}
+      (btn h [:toggle-import] (if (:import-open? ui) "取り込みを閉じる" "取り込む") {:type "solid-fill"})
+      (btn h [:load-sample] "サンプルを読み込む")]
+     [:div {:class "kk-toolbar-group"}
+      [:label {:class "kk-inline-label" :for "kk-export-format"} "書き出す形式"]
+      (select-el h [:set-export-format] (:export-format ui)
+                 (map (juxt :id :label) ingest/formats) {:id "kk-export-format"})
+      (let [fmt (ingest/format-by-id (:export-format ui))]
+        (when (:encodings fmt)
+          (select-el h [:set-export-encoding] (or (:export-encoding ui) (:encoding fmt))
+                     (map (fn [e] [e (ingest/encoding-label e)]) (:encodings fmt))
+                     {:id "kk-export-encoding" :aria-label "文字コード"})))
+      (btn h [:export] "書き出す" {:disabled empty?})]
+     [:div {:class "kk-toolbar-group"}
+      (if (:confirm-clear? ui)
+        [:span {:class "kk-confirm"}
+         (btn h [:clear-all] "本当にすべて消去する" {:type "solid-fill" :class "kk-danger"})
+         (btn h [:cancel-clear] "やめる")]
+        (btn h [:ask-clear] "すべて消去" {:type "text" :disabled empty?}))]]))
+
+(defn export-result [{:keys [error notes filename]} h]
+  [:div {:class (str "kk-result" (when error " kk-result--error")) :role "status"}
+   (if error
+     [:p {:class "kk-warnings"} error]
+     [:p (str filename " を書き出しました。")])
+   (when (seq notes)
+     (into [:ul {:class "kk-notes"}] (map (fn [n] [:li n]) notes)))
+   (btn h [:dismiss-export] "閉じる" {:type "text"})])
+
+;; ───────── 取り込み ─────────
+
+(defn import-panel [{:keys [ui data]} h]
+  [:section {:class "kk-panel" :aria-labelledby "kk-import-heading"}
+   [:h2 {:id "kk-import-heading" :class "kk-h2"} "仕訳を取り込む"]
+   [:p {:class "kk-help"}
+    "会計ソフトから書き出したファイルを選ぶか、テキストを貼り付けてください。"
+    "読み込みはこのブラウザの中で行い、何も送信しません。Shift_JIS のファイルはファイル選択で読み込んでください（貼り付けは UTF-8 だけです）。"]
+   [:div {:class "kk-settings"}
+    (field "kk-import-format" "形式"
+           (select-el h [:set-import :import-format] (:import-format ui)
+                      (cons ["auto" "自動で判定する"] (map (juxt :id :label) ingest/formats))
+                      {:id "kk-import-format"}))
+    (field "kk-import-encoding" "文字コード（ファイル）"
+           (select-el h [:set-import :import-encoding] (:import-encoding ui)
+                      [["auto" "自動（BOM → UTF-8 → Shift_JIS）"] ["utf-8" "UTF-8"] ["shift_jis" "Shift_JIS"]]
+                      {:id "kk-import-encoding"}))
+    (field "kk-import-currency" "通貨（Xero／QBO の JSON・CSV）"
+           (select-el h [:set-import :import-currency] (:import-currency ui)
+                      (map (fn [c] [c c]) (sort (keys core/currency-exponent)))
+                      {:id "kk-import-currency"
+                       :disabled (boolean (seq (:entries data)))})
+           (when (seq (:entries data)) (str "帳簿の通貨は " (:currency data) " です（1 帳簿 1 通貨）")))
+    (field "kk-import-mode" "取り込み方"
+           (select-el h [:set-import :import-mode] (:import-mode ui)
+                      [["append" "追加する（同じ仕訳は飛ばす）"] ["replace" "入れ替える"]]
+                      {:id "kk-import-mode"}))]
+   (field "kk-import-file" "ファイル（.csv / .txt / .json）"
+          [:input (with-handler {:id "kk-import-file" :type "file"
+                                 :accept ".csv,.txt,.json,text/csv,text/plain,application/json"}
+                    :on-change (h :file [:import-file]))])
+   (field "kk-import-text" "貼り付け（UTF-8）"
+          (text-area h [:set-import :import-text] (:import-text ui)
+                     {:id "kk-import-text" :rows 6
+                      :placeholder "取引No,取引日,借方勘定科目,…\n1,2026/04/01,普通預金,…"}))
+   [:div {:class "kk-actions"}
+    (btn h [:run-import-text] "貼り付けたテキストを取り込む"
+         {:type "solid-fill" :disabled (text/blank? (or (:import-text ui) ""))})]])
+
+(defn import-result [{:keys [format encoding added duplicates rejected warnings error]} h]
+  [:div {:class (str "kk-result" (when error " kk-result--error")) :role "status"}
+   (if error
+     [:p {:class "kk-warnings"} error]
+     [:p (str (or (:label (ingest/format-by-id (some-> format name))) "入力")
+              (when encoding (str "（" (ingest/encoding-label encoding) "）"))
+              " から " added " 件の仕訳を取り込みました。"
+              (when (pos? (or duplicates 0)) (str "同じ仕訳 " duplicates " 件は飛ばしました。"))
+              (when (pos? (or rejected 0)) (str "読めなかった仕訳 " rejected " 件は取り込んでいません。")))])
+   (when (seq warnings)
+     (into [:ul {:class "kk-warnings"}]
+           (concat (map (fn [w] [:li w]) (take 20 warnings))
+                   (when (> (count warnings) 20) [[:li (str "ほか " (- (count warnings) 20) " 件")]]))))
+   (btn h [:dismiss-import] "閉じる" {:type "text"})])
+
+;; ───────── 期間・検査 ─────────
+
+(defn period-bar [{:keys [data ui]} derived h]
+  (let [p (:period derived)
+        years (core/fiscal-years data (:fy-start ui 4))
+        months (core/months data)
+        [first-d last-d] (core/date-range data)
+        preset-value (str (:from p) "|" (:to p))
+        options (concat (map (fn [y] [(str (:from y) "|" (:to y)) (:label y)]) years)
+                        (when first-d [[(str first-d "|" last-d) (str "すべて（" first-d " 〜 " last-d "）")]])
+                        (map (fn [m] [(str (:from m) "|" (:to m)) (:label m)]) months))
+        options (if (some #(= preset-value (first %)) options)
+                  options
+                  (cons [preset-value (str (:from p) " 〜 " (:to p))] options))]
+    [:div {:class "kk-period"}
+     (field "kk-period" "期間"
+            (select-el h [:set-period-preset] preset-value options {:id "kk-period"}))
+     (field "kk-fy-start" "期首の月"
+            (select-el h [:set-fy-start] (:fy-start ui 4) (map (fn [m] [m (str m " 月")]) (range 1 13))
+                       {:id "kk-fy-start"}))
+     (field "kk-from" "開始日"
+            (text-input h [:set-period-date :from] (:from p) {:id "kk-from" :type "date"}))
+     (field "kk-to" "終了日"
+            (text-input h [:set-period-date :to] (:to p) {:id "kk-to" :type "date"}))]))
+
+(defn checks-panel [{:keys [data]} {:keys [checks]} h]
+  (let [{:keys [unclassified-accounts unclassified-lines invalid-entries bs-difference balanced?]} checks
+        exp (core/exponent (:currency data))]
+    [:div {:class (str "kk-checks" (when-not (and balanced? (zero? invalid-entries)) " kk-checks--warn"))
+           :role "status"}
+     (if (and balanced? (zero? invalid-entries))
+       [:p (chip "完全" "green") " すべての仕訳が貸借一致し、勘定科目はすべて区分されています。"]
+       (into [:ul]
+             (concat
+              (when (pos? invalid-entries)
+                [[:li (chip "要確認" "red") " 問題のある仕訳が " invalid-entries " 件あります。"
+                  (btn h [:show-problems] "仕訳帳で見る" {:type "text"})]])
+              (when (seq unclassified-accounts)
+                [[:li (chip "不完全" "orange") " 区分の無い勘定科目が " (count unclassified-accounts) " 件（"
+                  unclassified-lines " 行）あり、P/L・B/S に数えていません。"
+                  (btn h [:set-mode :accounts] "区分を付ける" {:type "text"})]])
+              (when-not (zero? bs-difference)
+                [[:li (chip "不一致" "red") " 貸借対照表の差額 " (core/display-amount bs-difference exp)
+                  "（資産 − 負債 − 純資産。区分の無い科目か貸借の合わない仕訳が原因です）"]]))))]))
+
+;; ───────── 帳票 ─────────
+
+(defn- money [data n] (core/display-amount n (core/exponent (:currency data))))
+
+(defn- side-amount
+  "純額（借方 − 貸方）を「借 1,000」「貸 1,000」で。"
+  [data n]
+  (cond
+    (pos? n) (str "借 " (money data n))
+    (neg? n) (str "貸 " (money data (- n)))
+    :else "0"))
+
+(defn trial-balance-view [{:keys [data]} {:keys [trial-balance]} h]
+  (let [{:keys [rows totals]} trial-balance]
+    [:section {:class "kk-report" :aria-labelledby "kk-tb-heading"}
+     [:h2 {:id "kk-tb-heading" :class "kk-h2"} "残高試算表"]
+     [:p {:class "kk-help"} "B/S の科目は期首前の累計から、P/L の科目は期間の分だけを数えます。期首前の損益は「" core/retained-label "」にまとめます。"]
+     [:div {:class "kk-table-wrap"}
+      [:table {:class "kk-table"}
+       [:thead [:tr [:th {:scope "col"} "区分"] [:th {:scope "col"} "勘定科目"]
+                [:th {:scope "col" :class "kk-num"} "期首残高"] [:th {:scope "col" :class "kk-num"} "借方"]
+                [:th {:scope "col" :class "kk-num"} "貸方"] [:th {:scope "col" :class "kk-num"} "期末残高"]]]
+       (into [:tbody]
+             (map (fn [{:keys [account class opening debit credit closing synthetic]}]
+                    [:tr {:class (when (= :unclassified class) "kk-row--warn")}
+                     [:td (core/class-label class)]
+                     [:th {:scope "row"}
+                      (if synthetic
+                        account
+                        [:button (with-handler {:type "button" :class "kk-link"} :on-click (h :click [:show-account account]))
+                         account])]
+                     [:td {:class "kk-num"} (side-amount data opening)]
+                     [:td {:class "kk-num"} (money data debit)]
+                     [:td {:class "kk-num"} (money data credit)]
+                     [:td {:class "kk-num"} (side-amount data closing)]])
+                  rows))
+       [:tfoot [:tr [:th {:scope "row" :col-span 2} "合計"] [:td]
+                [:td {:class "kk-num"} (money data (:debit totals))]
+                [:td {:class "kk-num"} (money data (:credit totals))]
+                [:td {:class "kk-num"} (side-amount data (:closing totals))]]]]]]))
+
+(defn- section-rows [data {:keys [class accounts total]} label]
+  (concat
+   [[:tr {:class "kk-section"} [:th {:scope "rowgroup" :col-span 2} label]]]
+   (map (fn [{:keys [account amount]}]
+          [:tr [:th {:scope "row" :class "kk-indent"} account] [:td {:class "kk-num"} (money data amount)]])
+        accounts)
+   [[:tr {:class "kk-subtotal"} [:th {:scope "row"} (str label " 計")] [:td {:class "kk-num"} (money data total)]]]))
+
+(defn- stage-row [data label amount]
+  [:tr {:class "kk-stage"} [:th {:scope "row"} label] [:td {:class "kk-num"} (money data amount)]])
+
+(defn profit-and-loss-view [{:keys [data ui]} {:keys [profit-and-loss]} h]
+  (let [{:keys [sections stages]} profit-and-loss
+        by-class (into {} (map (juxt :class identity) sections))
+        sec (fn [k] (section-rows data (by-class k) (core/class-label k)))
+        us? (= :us (:pl-style ui))
+        merged (fn [label ks]
+                 (let [ss (map by-class ks)]
+                   (section-rows data {:accounts (mapcat :accounts ss) :total (reduce + 0 (map :total ss))} label)))]
+    [:section {:class "kk-report" :aria-labelledby "kk-pl-heading"}
+     [:div {:class "kk-report-head"}
+      [:h2 {:id "kk-pl-heading" :class "kk-h2"} (if us? "Profit and Loss" "損益計算書")]
+      [:div {:class "kk-actions"}
+       (btn h [:set-pl-style :jp] "日本の段階利益" {:aria-pressed (not us?)})
+       (btn h [:set-pl-style :us] "米国式（QBO の区分）" {:aria-pressed us?})]]
+     [:div {:class "kk-table-wrap"}
+      (into [:table {:class "kk-table kk-statement"}]
+            [(into [:tbody]
+                   (if us?
+                     (concat (merged "Income" [:revenue])
+                             (merged "Cost of Goods Sold" [:cost-of-sales])
+                             [(stage-row data "Gross Profit" (:gross stages))]
+                             (merged "Expenses" [:operating-expense])
+                             [(stage-row data "Net Operating Income" (:operating stages))]
+                             (merged "Other Income" [:non-operating-income :extraordinary-gain])
+                             (merged "Other Expenses" [:non-operating-expense :extraordinary-loss :income-tax])
+                             [(stage-row data "Net Other Income" (- (:net stages) (:operating stages)))]
+                             [(stage-row data "Net Income" (:net stages))])
+                     (concat (sec :revenue) (sec :cost-of-sales)
+                             [(stage-row data (core/stage-label :gross) (:gross stages))]
+                             (sec :operating-expense)
+                             [(stage-row data (core/stage-label :operating) (:operating stages))]
+                             (sec :non-operating-income) (sec :non-operating-expense)
+                             [(stage-row data (core/stage-label :ordinary) (:ordinary stages))]
+                             (sec :extraordinary-gain) (sec :extraordinary-loss)
+                             [(stage-row data (core/stage-label :pre-tax) (:pre-tax stages))]
+                             (sec :income-tax)
+                             [(stage-row data (core/stage-label :net) (:net stages))])))])]]))
+
+(defn balance-sheet-view [{:keys [data]} {:keys [balance-sheet]} h]
+  (let [{:keys [sections totals retained net-income]} balance-sheet
+        by-class (into {} (map (juxt :class identity) sections))
+        sec (fn [k] (section-rows data (by-class k) (core/class-label k)))]
+    [:section {:class "kk-report" :aria-labelledby "kk-bs-heading"}
+     [:h2 {:id "kk-bs-heading" :class "kk-h2"} "貸借対照表"]
+     [:p {:class "kk-help"}
+      "取り込んだ仕訳の累計です。期首残高（開始仕訳）を取り込んでいないと、資産・負債・純資産は期中の増減だけになります。"]
+     [:div {:class "kk-bs"}
+      [:div {:class "kk-table-wrap"}
+       [:table {:class "kk-table kk-statement"}
+        [:caption "資産の部"]
+        (into [:tbody] (concat (sec :current-asset) (sec :non-current-asset) (sec :deferred-asset)
+                               [(stage-row data "資産合計" (:assets totals))]))]]
+      [:div {:class "kk-table-wrap"}
+       [:table {:class "kk-table kk-statement"}
+        [:caption "負債・純資産の部"]
+        (into [:tbody] (concat (sec :current-liability) (sec :non-current-liability)
+                               [(stage-row data "負債合計" (:liabilities totals))]
+                               (sec :equity)
+                               [[:tr [:th {:scope "row" :class "kk-indent"} core/retained-label]
+                                 [:td {:class "kk-num"} (money data retained)]]
+                                [:tr [:th {:scope "row" :class "kk-indent"} "当期純利益"]
+                                 [:td {:class "kk-num"} (money data net-income)]]]
+                               [(stage-row data "純資産合計" (:equity totals))
+                                (stage-row data "負債・純資産合計" (+ (:liabilities totals) (:equity totals)))]))]]]
+     (when-not (zero? (:difference totals))
+       [:p {:class "kk-warnings"} "差額 " (money data (:difference totals)) "（資産 − 負債・純資産）"])]))
+
+(defn- entry-row [data e]
+  (let [problems (core/entry-problems e)]
+    [:li {:class (str "kk-entry" (when (seq problems) " kk-entry--warn"))}
+     [:div {:class "kk-entry-head"}
+      [:span {:class "kk-date"} (:date e)]
+      (when (:number e) [:span {:class "kk-number"} (str "No. " (:number e))])
+      [:span {:class "kk-memo"} (or (:memo e) "")]
+      (when (:adjustment? e) (chip "決算整理" "blue"))
+      (when-let [f (get-in e [:origin :format])] [:span {:class "kk-origin"} (name f)])]
+     (when (seq problems)
+       (into [:ul {:class "kk-warnings"}] (map (fn [p] [:li (core/problem-label p)]) (sort problems))))
+     [:div {:class "kk-table-wrap"}
+     [:table {:class "kk-table kk-lines"}
+      [:thead [:tr [:th {:scope "col"} "勘定科目"] [:th {:scope "col"} "補助・部門・取引先"]
+               [:th {:scope "col" :class "kk-num"} "借方"] [:th {:scope "col" :class "kk-num"} "貸方"]
+               [:th {:scope "col"} "摘要・税区分"]]]
+      (into [:tbody]
+            (map (fn [l]
+                   [:tr
+                    [:td (:account l)]
+                    [:td (text/join " / " (remove nil? [(:sub-account l) (:department l) (:partner l)]))]
+                    [:td {:class "kk-num"} (when (pos? (:debit l 0)) (money data (:debit l)))]
+                    [:td {:class "kk-num"} (when (pos? (:credit l 0)) (money data (:credit l)))]
+                    [:td (text/join " / " (remove nil? [(:description l) (get-in l [:tax :code])
+                                                        (get-in l [:invoice :code])]))]])
+                 (:lines e)))]]]))
+
+(defn journal-view [{:keys [data ui]} {:keys [period]} h]
+  (let [entries (filterv (fn [e] (let [d (or (core/parse-date (:date e)) "")]
+                                   (or (and (>= (compare d (:from period)) 0) (<= (compare d (:to period)) 0))
+                                       (empty? d))))
+                         (:entries data))
+        entries (if (:problems-only? ui) (filterv #(seq (core/entry-problems %)) entries) entries)
+        page (min (:journal-page ui 0) (max 0 (quot (dec (count entries)) page-size)))
+        shown (subvec entries (min (count entries) (* page page-size))
+                      (min (count entries) (* (inc page) page-size)))]
+    [:section {:class "kk-report" :aria-labelledby "kk-journal-heading"}
+     [:div {:class "kk-report-head"}
+      [:h2 {:id "kk-journal-heading" :class "kk-h2"} "仕訳帳"]
+      [:label {:class "kk-check"}
+       [:input (with-handler {:type "checkbox" :checked (boolean (:problems-only? ui))}
+                 :on-change (h :checked [:set-problems-only]))]
+       " 問題のある仕訳だけ"]]
+     [:p {:class "kk-help"} (str (count entries) " 件"
+                                 (when (> (count entries) page-size)
+                                   (str "（" (inc (* page page-size)) "〜" (+ (* page page-size) (count shown)) " 件目）")))]
+     (into [:ol {:class "kk-entries"}] (map #(entry-row data %) shown))
+     (when (> (count entries) page-size)
+       [:div {:class "kk-actions"}
+        (btn h [:set-journal-page (dec page)] "前へ" {:disabled (zero? page)})
+        (btn h [:set-journal-page (inc page)] "次へ" {:disabled (>= (* (inc page) page-size) (count entries))})])]))
+
+(def ^:private class-source-label
+  {:vendor "取り込み元の型" :default "既定の表" :user "手で指定" :none "未分類"})
+
+(defn- account-ledger [data account period]
+  (let [from (:from period) to (:to period)
+        rows (for [e (:entries data)
+                   :let [d (or (core/parse-date (:date e)) "")]
+                   :when (<= (compare d to) 0)
+                   l (:lines e)
+                   :when (= account (:account l))]
+               {:date d :entry e :line l :in? (>= (compare d from) 0)})
+        opening (reduce + 0 (map #(- (:debit (:line %) 0) (:credit (:line %) 0)) (remove :in? rows)))
+        opening (if (core/pl-class? (core/account-class data account)) 0 opening)
+        in-rows (filter :in? rows)]
+    [:div {:class "kk-ledger"}
+     [:h3 {:class "kk-h3"} (str account " の元帳（" from " 〜 " to "）")]
+     [:div {:class "kk-table-wrap"}
+      [:table {:class "kk-table"}
+       [:thead [:tr [:th {:scope "col"} "日付"] [:th {:scope "col"} "摘要"]
+                [:th {:scope "col" :class "kk-num"} "借方"] [:th {:scope "col" :class "kk-num"} "貸方"]
+                [:th {:scope "col" :class "kk-num"} "残高"]]]
+       (into [:tbody [:tr [:td] [:th {:scope "row"} "期首残高"] [:td] [:td] [:td {:class "kk-num"} (side-amount data opening)]]]
+             (second
+              (reduce (fn [[bal acc] {:keys [date entry line]}]
+                        (let [bal (+ bal (- (:debit line 0) (:credit line 0)))]
+                          [bal (conj acc [:tr [:td date] [:td (or (:description line) (:memo entry) "")]
+                                          [:td {:class "kk-num"} (when (pos? (:debit line 0)) (money data (:debit line)))]
+                                          [:td {:class "kk-num"} (when (pos? (:credit line 0)) (money data (:credit line)))]
+                                          [:td {:class "kk-num"} (side-amount data bal)]])]))
+                      [opening []]
+                      (take 500 in-rows))))]]
+     (when (> (count in-rows) 500) [:p {:class "kk-help"} (str "最初の 500 行を表示しています（全 " (count in-rows) " 行）")])]))
+
+(defn accounts-view [{:keys [data ui]} {:keys [period]} h]
+  (let [names (core/used-accounts data)
+        unclassified (set (core/unclassified-accounts data))
+        names (concat (filter unclassified names) (remove unclassified names))]
+    [:section {:class "kk-report" :aria-labelledby "kk-accounts-heading"}
+     [:h2 {:id "kk-accounts-heading" :class "kk-h2"} "勘定科目と区分"]
+     [:p {:class "kk-help"}
+      "区分は P/L・B/S のどこに数えるかを決めます。QuickBooks・Xero から取り込んだ科目は先方の型から、"
+      "日本の会計ソフトの CSV の科目は名前から既定の表で付けます。違うものは選び直してください（推測では埋めません）。"]
+     [:div {:class "kk-table-wrap"}
+      [:table {:class "kk-table"}
+       [:thead [:tr [:th {:scope "col"} "勘定科目"] [:th {:scope "col"} "コード"]
+                [:th {:scope "col"} "区分"] [:th {:scope "col"} "区分の出所"]]]
+       (into [:tbody]
+             (map (fn [n]
+                    (let [k (core/account-class data n)
+                          src (get-in data [:accounts n :class-source] (if (core/default-class n) :default :none))]
+                      [:tr {:class (when (= :unclassified k) "kk-row--warn")}
+                       [:th {:scope "row"}
+                        [:button (with-handler {:type "button" :class "kk-link"} :on-click (h :click [:show-account n])) n]]
+                       [:td (or (get-in data [:accounts n :code]) "")]
+                       [:td (select-el h [:set-class n] (name k)
+                                       (map (fn [c] [(name c) (core/class-label c)]) core/classes)
+                                       {:aria-label (str n " の区分")})]
+                       [:td (class-source-label src)]]))
+                  names))]]
+     (when-let [a (:account ui)]
+       (when period (account-ledger data a period)))]))
+
+;; ───────── 空の状態・全体 ─────────
+
+(defn empty-state [h]
+  [:section {:class "kk-empty"}
+   [:h2 {:class "kk-h2"} "まだ仕訳がありません"]
+   [:p "会計ソフトから書き出した仕訳帳（CSV）か、QuickBooks Online・Xero の API の JSON を取り込んでください。"
+    "試すだけなら、合成データのサンプルを読み込めます。"]
+   [:noscript [:p {:class "kk-noscript"}
+               "この道具は JavaScript で動きます（すべてブラウザの中で処理し、何も送信しません）。"]]
+   [:div {:class "kk-actions"}
+    (btn h [:load-sample] "サンプルを読み込む" {:type "solid-fill"})
+    (btn h [:toggle-import] "取り込む")]])
+
+(defn booting []
+  [:section {:class "kk-empty" :aria-live "polite"}
+   [:h2 {:class "kk-h2"} "読み込んでいます…"]
+   [:p "この道具は JavaScript で動きます。仕訳はこのブラウザの中（IndexedDB）から読み込み、どこにも送信しません。"]
+   [:noscript [:p {:class "kk-noscript"}
+               "JavaScript が無効なので動きません。有効にすると、すべてこのブラウザの中で処理します。"]]])
+
+(defn- tabs [{:keys [ui]} h]
+  (into [:div {:class "kk-tabs" :role "group" :aria-label "表示"}]
+        (map (fn [[k label]] (btn h [:set-mode k] label {:aria-pressed (= k (:mode ui))
+                                                         :type (if (= k (:mode ui)) "solid-fill" "outline")}))
+             modes)))
+
+(defn- workspace [{:keys [ui] :as state} derived h]
+  [:div {:class "kk-workspace"}
+   (period-bar state derived h)
+   (checks-panel state derived h)
+   (tabs state h)
+   (case (:mode ui)
+     :profit-and-loss (profit-and-loss-view state derived h)
+     :balance-sheet (balance-sheet-view state derived h)
+     :journal (journal-view state derived h)
+     :accounts (accounts-view state derived h)
+     (trial-balance-view state derived h))])
+
+(defn root
+  "画面全体。state = {:data db :ui ui}、derived = (derive data period)。:ui の
+  :booting? が真なら（SSR）本文の代わりに booting を描く。"
+  [{:keys [data ui] :as state} derived h]
+  (if (:booting? ui)
+    [:div {:class "kk-app"} (header) (booting) (footer)]
+    [:div {:class "kk-app"}
+     (header)
+     (toolbar state h)
+     (when-let [r (:export-result ui)] (export-result r h))
+     (when (:import-open? ui) (import-panel state h))
+     (when-let [r (:import-result ui)] (import-result r h))
+     (if (or (empty? (:entries data)) (nil? derived))
+       (empty-state h)
+       (workspace state derived h))
+     (footer)]))
+
+(defn ssr-handlers
+  "SSR 用の h: どのイベントにも handler を付けない。"
+  [_kind _ev]
+  nil)

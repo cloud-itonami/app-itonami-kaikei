@@ -1,0 +1,34 @@
+;; 公開物の宣言 —— network-awai/cloud-itonami の生成器
+;; （scripts/generate-scittle-app-site.cljk）が読む。形は app-itonami-dandori の
+;; site/site.edn と同じ契約。
+;;
+;; - :vendor は site/vendor/ から vendor/<file> へ、この順で <script src> に並ぶ。
+;;   React UMD は scittle.reagent.js より先に読まれなければならない。
+;; - :external は :sha の commit から取る（生成器が git show で読む）。手元の
+;;   checkout の作業中の状態を公開物に混ぜないため。deps.edn / nbb.edn の pin と揃える。
+;; - :external と :sources は :to へコピーし、この順で
+;;   <script type="application/x-scittle"> に並ぶ。scittle は同じ SCI 文脈で
+;;   順に評価するので、require される側を先に置く。
+;; - (kaikei.page/document opts) が完全な HTML を返す。
+{:title "kaikei — 会計帳簿（MF・freee・弥生・QuickBooks・Xero 互換）"
+ :description "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作る。データは送信されず、この端末のブラウザの中（IndexedDB）にだけ残る。"
+ :page {:ns kaikei.page :fn document}
+ :vendor ["react.production.min.js" "react-dom.production.min.js"
+          "scittle.js" "scittle.reagent.js" "scittle.re-frame.js"]
+ :external [{:repo "kotoba-lang/text" :sha "bc551a3ecc68e551ba1dd2fcb22d5f1b8dd7805d"
+             :from "src/kotoba/lang/text.cljk" :to "kotoba/lang/text.cljs"}]
+ :sources [{:from "src/kaikei/core.cljk" :to "kaikei/core.cljs"}
+           {:from "src/kaikei/json.cljk" :to "kaikei/json.cljs"}
+           {:from "src/kaikei/csv.cljk" :to "kaikei/csv.cljs"}
+           {:from "src/kaikei/encoding.cljk" :to "kaikei/encoding.cljs"}
+           {:from "src/kaikei/compat/common.cljk" :to "kaikei/compat/common.cljs"}
+           {:from "src/kaikei/compat/native.cljk" :to "kaikei/compat/native.cljs"}
+           {:from "src/kaikei/compat/xero.cljk" :to "kaikei/compat/xero.cljs"}
+           {:from "src/kaikei/compat/qbo.cljk" :to "kaikei/compat/qbo.cljs"}
+           {:from "src/kaikei/compat/yayoi.cljk" :to "kaikei/compat/yayoi.cljs"}
+           {:from "src/kaikei/compat/mf.cljk" :to "kaikei/compat/mf.cljs"}
+           {:from "src/kaikei/compat/freee.cljk" :to "kaikei/compat/freee.cljs"}
+           {:from "src/kaikei/ingest.cljk" :to "kaikei/ingest.cljs"}
+           {:from "src/kaikei/export.cljk" :to "kaikei/export.cljs"}
+           {:from "src/kaikei/view.cljk" :to "kaikei/view.cljs"}
+           {:from "site/app.cljk" :to "app.cljs"}]}

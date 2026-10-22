@@ -1,0 +1,28 @@
+{:itonami.blueprint/id "kaikei"
+ :itonami.blueprint/name "kaikei — accounting ledger compatible with MoneyForward, freee, Yayoi, QuickBooks Online and Xero, browser-local"
+ :itonami.blueprint/domain :finance/bookkeeping
+ :itonami.blueprint/license "Apache-2.0 + etzhayyim Charter Compliance Rider v3.1 (NOTICE)"
+ :itonami.blueprint/social-impact [:data-sovereignty :self-hosting :vendor-lock-in-exit]
+ :itonami.blueprint/robotics false
+ :itonami.blueprint/required-technologies [:wasm-guest :browser-local-state]
+ :itonami.blueprint/status :public-oss
+ :itonami.blueprint/maturity :core-only
+ ;; itonami.cloud/sites/app/kaikei/（network-awai/cloud-itonami の sites.edn、app org）。
+ ;; :endpoint は書かない —— 静的配信の道具で、呼び出せる actor ではない。
+ :itonami.blueprint/org "app"
+ :itonami.blueprint/compat
+ {:target ["MoneyForward クラウド会計" "freee 会計" "弥生会計" "QuickBooks Online" "Xero"]
+  :scope :data-format
+  :network false
+  :formats [:kaikei-ledger-json :xero-accounts-journals-json :qbo-account-journalentry-json
+            :yayoi-import :moneyforward-journal-csv :freee-journal-csv :qbo-journal-csv :xero-manual-journal-csv]
+  :reports [:trial-balance :profit-and-loss :balance-sheet]
+  :report-shapes [:kaikei :qbo-report :xero-reports]
+  :note "各社の API へは接続しない（kotoba-client-runtime ブローカー未着地、各社 API は itonami.cloud からの CORS を返さない）。互換はデータ形式の互換で、各社の計算の再現ではない。電子帳簿保存法への適合は主張せず、申告書を作成・提出しない。"}
+ :itonami.blueprint/implementation
+ {:language :kotoba
+  :target :wasm32-browser-kotoba-v1
+  :guest "aiueos/kaikei_journal.cljk"
+  :descriptor "aiueos/kaikei.edn"
+  :ui :scittle-re-frame-reagent
+  :capabilities []}}

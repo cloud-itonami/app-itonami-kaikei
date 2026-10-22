@@ -1,0 +1,58 @@
+(ns kaikei.parity-test
+  "parity fixture（test/fixtures/parity.edn）を adapter で全行照合する。
+
+  同じ表を guest が 2 か所で通す:
+    - aiueos/kaikei_journal.cljk の test-*（amu test、:jvm-kir :js :wasm）
+    - test/guest_parity.mjs（コンパイル済み wasm を kototama-browser-host-v1 で）
+  ここでは関数別の行数も guest の docstring と照合する —— 表に行を足して
+  guest の test-* に写し忘れると、この件数が先にずれる。"
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.edn :as edn]
+            ["fs" :as fs]
+            [kaikei.core :as core]))
+
+(def fixture (edn/read-string (fs/readFileSync "test/fixtures/parity.edn" "utf8")))
+
+(defn- resolve-arg [a] (if (keyword? a) (get-in fixture [:buffers a]) a))
+
+(def adapter
+  {"validate-entry" core/validate-entry
+   "entry-balanced?" core/entry-balanced?
+   "ledger-balanced?" core/ledger-balanced?
+   "account-net" core/account-net
+   "class-valid?" core/class-valid?
+   "normal-sign" core/normal-sign
+   "period-net" core/period-net
+   "class-balance" core/class-balance
+   "profit-stage" core/profit-stage
+   "unclassified-count" core/unclassified-count
+   "bs-difference" core/bs-difference
+   "statement-balanced?" core/statement-balanced?
+   "statement-buffer-valid?" core/statement-buffer-valid?})
+
+(deftest every-row-matches
+  (doseq [{f :fn args :args expect :expect} (:rows fixture)]
+    (testing (str f " " (pr-str args))
+      (is (= expect (apply (adapter f) (map resolve-arg args)))))))
+
+(deftest row-counts-match-guest-docstring
+  (testing "aiueos/kaikei_journal.cljk の docstring に書いた関数別件数"
+    (is (= {"validate-entry" 7 "entry-balanced?" 2 "ledger-balanced?" 2 "account-net" 1
+            "class-valid?" 4 "normal-sign" 4 "period-net" 5 "class-balance" 4
+            "profit-stage" 8 "unclassified-count" 3 "bs-difference" 3
+            "statement-balanced?" 3 "statement-buffer-valid?" 6}
+           (frequencies (map :fn (:rows fixture)))))
+    (is (= 52 (count (:rows fixture))))))
+
+(deftest every-function-is-exported-by-the-guest
+  (let [src (str (fs/readFileSync "aiueos/kaikei_journal.cljk" "utf8"))
+        exports (second (re-find #"\(:export \[([^\]]*)\]" src))]
+    (doseq [f (keys adapter)]
+      (is (re-find (re-pattern (str "\\(defn " (.replace f "?" "\\?") " ")) src)
+          (str f " が guest に無い"))
+      (is (some #{f} (.split (.trim exports) #"\s+")) (str f " が guest の :export に無い")))))
+
+(deftest sample-import-is-the-guest-sample-ledger
+  (testing "core/sample-import を statement-buffer にすると、guest の sample-ledger と同じ数になる"
+    (let [db (:db (core/merge-import core/empty-db core/sample-import))]
+      (is (= (get-in fixture [:buffers :sample]) (core/statement-buffer db))))))
