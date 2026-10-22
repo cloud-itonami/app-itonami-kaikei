@@ -1,0 +1,342 @@
+(ns kaikei.compat.freee-invoices
+  "freee請求書 の請求書 —— 帳票の CSV インポートの形と、freee請求書 API の invoice の
+  JSON。どちらも売上の請求書だけで、金額は円。
+
+  ## CSV（帳票の一括インポート）
+
+  freee ヘルプ「帳票をCSVで一括インポートする」（18895523266841、2026-10-16）の添付の
+  フォーマット（47 列）と見本。行形式が「本文」の行が請求書、続く「明細」の行が明細。
+  - 本文: 発行日（YYYY/MM/DD か YYYY-MM-DD）・期日・番号・件名・消費税の表示方法
+    （内税・外税）・消費税端数の計算方法と金額端数の計算方法（切り捨て・切り上げ・
+    四捨五入）・取引先名称。
+  - 明細: 行の種類（通常・テキスト）・摘要・取引日・単価・数量・単位・税率（10%・
+    8% (軽減税率)・8%・0%）・源泉徴収（TRUE・FALSE）・勘定科目・税区分。
+  - 明細の金額の列は無い。単価 × 数量 を金額端数の計算方法で丸める。税額・税率ごとの
+    合計・登録番号の列も無い（freee が計算し、登録番号は事業所の設定から来る）。
+  - 添付の 2 つのファイルは 7 列目の名前が違う（フォーマットは「支払予定日」、見本は
+    「予定日」）。読むときはどちらも受け、書くときはフォーマットに合わせる。文字コードは
+    本文が「UTF-8 with BOM」と言い、添付は BOM なしの UTF-8（未確認）。
+  - 状態の列は無いので下書きで読む。
+
+  ## JSON（freee請求書 API、freee/freee-api-schema ac1acd4 の iv/open-api-3）
+
+  `GET /invoices/{id}` の応答 {\"invoice\": {…}}、またはその invoice の配列
+  {\"invoices\": […]}（一覧の応答は明細を持たないので、明細の無いものは飛ばす）。
+  - tax_entry_method（in 内税・out 外税）、tax_fraction と line_amount_fraction
+    （omit 切り捨て・round_up 切り上げ・round 四捨五入）。
+  - 明細の金額は単価 × 数量 を line_amount_fraction で丸める（unit_price は文字列）。
+    tax_rate（0・8・10）と reduced_tax_rate。type が text の行は読まない。
+  - 税率ごとの税額 amount_tax_10・amount_tax_8_reduced・amount_tax_8 を取り込み元の
+    額にする。
+  - cancel_status が canceled なら取消、payment_status（決済ステータス）が settled なら
+    入金済み、ほかは発行済み。template.invoice_registration_number は発行者（自社）の
+    登録番号。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]
+            [kaikei.invoice :as invoice]
+            [kaikei.json :as json]
+            [kaikei.compat.common :as common]))
+
+(def ^:private fraction->rounding
+  {"切り捨て" :floor "切り上げ" :ceil "四捨五入" :half-up
+   "omit" :floor "round_up" :ceil "round" :half-up})
+
+(def ^:private rounding->label {:floor "切り捨て" :ceil "切り上げ" :half-up "四捨五入"})
+(def ^:private rounding->api {:floor "omit" :ceil "round_up" :half-up "round"})
+
+(defn- rate-token
+  "kaikei の行 → freee の税率（CSV の文字列・API の数と軽減の印）。表せなければ nil。"
+  [l]
+  (let [category (:category l :taxable)]
+    (cond
+      (not= :taxable category) {:csv "0%" :api 0 :reduced false}
+      (= 1000 (:rate l)) {:csv "10%" :api 10 :reduced false}
+      (and (= 800 (:rate l)) (:reduced? l)) {:csv "8% (軽減税率)" :api 8 :reduced true}
+      (= 800 (:rate l)) {:csv "8%" :api 8 :reduced false}
+      (= 0 (:rate l)) {:csv "0%" :api 0 :reduced false}
+      :else nil)))
+
+(defn- tax-category-token [l]
+  (case (:category l :taxable)
+    :exempt "非課売上"
+    :out-of-scope "対象外"
+    :zero-rated nil
+    (cond
+      (= 1000 (:rate l)) "課税売上10%"
+      (and (= 800 (:rate l)) (:reduced? l)) "課税売上8%（軽）"
+      (= 800 (:rate l)) "課税売上8%"
+      :else nil)))
+
+(defn- representable? [inv] (every? rate-token (:lines inv)))
+
+(defn- simple-quantity
+  "単価 × 数量（切り捨て）が金額と同じなら [数量 単価]、違えば [\"1\" 金額]。"
+  [l exp]
+  (if (and (:quantity l) (:unit-price l)
+           (= (:amount l) (:amount (invoice/line-amount (:quantity l) (:unit-price l) exp :floor))))
+    [(:quantity l) (:unit-price l)]
+    ["1" (core/format-amount (:amount l 0) exp)]))
+
+;; ───────── CSV ─────────
+
+(def csv-columns
+  ["行形式" "発行日" "期日" "有効期限" "納品期限" "納品場所" "支払予定日" "入金方法" "支払方法" "番号" "枝番" "件名"
+   "繰越金額" "発行元担当者氏名" "社内メモ" "備考" "消費税の表示方法" "消費税端数の計算方法" "金額端数の計算方法"
+   "取引先名称" "取引先宛名" "取引先敬称" "取引先郵便番号" "取引先都道府県" "取引先市区町村・番地"
+   "取引先建物名・部屋番号" "取引先部署" "取引先担当者氏名" "行の種類" "摘要" "取引日" "単価" "数量" "単位" "税率"
+   "源泉徴収" "発生日" "振込先上書きの有無" "振込先上書き内容" "勘定科目" "税区分" "部門" "品目" "メモ" "セグメント1"
+   "セグメント2" "セグメント3"])
+
+(defn csv-detect? [rows]
+  (let [h (set (map #(text/trim (str %)) (first rows)))]
+    (and (contains? h "行形式") (contains? h "消費税の表示方法") (contains? h "行の種類"))))
+
+(defn- pick [rec k] (common/blank->nil (get rec k)))
+
+(defn- read-csv-line [rec exp rounding]
+  (let [w (str "行 " (::csv/row rec))
+        rate-text (pick rec "税率")
+        rate (when rate-text
+               (if (text/re-find #"^0\s*%$" rate-text)
+                 (or (common/rate-from-label (pick rec "税区分")) {:category :out-of-scope :rate 0})
+                 (common/rate-from-label rate-text)))
+        amt (if (pick rec "単価")
+              (invoice/line-amount (pick rec "数量") (pick rec "単価") exp rounding)
+              {:amount 0})]
+    (if (:error amt)
+      {:problem (str w ": 単価 × 数量 を読めません")}
+      {:line (cond-> (merge {:description (or (pick rec "摘要") "") :amount (:amount amt) :category :taxable} rate)
+               (pick rec "数量") (assoc :quantity (text/replace (pick rec "数量") "," ""))
+               (pick rec "単価") (assoc :unit-price (text/replace (pick rec "単価") "," ""))
+               (pick rec "勘定科目") (assoc :account (pick rec "勘定科目")))
+       :withholding? (= "TRUE" (some-> (pick rec "源泉徴収") text/upper))
+       :rate-unknown? (nil? rate)})))
+
+(defn read-csv
+  "parse 済みの CSV 行 → 請求書の取り込み結果（通貨は JPY）。"
+  [rows]
+  (let [header (mapv #(let [h (text/trim (str %))] (if (= h "予定日") "支払予定日" h)) (first rows))
+        recs (csv/records (cons header (rest rows)))
+        groups (reduce (fn [acc rec]
+                         (case (pick rec "行形式")
+                           "本文" (conj acc [rec])
+                           "明細" (if (seq acc) (conj (pop acc) (conj (peek acc) rec)) acc)
+                           acc))
+                       [] recs)
+        read-group
+        (fn [[head & lines]]
+          (let [where (str "行 " (::csv/row head))
+                date (core/parse-date (pick head "発行日"))
+                rounding (get fraction->rounding (pick head "金額端数の計算方法") :floor)
+                parts (vec (for [rec lines :when (not= "テキスト" (pick rec "行の種類"))]
+                             (read-csv-line rec 0 rounding)))
+                p (common/first-problem parts)]
+            (cond
+              p {:problem (:problem p)}
+              (nil? date) {:problem (str where ": 発行日 \"" (pick head "発行日") "\" を読めません")}
+              :else
+              {:invoice (cond-> {:kind :sales
+                                 :number (or (pick head "番号") "")
+                                 :date date
+                                 :status :draft
+                                 :partner {:name (or (pick head "取引先名称") "")}
+                                 :tax-mode (if (= "内税" (pick head "消費税の表示方法")) :inclusive :exclusive)
+                                 :rounding (get fraction->rounding (pick head "消費税端数の計算方法") :floor)
+                                 :lines (mapv :line parts)
+                                 :origin {:format :freee-invoice-csv}}
+                          (core/parse-date (pick head "期日")) (assoc :due-date (core/parse-date (pick head "期日")))
+                          (pick head "件名") (assoc :subject (pick head "件名"))
+                          (some :withholding? parts) (assoc :withholding true))
+               :rate-unknown? (some :rate-unknown? parts)})))
+        candidates (map read-group groups)]
+    (-> (merge {:format :freee-invoice-csv :currency "JPY"} (common/finish-invoices candidates))
+        (update :warnings into
+                (remove nil?
+                        ["freee請求書 の CSV は状態を持たないので、下書きとして読みました"
+                         (when (some :rate-unknown? candidates) "税率の読めない明細があります")])))))
+
+(defn write-csv
+  "db → freee請求書 の帳票インポート CSV（売上の請求書だけ、円だけ）。"
+  [db]
+  (if (not= "JPY" (:currency db))
+    {:error (str "freee請求書 の CSV は円の金額です。帳簿の通貨が " (:currency db) " なので書き出しません")}
+    (let [exp 0
+          all (filter #(and (= :sales (:kind %)) (not= :void (:status %))) (:invoices db))
+          invs (filter representable? all)
+          skipped (- (count all) (count invs))
+          purchases (count (filter #(= :purchase (:kind %)) (:invoices db)))
+          blank (vec (repeat (count csv-columns) nil))
+          index (zipmap csv-columns (range))
+          put (fn [row m] (reduce (fn [r [k v]] (assoc r (index k) v)) row m))
+          rows (mapcat (fn [inv]
+                         (cons (put blank {"行形式" "本文" "発行日" (core/slash-date (:date inv))
+                                           "期日" (some-> (:due-date inv) core/slash-date)
+                                           "番号" (:number inv) "件名" (:subject inv)
+                                           "消費税の表示方法" (if (= :inclusive (:tax-mode inv)) "内税" "外税")
+                                           "消費税端数の計算方法" (rounding->label (:rounding inv :floor))
+                                           "金額端数の計算方法" "切り捨て"
+                                           "取引先名称" (get-in inv [:partner :name])})
+                               (for [l (:lines inv)
+                                     :let [[qty unit] (simple-quantity l exp)]]
+                                 (put blank {"行形式" "明細" "行の種類" "通常" "摘要" (:description l)
+                                             "取引日" (core/slash-date (:date inv)) "単価" unit "数量" qty
+                                             "税率" (:csv (rate-token l)) "源泉徴収" "FALSE"
+                                             "勘定科目" (:account l) "税区分" (tax-category-token l)}))))
+                       invs)]
+      {:text (csv/write (cons csv-columns rows))
+       :notes (cond-> ["取引先名称・勘定科目・税区分は freee に登録済みの値でなければ取り込めません"
+                       "登録番号・税額の列はありません（freee が計算し、登録番号は事業所の設定から来ます）"
+                       "7 列目の見出しはフォーマットのファイルに合わせて「支払予定日」と書きました（見本のファイルは「予定日」）"]
+                (pos? purchases) (conj (str "受け取った請求書 " purchases " 件はこの形式に入りません"))
+                (pos? skipped) (conj (str "freee の税率（10%・8%・0%）で表せない請求書 " skipped " 件は書き出していません")))})))
+
+;; ───────── JSON（freee請求書 API） ─────────
+
+(defn detect? [data]
+  (and (map? data)
+       (or (and (map? (get data "invoice")) (contains? (get data "invoice") "tax_entry_method"))
+           (and (sequential? (get data "invoices"))
+                (some #(and (map? %) (contains? % "tax_entry_method")) (get data "invoices"))))))
+
+(defn- api-rate [l]
+  (case (get l "tax_rate")
+    10 {:category :taxable :rate 1000}
+    8 (cond-> {:category :taxable :rate 800} (true? (get l "reduced_tax_rate")) (assoc :reduced? true))
+    0 {:category :out-of-scope :rate 0}
+    nil))
+
+(defn- read-api-invoice [i inv]
+  (let [where (str "invoice " (or (get inv "invoice_number") (inc i)))
+        lines (filter #(and (map? %) (not= "text" (get % "type"))) (get inv "lines"))
+        line-rounding (get fraction->rounding (get inv "line_amount_fraction") :floor)
+        parts (vec (for [l lines
+                         :let [amt (invoice/line-amount (some-> (get l "quantity") str) (str (get l "unit_price" "")) 0 line-rounding)
+                               rate (api-rate l)]]
+                     (if (:error amt)
+                       {:problem (str where ": quantity × unit_price を読めません")}
+                       {:line (cond-> (merge {:description (str (get l "description" "")) :amount (:amount amt) :category :taxable} rate)
+                                (some? (get l "quantity")) (assoc :quantity (str (get l "quantity")))
+                                (some? (get l "unit_price")) (assoc :unit-price (str (get l "unit_price"))))
+                        :withholding? (true? (get l "withholding"))
+                        :rate-unknown? (nil? rate)})))
+        p (common/first-problem parts)
+        date (core/parse-date (get inv "billing_date"))
+        num (fn [k] (let [v (get inv k)] (when (number? v) (:amount (core/parse-amount v 0)))))
+        stated (vec (for [[k m] [["amount_tax_10" {:rate 1000}] ["amount_tax_8_reduced" {:rate 800 :reduced? true}]
+                                 ["amount_tax_8" {:rate 800}]]
+                          :let [v (num k)]
+                          :when (some? v)]
+                      (assoc m :tax v)))
+        withholding (num "amount_withholding_tax")]
+    (cond
+      (not (sequential? (get inv "lines"))) {:skip "明細の無い請求書（一覧の応答）"}
+      p {:problem (:problem p)}
+      (nil? date) {:problem (str where ": billing_date \"" (get inv "billing_date") "\" を読めません")}
+      :else
+      {:invoice (cond-> {:kind :sales
+                         :number (str (get inv "invoice_number" ""))
+                         :date date
+                         :status (cond
+                                   (= "canceled" (get inv "cancel_status")) :void
+                                   (= "settled" (get inv "payment_status")) :paid
+                                   :else :issued)
+                         :partner {:name (str (or (get inv "partner_display_name") (get inv "partner_name") ""))}
+                         :tax-mode (if (= "in" (get inv "tax_entry_method")) :inclusive :exclusive)
+                         :rounding (get fraction->rounding (get inv "tax_fraction") :floor)
+                         :lines (mapv :line parts)
+                         :origin (cond-> {:format :freee-invoice-json}
+                                   (get inv "id") (assoc :id (str (get inv "id"))))}
+                  (core/parse-date (get inv "payment_date")) (assoc :due-date (core/parse-date (get inv "payment_date")))
+                  (common/blank->nil (get inv "subject")) (assoc :subject (text/trim (get inv "subject")))
+                  (or (seq stated) (num "amount_tax"))
+                  (assoc :stated (cond-> {}
+                                   (seq stated) (assoc :tax-by-rate stated)
+                                   (num "amount_tax") (assoc :tax (num "amount_tax"))
+                                   (num "total_amount") (assoc :total (num "total_amount"))))
+                  (or (and withholding (pos? withholding)) (some :withholding? parts))
+                  (assoc :withholding (if (and withholding (pos? withholding)) withholding true)))
+       :registration (common/blank->nil (get-in inv ["template" "invoice_registration_number"]))
+       :rate-unknown? (some :rate-unknown? parts)})))
+
+(defn read-data
+  "構文解析済みの JSON → 請求書の取り込み結果（通貨は JPY）。"
+  [data]
+  (let [invs (if (map? (get data "invoice")) [(get data "invoice")] (filter map? (get data "invoices")))
+        candidates (map-indexed read-api-invoice invs)
+        registration (some :registration candidates)]
+    (cond-> (-> (merge {:format :freee-invoice-json :currency "JPY"} (common/finish-invoices candidates))
+                (update :warnings into (when (some :rate-unknown? candidates) ["税率の読めない明細があります"])))
+      registration (assoc :business {:registration registration}))))
+
+(defn data
+  "db → {\"invoices\": […]}（GET /invoices/{id} の invoice の形）。戻りは {:value :notes} か {:error}。"
+  [db]
+  (if (not= "JPY" (:currency db))
+    {:error (str "freee請求書 は円の金額です。帳簿の通貨が " (:currency db) " なので書き出しません")}
+    (let [money #(json/decimal (core/format-amount % 0))
+          all (filter #(and (= :sales (:kind %)) (not= :void (:status %))) (:invoices db))
+          invs (filter representable? all)
+          skipped (- (count all) (count invs))
+          purchases (count (filter #(= :purchase (:kind %)) (:invoices db)))
+          registration (some-> (get-in db [:business :registration]) invoice/normalize-registration)
+          per-rate (fn [t k pred]
+                     (let [gs (filter pred (:groups t))
+                           sum (fn [f] (when (seq gs) (money (reduce + 0 (map f gs)))))]
+                       [[(str "amount_including_tax_" k) (sum :gross)]
+                        [(str "amount_excluding_tax_" k) (sum :net)]
+                        [(str "amount_tax_" k) (sum :used-tax)]]))
+          taxable-key (fn [g] (let [[rate x] (:key g)] (when-not (keyword? x) [rate x])))]
+      {:value
+       (json/ordered
+        [["invoices"
+          (vec (for [inv invs
+                     :let [t (invoice/totals inv)]]
+                 (json/ordered
+                  (concat
+                   [["id" (when (= :freee-invoice-json (get-in inv [:origin :format])) (some-> (get-in inv [:origin :id]) parse-long))]
+                    ["invoice_number" (:number inv)]
+                    ["subject" (:subject inv)]
+                    ["billing_date" (:date inv)]
+                    ["payment_date" (:due-date inv)]
+                    ["partner_name" (get-in inv [:partner :name])]
+                    ["partner_display_name" (get-in inv [:partner :name])]
+                    ["partner_title" "御中"]
+                    ["tax_entry_method" (if (= :inclusive (:tax-mode inv)) "in" "out")]
+                    ["tax_fraction" (rounding->api (:rounding inv :floor))]
+                    ["line_amount_fraction" "omit"]
+                    ["withholding_tax_entry_method" "out"]
+                    ["payment_status" (when (= :paid (:status inv)) "settled")]
+                    ["cancel_status" "uncanceled"]
+                    ["total_amount" (money (:total t))]
+                    ["amount_including_tax" (money (:total t))]
+                    ["amount_excluding_tax" (money (:net t))]
+                    ["amount_tax" (money (:tax t))]]
+                   (per-rate t "10" #(= [1000 false] (taxable-key %)))
+                   (per-rate t "8" #(= [800 false] (taxable-key %)))
+                   (per-rate t "8_reduced" #(= [800 true] (taxable-key %)))
+                   (per-rate t "0" #(nil? (taxable-key %)))
+                   [["lines" (vec (for [[i l] (map-indexed vector (:lines inv))
+                                        :let [[qty unit] (simple-quantity l 0)
+                                              share (get (:line-tax t) i 0)]]
+                                    (json/ordered [["type" "item"]
+                                                   ["description" (:description l)]
+                                                   ["sales_date" (:date inv)]
+                                                   ["quantity" (json/decimal qty)]
+                                                   ["unit_price" unit]
+                                                   ["tax_rate" (:api (rate-token l))]
+                                                   ["reduced_tax_rate" (:reduced (rate-token l))]
+                                                   ["withholding" false]
+                                                   ["amount_excluding_tax" (money (if (= :inclusive (:tax-mode inv))
+                                                                                    (- (:amount l 0) share)
+                                                                                    (:amount l 0)))]])))]
+                    ["template" (when registration (json/ordered [["invoice_registration_number" registration]]))]]))))]])
+       :notes (cond-> ["POST /invoices には取引先の ID（partner_id か partner_code）と company_id が要ります（この形は応答の形です）"]
+                (some #(= :draft (:status %)) invs)
+                (conj (str "下書きの請求書 " (count (filter #(= :draft (:status %)) invs)) " 件は、freee請求書 の形に下書きの印が無いので、読み戻すと発行済みになります"))
+                (pos? purchases) (conj (str "受け取った請求書 " purchases " 件はこの形式に入りません"))
+                (pos? skipped) (conj (str "freee の税率（10%・8%・0%）で表せない請求書 " skipped " 件は書き出していません")))})))
+
+(defn write [db]
+  (let [{:keys [value notes error]} (data db)]
+    (if error {:error error} {:text (str (json/write value) "\n") :notes notes})))

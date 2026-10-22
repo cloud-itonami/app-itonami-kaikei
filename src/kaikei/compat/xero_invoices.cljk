@@ -33,6 +33,7 @@
   （Xero では作れない）。"
   (:require [kotoba.lang.text :as text]
             [kaikei.core :as core]
+            [kaikei.csv :as csv]
             [kaikei.invoice :as invoice]
             [kaikei.json :as json]
             [kaikei.compat.common :as common]))
@@ -265,3 +266,159 @@
 (defn write [db]
   (let [{:keys [value notes]} (data db)]
     {:text (str (json/write value) "\n") :notes notes}))
+
+;; ───────── 取り込み CSV（売上の請求書・受け取った請求書） ─────────
+;;
+;; Xero Central「Import customer invoices」（英・米・豪）と「Import bills and credit
+;; notes」（英・米）。1 行 = 1 明細で、同じ InvoiceNumber の行が 1 つの請求書
+;; （受け取った請求書は、取引先が違っても同じ番号ならまとめられる）。必須は
+;; ContactName と InvoiceNumber（受け取った請求書は Contact Name だけ）。日付は
+;; 英・豪 dd/mm/yyyy、米 mm/dd/yyyy（受け取った請求書は両方の文書で dd/mm/yyyy）。
+;; 税込・税抜はファイルに書かず、取り込みのときに選ぶ。TaxType は Xero の税率の
+;; 表示名（「20% (VAT on Income)」など）。TaxAmount を書くと税の調整になり、単価は
+;; 税抜でなければならない。Xero は取り込んだ請求書を下書きにする。
+;;
+;; 見出しの正確な文字列（* が付くか、空白の有無、列の順）は Xero のログインが要る
+;; ので未確認。kaikei は第 2 スライスの manual journal と同じく必須らしい欄に * を
+;; 付けて書き、読むときは * と空白を無視して照合する。
+
+(def csv-columns
+  ["*ContactName" "EmailAddress" "POAddressLine1" "POAddressLine2" "POAddressLine3" "POAddressLine4"
+   "POCity" "PORegion" "POPostalCode" "POCountry" "*InvoiceNumber" "Reference" "*InvoiceDate" "*DueDate"
+   "InventoryItemCode" "*Description" "*Quantity" "*UnitAmount" "Discount" "*AccountCode" "*TaxType"
+   "TaxAmount" "TrackingName1" "TrackingOption1" "TrackingName2" "TrackingOption2" "Currency"])
+
+(defn- csv-norm [h] (text/lower (text/replace (str h) #"[\s*]" "")))
+
+(defn csv-detect? [rows]
+  (let [h (set (map csv-norm (first rows)))]
+    (every? h ["contactname" "invoicenumber" "unitamount"])))
+
+(defn- pick [rec k] (common/blank->nil (get rec k)))
+
+(defn read-csv
+  "parse 済みの CSV 行 → 請求書の取り込み結果。kind は :sales（customer invoices）か
+  :purchase（bills）。opts: :currency（既定 JPY）、:date-order（無ければ日付から
+  推し、推せなければ dmy）。税込・税抜はファイルに無いので税抜として読み、状態は
+  下書き（Xero も下書きで取り込む）。"
+  [rows kind {:keys [currency date-order] :or {currency "JPY"}}]
+  (let [recs (csv/records (cons (mapv csv-norm (first rows)) (rest rows)))
+        currency (common/currency-of (map #(pick % "currency") recs) currency)
+        exp (core/exponent currency)
+        guessed (common/detect-date-order (concat (keep #(pick % "invoicedate") recs) (keep #(pick % "duedate") recs)))
+        order (or date-order guessed "dmy")
+        groups (vals (reduce (fn [acc rec]
+                               (let [k (or (pick rec "invoicenumber") (str "#" (::csv/row rec)))]
+                                 (update acc k (fnil conj []) rec)))
+                             (array-map) recs))
+        read-group
+        (fn [recs]
+          (let [first-of (fn [k] (some #(pick % k) recs))
+                where (str "行 " (::csv/row (first recs)))
+                code (first-of "currency")
+                date (some-> (first-of "invoicedate") (common/parse-ordered-date order))
+                parts (vec (for [rec recs
+                                 :let [w (str "行 " (::csv/row rec))
+                                       qty (pick rec "quantity")
+                                       unit (pick rec "unitamount")
+                                       factor (invoice/discount-factor (pick rec "discount"))
+                                       amt (cond
+                                             (= factor :error) {:error :format}
+                                             (nil? unit) {:amount 0}
+                                             :else (invoice/line-amount-of (cond-> [(or qty "1") unit] factor (conj factor))
+                                                                           exp :half-up))
+                                       tax (when (pick rec "taxamount") (common/read-amount (pick rec "taxamount") exp (str w " TaxAmount")))
+                                       label (pick rec "taxtype")
+                                       rate (common/rate-from-label label)
+                                       acc (pick rec "accountcode")]]
+                             (cond
+                               (:error amt) {:problem (str w ": Quantity × UnitAmount を読めません")}
+                               (:problem tax) {:problem (:problem tax)}
+                               :else {:line (cond-> (merge {:description (or (pick rec "description") "")
+                                                            :amount (:amount amt)
+                                                            :category :taxable}
+                                                           rate)
+                                              qty (assoc :quantity qty)
+                                              unit (assoc :unit-price unit)
+                                              acc (assoc :account acc :account-code acc)
+                                              label (assoc :tax {:scheme :xero-rate :code label}))
+                                      :tax (:amount tax)
+                                      :rate-unknown? (nil? rate)})))
+                p (common/first-problem parts)
+                lines (mapv :line parts)
+                taxes (mapv :tax parts)]
+            (cond
+              (and code (not= code currency)) {:skip (str "帳簿と違う通貨（" code "）の請求書")}
+              p {:problem (:problem p)}
+              (nil? date) {:problem (str where ": InvoiceDate \"" (first-of "invoicedate") "\" を読めません（日付の並び " order "）")}
+              :else
+              {:invoice (invoice/infer-rounding
+                         (cond-> {:kind kind
+                                  :number (or (first-of "invoicenumber") "")
+                                  :date date
+                                  :status :draft
+                                  :partner {:name (or (first-of "contactname") "")}
+                                  :tax-mode :exclusive
+                                  :lines lines
+                                  :origin {:format (if (= kind :sales) :xero-invoice-csv :xero-bill-csv)}}
+                           (some-> (first-of "duedate") (common/parse-ordered-date order))
+                           (assoc :due-date (common/parse-ordered-date (first-of "duedate") order))
+                           (and (= kind :sales) (first-of "reference")) (assoc :subject (first-of "reference"))
+                           (some some? taxes) (assoc :stated {:tax-by-rate (common/stated-tax-by-rate lines taxes)}))
+                         :half-up)
+               :rate-unknown? (some :rate-unknown? parts)})))
+        candidates (map read-group groups)
+        fmt (if (= kind :sales) :xero-invoice-csv :xero-bill-csv)]
+    (if-not exp
+      {:format fmt :invoices [] :rejected 0 :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      (-> (merge {:format fmt :currency currency} (common/finish-invoices candidates))
+          (update :warnings into
+                  (remove nil?
+                          ["Xero の CSV は税込・税抜を書かないので、単価を税抜として読みました。状態は下書きです"
+                           (when (some :rate-unknown? candidates)
+                             "TaxType（税率の表示名）から税率を読めない明細があります（% の数か 非課税・不課税・免税 の名前が要ります）")
+                           (when (and (nil? date-order) (nil? guessed))
+                             "日付の並びを判定できないので、日/月/年 と読みました（違うときは日付の並びを指定してください）")]))))))
+
+(defn- simple-quantity?
+  "数量 × 単価 が金額と同じなら [数量 単価]、違えば nil。"
+  [l exp]
+  (when (and (:quantity l) (:unit-price l)
+             (= (:amount l) (:amount (invoice/line-amount (:quantity l) (:unit-price l) exp :half-up))))
+    [(:quantity l) (:unit-price l)]))
+
+(defn write-csv
+  "db → 取り込み CSV。kind は :sales・:purchase。単価は税抜で書き、TaxAmount に
+  kaikei の税率ごとに 1 回の税額を行に割り当てた額を書く。opts の :date-order は
+  \"dmy\"（既定）・\"mdy\"・\"ymd\"。"
+  ([db kind] (write-csv db kind {}))
+  ([db kind {:keys [date-order] :or {date-order "dmy"}}]
+   (let [exp (core/exponent (:currency db))
+         money #(core/format-amount % exp)
+         date #(some-> % (common/format-ordered-date date-order))
+         invs (filter #(and (= kind (:kind %)) (not= :void (:status %))) (:invoices db))
+         others (count (remove #(= kind (:kind %)) (:invoices db)))
+         voids (count (filter #(and (= kind (:kind %)) (= :void (:status %))) (:invoices db)))
+         rows (for [inv invs
+                    :let [t (invoice/totals inv)]
+                    [i l] (map-indexed vector (:lines inv))
+                    :let [share (get (:line-tax t) i 0)
+                          net (if (= :inclusive (:tax-mode inv)) (- (:amount l 0) share) (:amount l 0))
+                          [qty unit] (or (when (= :exclusive (:tax-mode inv)) (simple-quantity? l exp))
+                                         ["1" (money net)])
+                          code (or (:account-code l)
+                                   (get-in db [:accounts (:account l) :xero :code])
+                                   (get-in db [:accounts (:account l) :code])
+                                   (:account l))]]
+                (vec (concat [(get-in inv [:partner :name]) nil nil nil nil nil nil nil nil nil
+                              (:number inv) (when (= kind :sales) (:subject inv)) (date (:date inv)) (date (:due-date inv))
+                              nil (:description l) qty unit nil code
+                              (or (common/tax-code l :xero-rate) (invoice/group-label (invoice/group-key l)))
+                              (when-not (= :none (:tax-mode inv)) (money share))
+                              nil nil nil nil (:currency db)])))]
+     {:text (csv/write (cons csv-columns rows))
+      :notes (cond-> ["単価（UnitAmount）は税抜で書きました。Xero に取り込むときは「tax exclusive」を選んでください"
+                      "TaxType は Xero の税率の表示名にしてください（Xero から来ていない明細は「10%」「8%（軽減）」などを書きました）"
+                      "Xero の CSV には登録番号の受け皿がありません"]
+               (pos? others) (conj (str (if (= kind :sales) "受け取った請求書 " "売上の請求書 ") others " 件はこの形式に入りません"))
+               (pos? voids) (conj (str "取消の請求書 " voids " 件は書き出していません")))})))

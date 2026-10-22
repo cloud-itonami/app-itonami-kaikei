@@ -1,0 +1,3 @@
+Contact Name,Invoice Number,Invoice Date,Due Date,Description,Quantity,Unit Amount,Account Code,Tax Type,Currency
+やまだ文具,A-201,20/11/2026,30/11/2026,コピー用紙,3,1100,461,消費税 10%（仕入）,JPY
+やまだ文具,A-201,,,トナー,1,8800,461,消費税 10%（仕入）,JPY

@@ -341,6 +341,15 @@ db に `:invoices`・`:business`（自社の名称・登録番号）・`:invoice
 | `kaikei-json` | kaikei.ledger.v1（invoices・business・invoice_settings を含む） | ○ | ○ | kaikei |
 | `xero-invoices-json` | Xero の Invoices（ACCREC・ACCPAY）。TaxRates・Accounts が同じ JSON にあれば引く | ○ | ○ | XeroAPI/Xero-OpenAPI `5a115f3`（Invoice L22386、LineItem L20731、TaxRate L25200）、Xero developer docs（invoices、Rounding in Xero） |
 | `qbo-invoices-json` | QuickBooks Online の Invoice・Bill（query の応答） | ○ | ○ | intuit/QuickBooks-V3-Java-SDK `c4d5dfa`（Finance.xsd の Invoice L5803、Bill L9498、TxnTaxDetail L5094）、Intuit developer docs（invoice、bill、sales tax） |
+| `xero-invoice-csv` | Xero の customer invoices 取り込み CSV | ○ | ○ | Xero Central「Import customer invoices」（英・米・豪） |
+| `xero-bill-csv` | Xero の bills 取り込み CSV | ○ | ○ | Xero Central「Import bills and credit notes」（英・米） |
+| `qbo-invoice-csv` | QuickBooks Online の invoices 取り込み CSV（売上の請求書） | ○ | ○ | QuickBooks Help「Import multiple invoices at once」（米・英）、Intuit の PDF（2018） |
+| `freee-invoice-csv` | freee請求書 の帳票 CSV インポート（請求書。本文と明細の行、47 列） | ○ | ○ | freee ヘルプ 18895523266841 の添付フォーマット |
+| `freee-invoice-json` | freee請求書 API の invoice | ○ | ○ | freee/freee-api-schema `ac1acd4` の `iv/open-api-3/api-schema.yml`（L5887） |
+| `mf-invoice-csv` | MF クラウド請求書 の CSV 一括追加（縦並び） | ○ | ○ | MF ガイド「帳票をCSVアップロードする方法」（do019） |
+| `mf-invoice-json` | MF クラウド請求書 API v3 の Billing | ○ | ○ | `iv_web_api.yaml` 3.6.0（sha256 `74a681dd…`、Billing L1773） |
+| `zoho-invoice-json` | Zoho Invoice API v3 の invoice | ○ | — | Zoho の OpenAPI の zip（`invoices.yml` sha256 `53e03d28…`） |
+| `freshbooks-invoice-json` | FreshBooks の invoices・bills | ○ | — | FreshBooks の API の文書（invoices・bills）、freshbooks-nodejs-sdk `f1e2d61b` |
 
 - **Xero**: 行ごとに 2 桁で丸めて足す（「Rounding in Xero」）ので、取り込んだ売上の請求書は
   日本の規則と差が出ることがある。`TaxType` は組織ごとのコードで、税率は `TaxRates` の
@@ -356,7 +365,23 @@ db に `:invoices`・`:business`（自社の名称・登録番号）・`:invoice
   `TaxInclusive` でも `Line.Amount` は税抜で、すべての課税の行に `TaxInclusiveAmt` があれば
   税込で読む。取消は金額 0 で `PrivateNote` が Voided で始まるもの。書き出しの
   `TaxCodeRef` は QBO から来た行だけ value を持ち、どの行にも name（「10%」「8%（軽減）」）を書く。
-- **登録番号**の受け皿は QBO・Xero の形に無い（kaikei-json だけが持つ）。
+- **CSV**（Xero・QBO・freee請求書・MF クラウド請求書）は状態の欄が無ければ下書きで読む（計上の前に
+  確かめる。Xero も取り込んだ請求書を下書きにする）。税込・税抜の欄が無い形（Xero・QBO・MF の CSV）は
+  税抜として読み、書き出しでは税抜にする（税込の請求書は行の税込から `tax-share` を引く）。税率は
+  税率の表示名の %（「20% (VAT on Income)」）か区分の名前（非課税・不課税・免税）から読み、読めなければ
+  税率不明にする（推測しない）。
+- **freee請求書・MF クラウド請求書**は明細の金額の欄を持たないので、単価 × 数量 を取り込み元の明細行の
+  端数処理で丸める（筆算で正確に）。どちらも売上の請求書だけで円だけ。自社の登録番号は先方の設定
+  （freee の template、MF の registration_code）から来るので、取り込みでは帳簿に自社の設定が無ければ
+  使う。どちらの API の形にも下書きの印は無い。
+- **Xero の bills の CSV** は customer invoices と見出しが同じなので、自動の判定では売上の請求書として
+  読む（受け取った請求書は形式を選ぶ）。
+- **Zoho Invoice**: 税額は請求書の `taxes[]` だけにあり、行は税率だけ。請求書全体の値引き・送料のある
+  請求書は飛ばし、`adjustment` は不課税の行にする。**FreshBooks**: `taxAmount1` は税の率で、税額の欄は
+  無い。1 行に 2 つの税・請求書全体の値引き・削除（vis_state 1）は飛ばす。
+- 取り込み元が税額を書いていて丸めの向きを書かない形（Xero・Zoho・MF の CSV など）は、書かれた額を
+  再現する向きを選ぶ。どの向きでも再現できなければ、検査で差を出す。
+- **登録番号**の受け皿は QBO・Xero・Zoho・FreshBooks の形に無い（kaikei-json だけが持つ）。
 
 ### 未確認のまま実装したもの
 
@@ -364,6 +389,17 @@ db に `:invoices`・`:business`（自社の名称・登録番号）・`:invoice
   文字列で来る文書の例。
 - QBO の売上の税が入る勘定と、取消の Bill の形（取消の操作が文書に無い）。
 - QBO の `TxnStatus` の Draft が請求書の応答に現れるか（書き出しの下書きはこれで表す）。
+- Xero の取り込み CSV の見出しの正確な文字列（`*` の有無、空白の有無、列の順。テンプレートはログインが要る）。
+- QBO の invoices の取り込み CSV の今の見本の見出し（2018 年の PDF を使った）と、英国版の税の列の名前
+  （kaikei は `ItemTaxCode` と書く）。
+- freee請求書 の CSV の文字コード（ヘルプの本文は BOM 付きの UTF-8、添付のファイルは BOM なし）と、
+  7 列目の名前（フォーマットは「支払予定日」、見本は「予定日」）。CSV の書き出しは文書に無い。
+- MF クラウド請求書 の CSV の見出し（2023 年の画面写しから読んだ）、日付の形、ダウンロードの CSV の列。
+  MF が消費税を税率ごとに 1 回丸めると明言した文書は無い。
+- MF の API の応答の日付（例は `/` 区切り、仕様は date）。
+- freee請求書 の API が税率ごとに 1 回丸めるか（ヘルプの帳票の説明はそう言う）。
+- FreshBooks の行の amount が税込か、税の丸め、bill の取引先の名前の欄（`vendor.vendor_name` を読む）。
+- Zoho の見本は数が合わないものがある（total・balance の型も宣言と見本で違う）。
 
 ### 実測（2026-10-22）
 
@@ -377,7 +413,9 @@ db に `:invoices`・`:business`（自社の名称・登録番号）・`:invoice
   - 例の出所: 国税庁 Q&A 問 57（税込 60,000・40,000 → 5,454 + 2,962）、freee ヘルプの配分
     （426・2,100・1,885・220 → 463、2,100 の行が 211）、Xero の「Rounding in Xero」（行ごと 11.44、
     税率ごと 11.45）。
-- **adapter・形式・画面・MCP**: `npm test`（kbb）→ **76 tests, 759 assertions, 0 failures**。
+- **adapter・形式・画面・MCP**: `npm test`（kbb）→ **86 tests, 816 assertions, 0 failures**（2 つ目の PR の後）。
+  形式ごとの取り込み・往復と、kaikei → Xero JSON → QBO JSON → freee JSON → MF JSON → MF の CSV → kaikei の
+  連鎖で、番号・日付・取引先・税率ごとの対価と税額・合計が保たれること。
 - **MCP**: `bin/kaikei-mcp` を `/` から起こし、`kaikei_invoice_totals` が Q&A 問 57 の 8,416 を返す。
 - **ブラウザ**（built-in browser、ローカルの静的サーバ、`scripts/build-site.cljk` の公開物）:
   - サンプル → 検査の欄に「未計上 2 件」「記載事項の欠け 1 件」→ 請求書の詳細（6 項目）→ 計上 →
@@ -388,6 +426,10 @@ db に `:invoices`・`:business`（自社の名称・登録番号）・`:invoice
   - Xero・QBO の請求書 JSON・kaikei-json・MF の書き出しを Blob で受け、Xero の JSON を取り込み直すと
     4 件とも同じ請求書として飛ばされる。
   - 375px 幅で 10 の画面（帳票 5・請求書の一覧・詳細・編集・設定・取り込み）とも横スクロールなし。
+  - 2 つ目の PR の後: Shift_JIS の MF クラウド請求書の CSV・freee請求書 の JSON・Xero の請求書の CSV を
+    取り込み（形式は自動の判定、USD の 1 件は飛ばす）、未計上をすべて計上（下書きと取消を除く 3 件）、
+    freee・MF の CSV・Xero の bills の CSV・MF の JSON を Blob で書き出す。読むだけの Zoho・FreshBooks は
+    書き出しの選択肢に出ない。375px で一覧・詳細・取り込み・試算表とも横スクロールなし。
   - network は 127.0.0.1 だけ（https の要求は 0）。console のエラーは調べるために打った式のものだけ。
   - built-in browser の pane が隠れていると `requestAnimationFrame` が止まり、再読み込みの後の描画が
     進まない（第 2 スライスの「測れなかったもの」と同じ原因）。描画の確認は、`requestAnimationFrame` を

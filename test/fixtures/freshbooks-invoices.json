@@ -1,0 +1,96 @@
+{
+  "response": {
+    "result": {
+      "invoices": [
+        {
+          "invoiceid": 77,
+          "id": 77,
+          "invoice_number": "0000077",
+          "customerid": 12,
+          "create_date": "2026-11-10",
+          "due_date": "2026-12-10",
+          "due_offset_days": 30,
+          "currency_code": "JPY",
+          "organization": "Test Client",
+          "fname": "Test",
+          "lname": "Client",
+          "status": 2,
+          "v3_status": "sent",
+          "vis_state": 0,
+          "discount_value": "0",
+          "amount": {
+            "amount": "26400",
+            "code": "JPY"
+          },
+          "outstanding": {
+            "amount": "26400",
+            "code": "JPY"
+          },
+          "paid": {
+            "amount": "0",
+            "code": "JPY"
+          },
+          "lines": [
+            {
+              "lineid": 1,
+              "type": 0,
+              "name": "Consulting",
+              "description": "",
+              "qty": "1",
+              "unit_cost": {
+                "amount": "24000",
+                "code": "JPY"
+              },
+              "amount": {
+                "amount": "24000",
+                "code": "JPY"
+              },
+              "taxName1": "GST",
+              "taxAmount1": "10",
+              "taxName2": null,
+              "taxAmount2": "0"
+            }
+          ]
+        },
+        {
+          "invoiceid": 78,
+          "id": 78,
+          "invoice_number": "0000078",
+          "create_date": "2026-11-11",
+          "due_date": "2026-12-11",
+          "currency_code": "JPY",
+          "organization": "Test Client",
+          "v3_status": "sent",
+          "vis_state": 0,
+          "amount": {
+            "amount": "11500",
+            "code": "JPY"
+          },
+          "lines": [
+            {
+              "lineid": 1,
+              "name": "Two taxes",
+              "qty": "1",
+              "unit_cost": {
+                "amount": "10000",
+                "code": "JPY"
+              },
+              "amount": {
+                "amount": "10000",
+                "code": "JPY"
+              },
+              "taxName1": "GST",
+              "taxAmount1": "10",
+              "taxName2": "PST",
+              "taxAmount2": "5"
+            }
+          ]
+        }
+      ],
+      "page": 1,
+      "pages": 1,
+      "per_page": 15,
+      "total": 2
+    }
+  }
+}

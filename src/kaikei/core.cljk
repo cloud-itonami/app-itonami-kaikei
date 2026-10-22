@@ -678,12 +678,22 @@
                     (assoc :business (:business parsed))
                     (and (:invoice-settings parsed) (or replace? (nil? (:invoice-settings base))))
                     (assoc :invoice-settings (:invoice-settings parsed)))
-             [base invoice-ids inv-added inv-dup] (merge-invoices base (:invoices parsed) (:invoices db))
              with-accounts (reduce (fn [d a] (ensure-account d (:name a) (dissoc a :name)))
                                    base (:accounts parsed))
              by-code (into {} (for [[n a] (:accounts with-accounts)
                                     c (distinct (remove nil? [(:code a) (get-in a [:xero :code])]))]
                                 [c n]))
+             ;; 請求書の行のコード（Xero の CSV の AccountCode）も、帳簿の勘定科目の名前に引き直す
+             ;; （:account-code は書き出しで同じコードに戻すために残す）
+             resolve-invoice (fn [inv]
+                               (update inv :lines
+                                       (fn [ls] (mapv (fn [l]
+                                                        (if-let [n (some-> (:account-code l) by-code)]
+                                                          (assoc l :account n)
+                                                          l))
+                                                      ls))))
+             [with-accounts invoice-ids inv-added inv-dup]
+             (merge-invoices with-accounts (map resolve-invoice (:invoices parsed)) (:invoices db))
              resolve-codes (fn [e]
                              (update e :lines
                                      (fn [ls] (mapv (fn [l]

@@ -28,6 +28,10 @@
            {:from "src/kaikei/compat/qbo.cljk" :to "kaikei/compat/qbo.cljs"}
            {:from "src/kaikei/compat/xero_invoices.cljk" :to "kaikei/compat/xero_invoices.cljs"}
            {:from "src/kaikei/compat/qbo_invoices.cljk" :to "kaikei/compat/qbo_invoices.cljs"}
+           {:from "src/kaikei/compat/freee_invoices.cljk" :to "kaikei/compat/freee_invoices.cljs"}
+           {:from "src/kaikei/compat/mf_invoices.cljk" :to "kaikei/compat/mf_invoices.cljs"}
+           {:from "src/kaikei/compat/zoho_invoices.cljk" :to "kaikei/compat/zoho_invoices.cljs"}
+           {:from "src/kaikei/compat/freshbooks_invoices.cljk" :to "kaikei/compat/freshbooks_invoices.cljs"}
            {:from "src/kaikei/compat/yayoi.cljk" :to "kaikei/compat/yayoi.cljs"}
            {:from "src/kaikei/compat/mf.cljk" :to "kaikei/compat/mf.cljs"}
            {:from "src/kaikei/compat/freee.cljk" :to "kaikei/compat/freee.cljs"}

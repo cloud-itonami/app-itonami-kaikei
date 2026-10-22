@@ -1,0 +1,121 @@
+(ns kaikei.compat.freshbooks-invoices
+  "FreshBooks の invoices（売上の請求書）と bills（受け取った請求書）の JSON（読むだけ。
+  オーナーの判断 2026-10-22）。形の正本は FreshBooks の API の文書（/api/invoices
+  2026-02-16、/api/bills 2026-03-04）と freshbooks/freshbooks-nodejs-sdk f1e2d61b。
+
+  - 応答は {\"response\": {\"result\": {\"invoices\": […]}}}・{… {\"invoice\": {…}}}・
+    {… {\"bills\": […]}}・{… {\"bill\": {…}}}。result の中身だけでも読む。
+  - 金額は {\"amount\": \"104.50\", \"code\": \"CAD\"}（文字列の 10 進）。
+  - invoice の lines は include[]=lines のときだけ返る。明細の無い請求書は飛ばす。
+    行の amount は qty × unit_cost（文書の見本では税抜）、taxAmount1・taxAmount2 は
+    税の**率**（%）で、税額の欄は請求書にも行にも無い。税は 1 行に 2 つまで。
+  - bill の lines は quantity・unit_cost・amount（税抜）・tax_percent1・tax_percent2・
+    tax_amount1・tax_amount2（計算された税額）。bill の amount は税抜の小計。
+  - 1 行に 2 つの税・請求書全体の値引き（discount_value）のある請求書は、kaikei の
+    1 行 1 税率に入らないので飛ばす。vis_state が 1（削除）のものも飛ばす。
+  - 状態: invoice は v3_status（draft・sent・viewed・paid・partial・…）、bill は
+    status（unpaid・overdue・partial・paid）。
+  - bill の取引先の名前は文書の bill の欄に無い（vendorid だけ）。include の vendor の
+    vendor_name を読み、無ければ vendorid を書く（未確認）。
+  - 行の amount が税込か、税の丸めは文書に無い（未確認）。税抜として読み、端数処理は
+    bill の tax_amount を再現する向きを選ぶ（invoice は四捨五入）。"
+  (:require [kaikei.core :as core]
+            [kaikei.invoice :as invoice]
+            [kaikei.compat.common :as common]))
+
+(defn- result [data]
+  (or (get-in data ["response" "result"]) data))
+
+(defn detect? [data]
+  (and (map? data)
+       (let [r (result data)]
+         (and (map? r) (some #(contains? r %) ["invoices" "invoice" "bills" "bill"])
+              (or (contains? data "response")
+                  (some (fn [x] (and (map? x) (map? (get x "amount")) (contains? (get x "amount") "code")))
+                        (concat (get r "invoices") (get r "bills") [(get r "invoice") (get r "bill")])))))))
+
+(defn- money [m exp] (when (map? m) (:amount (core/parse-amount (get m "amount" "") exp))))
+
+(defn- second-tax? [l k1 k2]
+  (let [v (get l k1)]
+    (or (and (some? v) (not (zero? (or (common/percent->rate v) 0))))
+        (some? (common/blank->nil (get l k2))))))
+
+(defn- read-doc [{:keys [currency exp]} kind i doc]
+  (let [where (str (if (= kind :sales) "invoice " "bill ")
+                   (or (get doc "invoice_number") (get doc "bill_number") (inc i)))
+        lines (get doc "lines")
+        code (get doc "currency_code")
+        rate-key (if (= kind :sales) "taxAmount1" "tax_percent1")]
+    (cond
+      (= 1 (get doc "vis_state")) {:skip "削除された請求書（vis_state 1）"}
+      (not (sequential? lines)) {:skip "明細の無い請求書（include[]=lines の無い応答）"}
+      (and code (not= code currency)) {:skip (str "帳簿と違う通貨（" code "）の請求書")}
+      (some #(if (= kind :sales) (second-tax? % "taxAmount2" "taxName2") (second-tax? % "tax_percent2" "tax_name2"))
+            (filter map? lines))
+      {:skip "1 行に税が 2 つある請求書"}
+      (and (= kind :sales) (some? (common/percent->rate (get doc "discount_value")))
+           (pos? (common/percent->rate (get doc "discount_value"))))
+      {:skip "請求書全体の値引きのある請求書"}
+      :else
+      (let [parts (vec (for [l (filter map? lines)
+                             :let [a (money (get l "amount") exp)
+                                   rate (common/percent->rate (get l rate-key))]]
+                         (if (nil? a)
+                           {:problem (str where ": 明細の amount を読めません")}
+                           {:line (cond-> {:description (str (or (common/blank->nil (get l "description")) (get l "name") ""))
+                                           :amount a
+                                           :category (if rate :taxable :out-of-scope)
+                                           :rate (or rate 0)}
+                                    (some? (or (get l "qty") (get l "quantity"))) (assoc :quantity (str (or (get l "qty") (get l "quantity"))))
+                                    (money (get l "unit_cost") exp) (assoc :unit-price (get-in l ["unit_cost" "amount"]))
+                                    (and (= kind :purchase) (get-in l ["category" "category"]))
+                                    (assoc :account (get-in l ["category" "category"])))
+                            :tax (when (= kind :purchase) (money (get l "tax_amount1") exp))})))
+            p (common/first-problem parts)
+            date (core/parse-date (if (= kind :sales) (get doc "create_date") (get doc "issue_date")))
+            line-vals (mapv :line parts)
+            taxes (mapv :tax parts)
+            v3 (or (get doc "v3_status") (get doc "status"))
+            partner (if (= kind :sales)
+                      (or (common/blank->nil (get doc "organization"))
+                          (common/blank->nil (str (get doc "fname" "") " " (get doc "lname" "")))
+                          "")
+                      (or (get-in doc ["vendor" "vendor_name"]) (some->> (get doc "vendorid") (str "vendor "))  ""))]
+        (cond
+          p {:problem (:problem p)}
+          (nil? date) {:problem (str where ": 日付を読めません")}
+          :else
+          {:invoice (invoice/infer-rounding
+                     (cond-> {:kind kind
+                              :number (str (or (get doc "invoice_number") (get doc "bill_number") ""))
+                              :date date
+                              :status (cond
+                                        (#{"draft" "created"} v3) :draft
+                                        (#{"paid" "autopaid"} v3) :paid
+                                        :else :issued)
+                              :partner {:name (str partner)}
+                              :tax-mode :exclusive
+                              :lines line-vals
+                              :origin (cond-> {:format :freshbooks-invoice-json}
+                                        (or (get doc "invoiceid") (get doc "id"))
+                                        (assoc :id (str (or (get doc "invoiceid") (get doc "id")))))}
+                       (core/parse-date (get doc "due_date")) (assoc :due-date (core/parse-date (get doc "due_date")))
+                       (some some? taxes) (assoc :stated {:tax-by-rate (common/stated-tax-by-rate line-vals taxes)})
+                       (money (get doc "outstanding") exp) (assoc :amount-due (money (get doc "outstanding") exp))
+                       (money (get doc "paid") exp) (assoc :amount-paid (money (get doc "paid") exp)))
+                     :half-up)})))))
+
+(defn read-data
+  "構文解析済みの JSON → 請求書の取り込み結果。通貨は currency_code（いちばん多い
+  もの）、無ければ opts の :currency（既定 JPY）。"
+  [data {:keys [currency] :or {currency "JPY"}}]
+  (let [r (result data)
+        docs (concat (for [x (cond (map? (get r "invoice")) [(get r "invoice")] :else (get r "invoices")) :when (map? x)] [:sales x])
+                     (for [x (cond (map? (get r "bill")) [(get r "bill")] :else (get r "bills")) :when (map? x)] [:purchase x]))
+        currency (common/currency-of (map #(get (second %) "currency_code") docs) currency)
+        exp (core/exponent currency)]
+    (if-not exp
+      {:format :freshbooks-invoice-json :invoices [] :rejected 0 :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      (merge {:format :freshbooks-invoice-json :currency currency}
+             (common/finish-invoices (map-indexed (fn [i [kind doc]] (read-doc {:currency currency :exp exp} kind i doc)) docs))))))
