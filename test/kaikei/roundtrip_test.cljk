@@ -1,0 +1,108 @@
+(ns kaikei.roundtrip-test
+  "書き出し → 取り込み で値が変わらないこと。形式ごとに、その形式が持てる
+  項目だけを比べる（持てない項目は書き出しの注記に出る）。形式をまたぐ変換は
+  日付・勘定科目・金額が保たれること。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [kaikei.core :as core]
+            [kaikei.export :as export]
+            [kaikei.ingest :as ingest]))
+
+(defn- bytes-of [f] (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" f))))
+
+(defn- db-of [& results]
+  (reduce (fn [db r] (:db (core/merge-import db r))) core/empty-db results))
+
+(defn- load-db [f & [opts]] (db-of (ingest/ingest-bytes (bytes-of f) (or opts {}))))
+
+(defn- again
+  "db を format で書き出し、同じ形式として取り込み直した db。"
+  [db fmt & [opts]]
+  (let [{:keys [bytes error]} (export/export db fmt (or opts {}))]
+    (is (nil? error) (str fmt " " error))
+    (db-of (ingest/ingest-bytes bytes (merge {:format fmt :currency (:currency db)} opts)))))
+
+(defn- shape
+  "比べる形: 仕訳ごとに、指定した仕訳の項目と、行（順序を無視）の指定した項目。"
+  [db entry-keys line-keys]
+  (mapv (fn [e] (assoc (select-keys e entry-keys)
+                       :lines (sort-by pr-str (map #(select-keys % line-keys) (:lines e)))))
+        (:entries db)))
+
+(def money-keys [:account :debit :credit])
+
+(deftest each-format-round-trips
+  (doseq [[fixture fmt opts entry-keys line-keys]
+          [["mf.csv" "mf" {} [:date :number :memo :note :adjustment?]
+            (into money-keys [:sub-account :department :partner :tax :invoice :tax-amount])]
+           ["yayoi.csv" "yayoi" {} [:date :memo :adjustment?]
+            (into money-keys [:sub-account :department :tax :tax-amount])]
+           ["freee.csv" "freee" {} [:date :adjustment?]
+            (into money-keys [:sub-account :department :partner :tax :tax-amount])]
+           ["qbo-journal-entries.json" "qbo-json" {} [:date :number :memo :adjustment?]
+            (into money-keys [:sub-account :department :partner :partner-type :description])]
+           ["xero-journals.json" "xero-json" {} [:date :memo] (into money-keys [:description :tax :tracking])]
+           ["qbo-journal.csv" "qbo-csv" {:currency "USD"} [:date :number]
+            (into money-keys [:sub-account :partner :department :description])]
+           ["xero-manual-journal.csv" "xero-csv" {:currency "GBP"} [:date :memo]
+            (into money-keys [:description :tax :tracking])]]]
+    (testing (str fmt " ← " fixture)
+      (let [db (load-db fixture opts)
+            db2 (again db fmt)]
+        (is (seq (:entries db)))
+        (is (= (shape db entry-keys line-keys) (shape db2 entry-keys line-keys)))))))
+
+(deftest native-is-lossless
+  (doseq [f ["mf.csv" "qbo-journal-entries.json" "xero-journals.json" "freee.csv"]]
+    (let [db (load-db f)
+          db2 (again db "kaikei-json")]
+      (is (= (:entries db) (:entries db2)) f)
+      (is (= (:accounts db) (:accounts db2)) f))))
+
+(deftest csv-date-orders-round-trip
+  (doseq [fmt ["qbo-csv" "xero-csv"]
+          order ["mdy" "dmy" "ymd"]]
+    (let [db (load-db "qbo-journal.csv" {:currency "USD"})
+          db2 (again db fmt {:date-order order})]
+      (is (= (map :date (:entries db)) (map :date (:entries db2))) (str fmt " " order)))))
+
+(deftest across-formats
+  (testing "MF → Xero JSON → QBO JSON → 弥生 → MF で、日付・勘定科目・金額が保たれる"
+    (let [db (load-db "mf.csv")
+          end (-> db (again "xero-json") (again "qbo-json") (again "yayoi") (again "mf"))]
+      (is (= (shape db [:date] money-keys) (shape end [:date] money-keys)))))
+  (testing "区分も保たれる（Xero・QBO の型が粗いところは名前の既定の表で戻す）"
+    (let [db (load-db "mf.csv")
+          end (-> db (again "xero-json") (again "qbo-json"))]
+      (is (= (into {} (map (juxt identity #(core/account-class db %)) (core/used-accounts db)))
+             (into {} (map (juxt identity #(core/account-class end %)) (core/used-accounts end)))))))
+  (testing "QBO（ドル）→ Xero JSON → QBO：セントが保たれる"
+    (let [db (load-db "qbo-journal-entries.json")
+          end (-> db (again "xero-json") (again "qbo-json"))]
+      (is (= "USD" (:currency end)))
+      (is (= (shape db [:date] money-keys) (shape end [:date] money-keys)))))
+  (testing "帳票は形式をまたいでも同じ"
+    (let [db (load-db "mf.csv")
+          end (-> db (again "xero-json") (again "qbo-json") (again "freee"))]
+      (is (= (core/profit-and-loss db 20260401 20270331) (core/profit-and-loss end 20260401 20270331)))
+      (is (= (:totals (core/balance-sheet db 20260401 20270331))
+             (:totals (core/balance-sheet end 20260401 20270331)))))))
+
+(deftest export-refusals-and-notes
+  (testing "円でない帳簿は日本の形式に書き出さない"
+    (let [db (load-db "qbo-journal-entries.json")]
+      (doseq [fmt ["mf" "yayoi" "freee"]]
+        (is (:error (export/export db fmt)) fmt))))
+  (testing "Shift_JIS に無い文字があれば書き出さず、UTF-8 なら書き出せる"
+    (let [db (db-of {:currency "JPY" :accounts []
+                     :entries [{:date "2026-04-01" :memo "波ダッシュ〜"
+                                :lines [{:account "現金" :debit 100 :credit 0}
+                                        {:account "売上高" :debit 0 :credit 100}]}]})]
+      (is (re-find #"〜" (:error (export/export db "mf" {:encoding "shift_jis"}))))
+      (is (:bytes (export/export db "mf" {:encoding "utf-8"})))))
+  (testing "受け皿の無い項目は注記する"
+    (let [db (load-db "mf.csv")]
+      (is (some #(re-find #"補助科目" %) (:notes (export/export db "xero-json"))))
+      (is (some #(re-find #"対象外 と書きました" %) (:notes (export/export db "yayoi"))))))
+  (testing "形式の受けない文字コードは選べない"
+    (is (:error (export/export (load-db "mf.csv") "qbo-csv" {:encoding "shift_jis"})))))

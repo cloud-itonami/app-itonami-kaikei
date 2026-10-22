@@ -1,0 +1,115 @@
+(ns kaikei.report-test
+  "帳票の 3 つの形（kaikei・QBO・Xero）。同じ帳簿から出した合計が一致し、
+  形が各社の帳票の見本（test/fixtures/README.md の出所）に沿うこと。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [clojure.walk :as walk]
+            [kaikei.core :as core]
+            [kaikei.export :as export]
+            [kaikei.ingest :as ingest]
+            [kaikei.json :as json]))
+
+(def sample-db (:db (core/merge-import core/empty-db core/sample-import)))
+
+(def usd-db (:db (core/merge-import core/empty-db
+                                    (ingest/ingest-bytes (js/Uint8Array. (fs/readFileSync "test/fixtures/qbo-journal-entries.json")) {}))))
+
+(defn- report [db kind shape]
+  (json/parse (export/report-text db kind shape "2026-04-01" "2027-03-31")))
+
+(defn- nodes [x]
+  (let [acc (atom [])] (walk/postwalk (fn [v] (swap! acc conj v) v) x) @acc))
+
+(defn- qbo-sections [r] (get-in r ["Rows" "Row"]))
+
+(defn- qbo-summary [section] (get-in section ["Summary" "ColData" 1 "value"]))
+
+(defn- xero-rows [r] (get-in r ["Reports" 0 "Rows"]))
+
+(defn- xero-cell-row [r label]
+  (first (for [s (xero-rows r), row (get s "Rows" [])
+               :when (= label (get-in row ["Cells" 0 "Value"]))]
+           row)))
+
+(deftest kaikei-shape
+  (let [pl (report sample-db "profit-and-loss" "kaikei")
+        bs (report sample-db "balance-sheet" "kaikei")
+        tb (report sample-db "trial-balance" "kaikei")]
+    (is (= 103500 (get-in pl ["stages" "net"])))
+    (is (= 1333500 (get-in bs ["totals" "assets"])))
+    (is (= 0 (get-in bs ["totals" "difference"])))
+    (is (= (get-in tb ["totals" "debit"]) (get-in tb ["totals" "credit"])))))
+
+(deftest qbo-profit-and-loss
+  (let [r (report sample-db "profit-and-loss" "qbo")
+        by-group (into {} (map (juxt #(get % "group") identity) (qbo-sections r)))]
+    (is (= ["Income" "COGS" "GrossProfit" "Expenses" "NetOperatingIncome" "OtherIncome" "OtherExpenses"
+            "NetOtherIncome" "NetIncome"]
+           (map #(get % "group") (qbo-sections r))))
+    (is (= "ProfitAndLoss" (get-in r ["Header" "ReportName"])))
+    (is (= "2026-04-01" (get-in r ["Header" "StartPeriod"])))
+    (is (= "JPY" (get-in r ["Header" "Currency"])))
+    (is (= ["Account" "Money"] (map #(get % "ColType") (get-in r ["Columns" "Column"]))))
+    (testing "合計は kaikei の段階利益と同じ"
+      (is (= "330000" (qbo-summary (by-group "Income"))))
+      (is (= "220000" (qbo-summary (by-group "GrossProfit"))))
+      (is (= "140000" (qbo-summary (by-group "NetOperatingIncome"))))
+      (is (= "103500" (qbo-summary (by-group "NetIncome"))))
+      (testing "営業外・特別・法人税等は OtherIncome／OtherExpenses に入る"
+        (is (= "5500" (qbo-summary (by-group "OtherIncome"))))
+        (is (= "42000" (qbo-summary (by-group "OtherExpenses"))))))
+    (testing "計算された行（GrossProfit など）は Summary だけ"
+      (is (nil? (get (by-group "GrossProfit") "Rows"))))))
+
+(deftest qbo-balance-sheet-and-trial-balance
+  (let [bs (report usd-db "balance-sheet" "qbo")
+        [assets le] (qbo-sections bs)
+        tb (report usd-db "trial-balance" "qbo")
+        grand (last (qbo-sections tb))]
+    (is (= ["TotalAssets" "TotalLiabilitiesAndEquity"] (map #(get % "group") (qbo-sections bs))))
+    (is (= "USD" (get-in bs ["Header" "Currency"])))
+    (testing "セントは 2 桁の小数で書く"
+      (is (= (qbo-summary assets) (qbo-summary le)))
+      ;; Truck 13495.00 + Checking (2500.50 − 46.00 − 12.34) + A/R 330.00
+      (is (= "16267.16" (qbo-summary assets))))
+    (testing "Net Income は Equity の中の group NetIncome の Data 行"
+      (is (some #(and (= "NetIncome" (get % "group")) (= "Data" (get % "type"))) (filter map? (nodes le)))))
+    (testing "試算表は Debit／Credit の 2 列と GrandTotal"
+      (is (= ["" "Debit" "Credit"] (map #(get % "ColTitle") (get-in tb ["Columns" "Column"]))))
+      (is (= "GrandTotal" (get grand "group")))
+      (is (= (get-in grand ["Summary" "ColData" 1 "value"]) (get-in grand ["Summary" "ColData" 2 "value"]))))
+    (testing "QBO から取り込んだ科目の行は Id を持つ"
+      (is (some #(= "35" (get % "id")) (filter map? (nodes tb)))))))
+
+(deftest xero-reports
+  (let [pl (report sample-db "profit-and-loss" "xero")
+        bs (report sample-db "balance-sheet" "xero")
+        tb (report sample-db "trial-balance" "xero")]
+    (testing "Reports[].Rows[] の RowType は Header・Section・Row・SummaryRow"
+      (doseq [r [pl bs tb]]
+        (is (every? #{"Header" "Section" "Row" "SummaryRow"}
+                    (keep #(get % "RowType") (filter map? (nodes r)))))))
+    (is (= "ProfitAndLoss" (get-in pl ["Reports" 0 "ReportType"])))
+    (is (= "31 March 2027" (get-in pl ["Reports" 0 "ReportDate"])))
+    (is (= "1 April 2026 to 31 March 2027" (get-in pl ["Reports" 0 "ReportTitles" 2])))
+    (testing "合計は kaikei と同じ"
+      (is (= "103500" (get-in (xero-cell-row pl "Net Profit") ["Cells" 1 "Value"])))
+      (is (= "220000" (get-in (xero-cell-row pl "Gross Profit") ["Cells" 1 "Value"])))
+      (is (= "1333500" (get-in (xero-cell-row bs "Total Assets") ["Cells" 1 "Value"])))
+      (is (= "1103500" (get-in (xero-cell-row bs "Total Equity") ["Cells" 1 "Value"]))))
+    (testing "試算表の見出しと合計"
+      (is (= ["Account" "Debit" "Credit" "YTD Debit" "YTD Credit"]
+             (map #(get % "Value") (get-in (first (xero-rows tb)) ["Cells"]))))
+      (let [total (xero-cell-row tb "Total")]
+        (is (= (get-in total ["Cells" 3 "Value"]) (get-in total ["Cells" 4 "Value"])))))))
+
+(deftest xero-account-attributes
+  (let [db (:db (reduce (fn [acc f] (core/merge-import (:db acc) (ingest/ingest-bytes (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" f))) {})))
+                        {:db core/empty-db}
+                        ["xero-accounts.json" "xero-journals.json"]))
+        pl (report db "profit-and-loss" "xero")
+        sales (xero-cell-row pl "Sales (200)")]
+    (testing "Xero から取り込んだ科目は「名前 (コード)」と AccountID の Attributes"
+      (is (some? sales))
+      (is (= [{"Value" "00000000-0000-4000-8000-000000000200" "Id" "account"}]
+             (get-in sales ["Cells" 0 "Attributes"]))))))

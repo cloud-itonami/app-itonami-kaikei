@@ -1,0 +1,4 @@
+;; kaikei_journal.wasm のコンパイル方針。fuel は wasm の module-private な
+;; 大域に焼き込まれ、補充されない（amu の既定は 512）。帳票の判定は帳簿を
+;; 何度もなめるので、記述子 aiueos/kaikei.edn の :aiueos/limits と同じ上限にする。
+{:budgets {:fuel 5000000}}

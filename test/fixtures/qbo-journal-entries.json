@@ -1,0 +1,59 @@
+{
+  "QueryResponse": {
+    "startPosition": 1, "totalCount": 4, "maxResults": 4,
+    "Account": [
+      {"FullyQualifiedName": "Checking", "Name": "Checking", "Classification": "Asset", "AccountType": "Bank",
+       "CurrencyRef": {"value": "USD"}, "Id": "35", "SubAccount": false},
+      {"FullyQualifiedName": "Accounts Receivable (A/R)", "Name": "Accounts Receivable (A/R)", "Classification": "Asset",
+       "AccountType": "Accounts Receivable", "CurrencyRef": {"value": "USD"}, "Id": "84", "SubAccount": false},
+      {"FullyQualifiedName": "Truck", "Name": "Truck", "Classification": "Asset", "AccountType": "Fixed Asset",
+       "CurrencyRef": {"value": "USD"}, "Id": "37", "SubAccount": false},
+      {"FullyQualifiedName": "Truck:Original Cost", "Name": "Original Cost", "Classification": "Asset",
+       "AccountType": "Fixed Asset", "CurrencyRef": {"value": "USD"}, "Id": "38", "SubAccount": true, "ParentRef": {"value": "37"}},
+      {"FullyQualifiedName": "Opening Balance Equity", "Name": "Opening Balance Equity", "Classification": "Equity",
+       "AccountType": "Equity", "CurrencyRef": {"value": "USD"}, "Id": "34", "SubAccount": false},
+      {"FullyQualifiedName": "Services", "Name": "Services", "Classification": "Revenue", "AccountType": "Income",
+       "CurrencyRef": {"value": "USD"}, "Id": "1", "SubAccount": false},
+      {"FullyQualifiedName": "Meals and Entertainment", "Name": "Meals and Entertainment", "Classification": "Expense",
+       "AccountType": "Expense", "CurrencyRef": {"value": "USD"}, "Id": "13", "SubAccount": false},
+      {"FullyQualifiedName": "Interest Expense", "Name": "Interest Expense", "Classification": "Expense",
+       "AccountType": "Other Expense", "CurrencyRef": {"value": "USD"}, "Id": "90", "SubAccount": false}
+    ],
+    "JournalEntry": [
+      {"SyncToken": "0", "domain": "QBO", "TxnDate": "2026-04-01", "PrivateNote": "Opening Balance", "sparse": false,
+       "DocNumber": "1", "CurrencyRef": {"value": "USD", "name": "United States Dollar"},
+       "Line": [
+         {"JournalEntryLineDetail": {"PostingType": "Debit", "AccountRef": {"name": "Truck:Original Cost", "value": "38"}},
+          "DetailType": "JournalEntryLineDetail", "Amount": 13495.0, "Id": "0", "Description": "Opening Balance"},
+         {"JournalEntryLineDetail": {"PostingType": "Debit", "AccountRef": {"name": "Checking", "value": "35"}},
+          "DetailType": "JournalEntryLineDetail", "Amount": 2500.5, "Id": "1", "Description": "Opening Balance"},
+         {"JournalEntryLineDetail": {"PostingType": "Credit", "AccountRef": {"name": "Opening Balance Equity", "value": "34"}},
+          "DetailType": "JournalEntryLineDetail", "Amount": 15995.5, "Id": "2", "Description": "Opening Balance"}],
+       "Adjustment": false, "Id": "6", "TxnTaxDetail": {}},
+      {"TxnDate": "2026-04-15", "PrivateNote": "April services", "DocNumber": "2", "CurrencyRef": {"value": "USD"},
+       "Line": [
+         {"Description": "Garden maintenance", "DetailType": "JournalEntryLineDetail", "Amount": 330.0, "Id": "0",
+          "JournalEntryLineDetail": {"PostingType": "Debit", "AccountRef": {"name": "Accounts Receivable (A/R)", "value": "84"},
+                                     "Entity": {"Type": "Customer", "EntityRef": {"name": "Test Customer", "value": "1"}}}},
+         {"Description": "Garden maintenance", "DetailType": "JournalEntryLineDetail", "Amount": 330.0, "Id": "1",
+          "JournalEntryLineDetail": {"PostingType": "Credit", "AccountRef": {"name": "Services", "value": "1"},
+                                     "DepartmentRef": {"name": "North", "value": "2"}}}],
+       "Adjustment": false, "Id": "7"},
+      {"TxnDate": "2026-05-03", "PrivateNote": "Client lunch", "DocNumber": "3", "CurrencyRef": {"value": "USD"},
+       "Line": [
+         {"Description": "Lunch", "DetailType": "JournalEntryLineDetail", "Amount": 46.0, "Id": "0",
+          "JournalEntryLineDetail": {"PostingType": "Debit", "AccountRef": {"name": "Meals and Entertainment", "value": "13"}}},
+         {"Description": "Lunch", "DetailType": "JournalEntryLineDetail", "Amount": 46.0, "Id": "1",
+          "JournalEntryLineDetail": {"PostingType": "Credit", "AccountRef": {"name": "Checking", "value": "35"}}}],
+       "Adjustment": false, "Id": "8"},
+      {"TxnDate": "2027-03-31", "PrivateNote": "Year-end interest accrual", "DocNumber": "4", "CurrencyRef": {"value": "USD"},
+       "Line": [
+         {"Description": "Interest", "DetailType": "JournalEntryLineDetail", "Amount": 12.34, "Id": "0",
+          "JournalEntryLineDetail": {"PostingType": "Debit", "AccountRef": {"name": "Interest Expense", "value": "90"}}},
+         {"Description": "Interest", "DetailType": "JournalEntryLineDetail", "Amount": 12.34, "Id": "1",
+          "JournalEntryLineDetail": {"PostingType": "Credit", "AccountRef": {"name": "Checking", "value": "35"}}}],
+       "Adjustment": true, "Id": "9"}
+    ]
+  },
+  "time": "2026-10-22T09:00:00.000-07:00"
+}

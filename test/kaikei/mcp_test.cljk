@@ -1,0 +1,88 @@
+(ns kaikei.mcp-test
+  "MCP の tool（kaikei.mcp）。stdio を通さず、handle に JSON-RPC の 1 通を渡す。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [kaikei.encoding :as enc]
+            [kaikei.ingest :as ingest]
+            [kaikei.mcp :as mcp]))
+
+(defn- call [tool args]
+  (get (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "tools/call" "params" {"name" tool "arguments" args}}) "result"))
+
+(defn- ok [tool args]
+  (let [r (call tool args)]
+    (is (false? (get r "isError")) (str tool " " (get-in r ["content" 0 "text"])))
+    (get r "structuredContent")))
+
+(defn- err [tool args]
+  (let [r (call tool args)]
+    (is (true? (get r "isError")))
+    (get (js->clj (.parse js/JSON (get-in r ["content" 0 "text"]))) "error")))
+
+(defn- fixture-text [f] (str (fs/readFileSync (str "test/fixtures/" f) "utf8")))
+(defn- fixture-base64 [f] (enc/bytes->base64 (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" f)))))
+
+(deftest lists-five-tools
+  (let [tools (get-in (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "tools/list"}) ["result" "tools"])]
+    (is (= ["kaikei_import" "kaikei_validate" "kaikei_report" "kaikei_export" "kaikei_convert"]
+           (map #(get % "name") tools)))
+    (is (every? #(get-in % ["inputSchema" "type"]) tools))
+    (is (not-any? #(contains? % "run") tools))))
+
+(deftest import-validate-report-export
+  (let [{:strs [format encoding entries ledger checks]} (ok "kaikei_import" {"bytes_base64" (fixture-base64 "yayoi-sjis.txt")})]
+    (is (= "yayoi" format))
+    (is (= "shift_jis" encoding))
+    (is (= 4 entries))
+    (is (true? (get checks "balanced")))
+    (is (= "kaikei.ledger.v1" (get ledger "format")))
+    (testing "validate"
+      (is (= [] (get (ok "kaikei_validate" {"ledger" ledger}) "problems"))))
+    (testing "report: 3 つの形"
+      (let [pl (ok "kaikei_report" {"ledger" ledger "report" "profit-and-loss" "from" "2026-04-01" "to" "2027-03-31"})]
+        ;; 売上高 300,000（税抜）− 消耗品費 11,000 − 地代家賃 80,000 − 法人税等 30,000
+        (is (= 179000 (get-in pl ["data" "stages" "net"]))))
+      (let [bs (ok "kaikei_report" {"ledger" ledger "report" "balance-sheet" "shape" "qbo"
+                                    "from" "2026-04-01" "to" "2027-03-31"})]
+        (is (= "BalanceSheet" (get-in bs ["data" "Header" "ReportName"]))))
+      (let [tb (ok "kaikei_report" {"ledger" ledger "report" "trial-balance" "shape" "xero"
+                                    "from" "2026-04-01" "to" "2027-03-31"})]
+        (is (= "TrialBalance" (get-in tb ["data" "Reports" 0 "ReportType"])))))
+    (testing "export: Shift_JIS は base64、UTF-8 は text"
+      (let [y (ok "kaikei_export" {"ledger" ledger "format" "yayoi"})]
+        (is (= "shift_jis" (get y "encoding")))
+        (is (string? (get y "bytes_base64")))
+        (is (= (:entries (ingest/ingest-bytes (enc/base64->bytes (get y "bytes_base64")) {}))
+               (:entries (ingest/ingest-bytes (enc/base64->bytes (fixture-base64 "yayoi-sjis.txt")) {})))))
+      (let [x (ok "kaikei_export" {"ledger" ledger "format" "xero-json"})]
+        (is (string? (get x "text")))
+        (is (seq (get x "notes")))))))
+
+(deftest convert
+  (let [r (ok "kaikei_convert" {"text" (fixture-text "qbo-journal.csv") "currency" "USD" "to" "xero-csv"
+                                "output_date_order" "dmy"})]
+    (is (= "qbo-csv" (get r "from")))
+    (is (= 3 (get r "entries")))
+    (is (re-find #"15/04/2026" (get r "text")))))
+
+(deftest invalid-input-is-a-tool-error
+  (is (= "invalid-argument" (err "kaikei_import" {})))
+  (is (= "invalid-argument" (err "kaikei_import" {"text" "a" "bytes_base64" "YQ=="})))
+  (is (= "unknown-argument" (err "kaikei_import" {"text" "a" "nope" 1})))
+  (is (= "invalid-argument" (err "kaikei_import" {"text" "a" "currency" "XXX"})))
+  (is (= "invalid-argument" (err "kaikei_validate" {"ledger" {"format" "other"}})))
+  (is (= "invalid-date" (err "kaikei_report" {"ledger" {"format" "kaikei.ledger.v1" "currency" "JPY" "entries" []}
+                                              "report" "balance-sheet" "from" "2026-13-01" "to" "2027-03-31"})))
+  (is (= "cannot-export" (err "kaikei_export" {"ledger" {"format" "kaikei.ledger.v1" "currency" "USD"
+                                                         "entries" [{"date" "2026-04-01"
+                                                                     "lines" [{"account" "Cash" "debit" 100 "credit" 0}
+                                                                              {"account" "Sales" "debit" 0 "credit" 100}]}]}
+                                               "format" "mf"})))
+  (testing "5 MiB を超える入力"
+    (is (= "input-too-large" (err "kaikei_import" {"text" (apply str (repeat (inc (* 5 1024 1024)) "a"))}))))
+  (testing "JSON-RPC の層の誤り"
+    (is (= -32602 (get-in (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "tools/call" "params" {"name" "nope"}})
+                          ["error" "code"])))
+    (is (= -32601 (get-in (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "nope"}) ["error" "code"])))
+    (is (nil? (mcp/handle {"jsonrpc" "2.0" "method" "notifications/initialized"})))
+    (is (re-find #"-32700" (mcp/handle-line "{not json")))))

@@ -1,0 +1,200 @@
+(ns kaikei.ingest-test
+  "各形式の取り込み。fixture の形の出所は test/fixtures/README.md。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [kaikei.core :as core]
+            [kaikei.ingest :as ingest]))
+
+(defn- bytes-of [f] (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" f))))
+
+(defn- load
+  ([f] (load f {}))
+  ([f opts] (ingest/ingest-bytes (bytes-of f) opts)))
+
+(defn- db-of [& results]
+  (reduce (fn [db r] (:db (core/merge-import db r))) core/empty-db results))
+
+(defn- lines [e] (mapv (juxt :account :debit :credit) (:lines e)))
+
+(deftest detects-every-format
+  (doseq [[f expected] [["xero-accounts.json" :xero-json] ["xero-manual-journals.json" :xero-json]
+                        ["xero-journals.json" :xero-json] ["qbo-accounts.json" :qbo-json]
+                        ["qbo-journal-entries.json" :qbo-json] ["yayoi.csv" :yayoi] ["yayoi-sjis.txt" :yayoi]
+                        ["mf.csv" :mf] ["freee.csv" :freee] ["qbo-journal.csv" :qbo-csv]
+                        ["xero-manual-journal.csv" :xero-csv]]]
+    (is (= expected (:format (load f))) f)))
+
+(deftest xero
+  (testing "Journals は帳簿の全体。勘定科目名と区分は行の AccountName・AccountType から"
+    (let [r (load "xero-journals.json")
+          db (db-of r)]
+      (is (= 3 (count (:entries r))))
+      (is (= [["Accounts Receivable" 330000 0] ["Sales" 0 330000]] (lines (second (:entries db)))))
+      (is (= "INV-0001" (:memo (second (:entries db)))))
+      (is (= :revenue (core/account-class db "Sales")))
+      (testing "Xero の EXPENSE は、名前の既定の表で営業外費用に細かくする"
+        (is (= :non-operating-expense (core/account-class db "Interest Expense"))))))
+  (testing "ManualJournals は POSTED だけ。税額のある Exclusive の仕訳は警告し、検証で貸借不一致になる"
+    (let [r (load "xero-manual-journals.json")]
+      (is (= 3 (count (:entries r))))
+      (is (some #(re-find #"POSTED でない ManualJournals 2 件" %) (:warnings r)))
+      (is (some #(re-find #"税額のある ManualJournals 1 件" %) (:warnings r)))
+      (is (= #{:unbalanced} (core/entry-problems (last (:entries r)))))
+      (is (= [["Region" "North"]] (:tracking (first (:lines (second (:entries r)))))))
+      (is (= {:scheme :xero :code "NONE"} (:tax (first (:lines (first (:entries r)))))))))
+  (testing "Accounts を先に取り込めば、ManualJournals のコードは名前に引き直される"
+    (let [db (db-of (load "xero-accounts.json") (load "xero-manual-journals.json"))]
+      (is (= [["Business Bank Account" 1000000 0] ["Owner A Funds Introduced" 0 1000000]]
+             (lines (first (:entries db)))))
+      (is (= :current-asset (core/account-class db "Business Bank Account")))
+      (is (= :operating-expense (core/account-class db "Rent")))
+      (is (= "469" (get-in db [:accounts "Rent" :code])))))
+  (testing "Journals と ManualJournals の両方があれば Journals を使う"
+    (let [j (js->clj (.parse js/JSON (str (fs/readFileSync "test/fixtures/xero-journals.json"))))
+          m (js->clj (.parse js/JSON (str (fs/readFileSync "test/fixtures/xero-manual-journals.json"))))
+          r (ingest/ingest-text (.stringify js/JSON (clj->js (assoc j "ManualJournals" (get m "ManualJournals")))) {})]
+      (is (= 3 (count (:entries r))))
+      (is (some #(re-find #"Journals を使い" %) (:warnings r))))))
+
+(deftest qbo
+  (let [r (load "qbo-journal-entries.json")
+        db (db-of r)
+        opening (first (:entries db))]
+    (testing "通貨は CurrencyRef、金額はセント"
+      (is (= "USD" (:currency r)))
+      (is (= [["Truck" 1349500 0] ["Checking" 250050 0] ["Opening Balance Equity" 0 1599550]] (lines opening))))
+    (testing "補助科目（ParentRef）は FullyQualifiedName の最初の段が勘定科目、残りが補助科目"
+      (is (= "Original Cost" (:sub-account (first (:lines opening))))))
+    (testing "Entity（取引先）と DepartmentRef"
+      (let [[ar sales] (:lines (second (:entries db)))]
+        (is (= "Test Customer" (:partner ar)))
+        (is (= "Customer" (:partner-type ar)))
+        (is (= "North" (:department sales)))))
+    (testing "区分は AccountType、Adjustment は決算整理"
+      (is (= :non-current-asset (core/account-class db "Truck")))
+      (is (= :non-operating-expense (core/account-class db "Interest Expense")))
+      (is (true? (:adjustment? (last (:entries db))))))
+    (testing "帳簿の通貨と違う JournalEntry は取り込まない"
+      (let [j (js->clj (.parse js/JSON (str (fs/readFileSync "test/fixtures/qbo-journal-entries.json"))))
+            j (assoc-in j ["QueryResponse" "JournalEntry" 1 "CurrencyRef" "value"] "EUR")
+            r (ingest/ingest-text (.stringify js/JSON (clj->js j)) {})]
+        (is (= 3 (count (:entries r))))
+        (is (= 1 (:rejected r)))))
+    (testing "小数の桁が通貨の桁を超える金額は丸めずに落とす"
+      (let [j (js->clj (.parse js/JSON (str (fs/readFileSync "test/fixtures/qbo-journal-entries.json"))))
+            j (assoc-in j ["QueryResponse" "JournalEntry" 2 "Line" 0 "Amount"] 46.005)
+            r (ingest/ingest-text (.stringify js/JSON (clj->js j)) {})]
+        (is (= 1 (:rejected r)))
+        (is (some #(re-find #"丸めません" %) (:warnings r)))))))
+
+(deftest yayoi
+  (let [r (load "yayoi.csv")
+        [stationery sales rent tax] (:entries r)]
+    (is (= 4 (count (:entries r))))
+    (is (= 0 (:rejected r)))
+    (testing "2110〜2101 の複数行の伝票、後の行は先頭行の日付"
+      (is (= [["売掛金" 330000 0] ["売上高" 0 300000] ["仮受消費税等" 0 30000]] (lines sales)))
+      (is (= "2026-05-25" (:date rent)))
+      (is (= [["地代家賃" 80000 0] ["普通預金" 0 88000] ["仮払消費税等" 8000 0]] (lines rent))))
+    (testing "インボイスの区分は税区分の文字列のまま"
+      (is (= {:scheme :yayoi :code "課対仕入内10%適格"} (:tax (first (:lines stationery)))))
+      (is (= {:scheme :yayoi :code "課対仕入内10%区分80%"} (:tax (first (:lines rent))))))
+    (testing "本決は決算整理、和暦の日付"
+      (is (true? (:adjustment? tax)))
+      (is (= "2027-03-31" (:date tax)))
+      (is (= "2111" (get-in tax [:origin :flag])))))
+  (testing "Shift_JIS のファイルも同じ結果"
+    (let [r (load "yayoi-sjis.txt")]
+      (is (= "shift_jis" (:encoding r)))
+      (is (= (:entries (load "yayoi.csv")) (:entries r)))))
+  (testing "閉じていない複数行の伝票・項目数の違う行は落として理由を書く"
+    (let [r (ingest/ingest-text (str "2110,,,2026/04/10,売掛金,,,対象外,100,,売上高,,,対象外,100,,x,,,3,,,0,0,no\r\n"
+                                     "2000,,,2026/04/11,現金,,,対象外,100,,売上高,,,対象外,100\r\n")
+                                {:format "yayoi"})]
+      (is (= 0 (count (:entries r))))
+      (is (= 2 (count (:warnings r)))))))
+
+(deftest mf
+  (let [r (load "mf.csv")
+        db (db-of r)
+        [stationery sales rent tax] (:entries db)]
+    (is (= 4 (count (:entries r))))
+    (testing "取引No と取引日が同じ行は 1 つの複合仕訳"
+      (is (= [["地代家賃" 80000 0] ["普通預金" 0 88000] ["仮払消費税等" 8000 0]] (lines rent)))
+      (is (= "三井住友" (:sub-account (second (:lines rent)))))
+      (is (= "家賃は毎月 25 日" (:note rent))))
+    (testing "税区分・インボイス・取引先・部門"
+      (is (= {:scheme :mf :code "課税仕入 10%"} (:tax (first (:lines stationery)))))
+      (is (= {:scheme :mf :code "適格"} (:invoice (first (:lines stationery)))))
+      (is (= {:scheme :mf :code "80％控除"} (:invoice (first (:lines rent)))))
+      (is (= 1000 (:tax-amount (first (:lines stationery)))))
+      (is (= "株式会社テスト顧客" (:partner (first (:lines sales)))))
+      (is (= "営業部" (:department (second (:lines sales))))))
+    (testing "決算整理仕訳に何か書いてあれば決算整理、MF仕訳タイプは保つ"
+      (is (true? (:adjustment? tax)))
+      (is (= "決算整理" (get-in tax [:origin :mf-type]))))
+    (testing "取引No が同じでも取引日が違えば別の仕訳"
+      (let [csv (str (first (.split (str (fs/readFileSync "test/fixtures/mf.csv")) "\r\n")) "\r\n"
+                     "5,2026/06/01,現金,,,,,,100,,売上高,,,,,,100,,a,,,,,,,,\r\n"
+                     "5,2026/06/02,現金,,,,,,200,,売上高,,,,,,200,,b,,,,,,,,\r\n")]
+        (is (= 2 (count (:entries (ingest/ingest-text csv {})))))))))
+
+(deftest freee
+  (let [r (load "freee.csv")
+        [sale rent discount tax] (:entries r)]
+    (is (= 4 (count (:entries r))))
+    (is (= "300" (:number sale)))
+    (is (= [["地代家賃" 80000 0] ["普通預金" 0 88000] ["仮払消費税等" 8000 0]] (lines rent)))
+    (is (= {:scheme :freee :code "課税売上10%"} (:tax (second (:lines sale)))))
+    (is (= {:scheme :freee :code "課税売上8%（軽）"} (:tax (first (:lines discount)))))
+    (is (= 100000 (:tax-amount (second (:lines sale)))))
+    (is (= "販売部" (:department (first (:lines sale)))))
+    (is (true? (:adjustment? tax)))
+    (is (= "2027-03-31" (:date tax))))
+  (testing "借方・貸方ともに負の行は入れ替える（freee の規則）"
+    (let [csv (str (first (.split (str (fs/readFileSync "test/fixtures/freee.csv")) "\r\n")) "\r\n"
+                   "[明細行],2026/07/01,9,,現金,,,,,,,,,,,-500,対象外,0,売上高,,,,,,,,,,,-500,対象外,0,返金\r\n")
+          e (first (:entries (ingest/ingest-text csv {})))]
+      (is (= [["売上高" 500 0] ["現金" 0 500]] (lines e)))))
+  (testing "freee の仕訳帳の書き出し（取引日・No.・補助科目名の見出し）も読む"
+    (let [csv (str "No.,取引日,借方勘定科目,借方補助科目名,借方金額,借方税区分,貸方勘定科目,貸方金額,貸方税区分,摘要\r\n"
+                   "1,2026/04/01,普通預金,三井住友,1000,対象外,売上高,1000,課税売上10%,売上\r\n")
+          e (first (:entries (ingest/ingest-text csv {})))]
+      (is (= [["普通預金" 1000 0] ["売上高" 0 1000]] (lines e)))
+      (is (= "三井住友" (:sub-account (first (:lines e))))))))
+
+(deftest qbo-csv
+  (let [r (load "qbo-journal.csv" {:currency "USD"})
+        [_ ar truck] (:entries r)]
+    (is (= 3 (count (:entries r))))
+    (is (= "2026-04-15" (:date ar)) "mm/dd/yyyy を判定")
+    (is (= [["Accounts Receivable (A/R)" 33000 0] ["Services" 0 33000]] (lines ar)))
+    (is (= "Test Customer" (:partner (first (:lines ar)))))
+    (is (= "Original Cost" (:sub-account (first (:lines truck)))))
+    (is (= "North" (:department (first (:lines truck))))))
+  (testing "日付の並びを判定できなければ月/日/年と読み、そう警告する"
+    (let [r (ingest/ingest-text "Journal No.,Journal Date,Account Name,Debits,Credits\r\n1,04/05/2026,Cash,1,\r\n1,04/05/2026,Sales,,1\r\n"
+                                {:currency "USD"})]
+      (is (= "2026-04-05" (:date (first (:entries r)))))
+      (is (some #(re-find #"月/日/年" %) (:warnings r))))))
+
+(deftest xero-csv
+  (let [r (load "xero-manual-journal.csv" {:currency "GBP"})
+        [opening rent] (:entries r)]
+    (is (= 2 (count (:entries r))))
+    (is (= "2026-04-30" (:date rent)) "dd/mm/yyyy を判定")
+    (is (= [["090" 500000 0] ["970" 0 500000]] (lines opening)))
+    (is (= {:scheme :xero-rate :code "No VAT"} (:tax (first (:lines rent)))))
+    (is (= [["Region" "North"]] (:tracking (first (:lines rent))))))
+  (testing "帳簿に Xero のコードがあれば名前に引き直す（円の帳簿なので 5000.00 は 5,000 円）"
+    (let [db (db-of (load "xero-accounts.json") (load "xero-manual-journal.csv"))]
+      (is (= [["Business Bank Account" 5000 0] ["Owner A Funds Introduced" 0 5000]]
+             (lines (first (:entries db))))))))
+
+(deftest refuses-what-it-cannot-read
+  (is (seq (:warnings (ingest/ingest-text "{\"foo\": 1}" {}))))
+  (is (seq (:warnings (ingest/ingest-text "a,b,c\r\n1,2,3\r\n" {}))))
+  (is (seq (:warnings (ingest/ingest-text "{" {:format "xero-json"}))))
+  (testing "知らない通貨は桁を推測しない"
+    (is (= 0 (count (:entries (ingest/ingest-text (str (fs/readFileSync "test/fixtures/xero-journals.json"))
+                                                  {:currency "XXX"})))))))

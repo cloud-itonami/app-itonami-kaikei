@@ -1,0 +1,58 @@
+(ns kaikei.csv
+  "CSV（RFC 4180）の読み書き。各社の仕訳帳 CSV が共通に使う。
+
+  読みは dandori.ingest/parse-csv と同じ方法: `\"` で分割すると偶数番目が
+  引用の外、奇数番目が引用の中になる。文字単位の走査より速く、ブラウザ
+  （scittle）でも年間の仕訳帳を読める。"
+  (:require [kotoba.lang.text :as text]))
+
+(defn- outside-tokens [s]
+  (text/re-seq #"[^,\r\n]+|,|\r?\n|\r" s))
+
+(defn parse
+  "CSV 文字列 → 行のベクタ（各行は文字列のベクタ）。空行は落とす。先頭の
+  BOM は外す。"
+  [s]
+  (let [s (text/replace (or s "") #"^﻿" "")
+        parts (text/split s #"\"" -1)
+        last-i (dec (count parts))]
+    (loop [i 0, field "", row [], rows [], touched? false]
+      (if (> i last-i)
+        (let [rows (if (or touched? (seq row)) (conj rows (conj row field)) rows)]
+          (vec (remove #(every? text/blank? %) rows)))
+        (let [part (nth parts i)]
+          (if (odd? i)
+            (recur (inc i) (str field part) row rows true)
+            (if (and (= part "") (pos? i) (< i last-i))
+              (recur (inc i) (str field "\"") row rows true)
+              (let [[field row rows touched?]
+                    (reduce (fn [[field row rows touched?] tok]
+                              (cond
+                                (= tok ",") ["" (conj row field) rows true]
+                                (#{"\n" "\r\n" "\r"} tok) ["" [] (conj rows (conj row field)) false]
+                                :else [(str field tok) row rows true]))
+                            [field row rows touched?]
+                            (outside-tokens part))]
+                (recur (inc i) field row rows touched?)))))))))
+
+(defn- quote-field [v]
+  (let [s (str (if (nil? v) "" v))]
+    (if (text/re-find #"[\",\r\n]" s)
+      (str "\"" (text/replace s "\"" "\"\"") "\"")
+      s)))
+
+(defn write
+  "行のベクタ → CSV 文字列（CRLF 区切り、最後の行も CRLF で終える）。"
+  [rows]
+  (apply str (map (fn [row] (str (text/join "," (map quote-field row)) "\r\n")) rows)))
+
+(defn records
+  "見出し行 + データ行 → 見出し（前後の空白を除いたもの）をキーにした map
+  の列。足りない欄は \"\"。各 map の ::row は元の行番号（1 始まり、見出し行を
+  含む）。"
+  [rows]
+  (let [header (mapv text/trim (first rows))]
+    (vec (map-indexed (fn [i row]
+                        (assoc (zipmap header (concat (map #(or % "") row) (repeat "")))
+                               ::row (+ i 2)))
+                      (rest rows)))))

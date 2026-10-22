@@ -1,0 +1,34 @@
+{
+  "QueryResponse": {
+    "startPosition": 1,
+    "Account": [
+      {"FullyQualifiedName": "Checking", "domain": "QBO", "Name": "Checking", "Classification": "Asset",
+       "AccountSubType": "Checking", "CurrencyRef": {"name": "United States Dollar", "value": "USD"},
+       "CurrentBalanceWithSubAccounts": 0, "sparse": false, "AccountType": "Bank", "CurrentBalance": 0,
+       "Active": true, "SyncToken": "0", "Id": "35", "SubAccount": false},
+      {"FullyQualifiedName": "Accounts Receivable (A/R)", "Name": "Accounts Receivable (A/R)", "Classification": "Asset",
+       "AccountSubType": "AccountsReceivable", "CurrencyRef": {"name": "United States Dollar", "value": "USD"},
+       "AccountType": "Accounts Receivable", "Active": true, "Id": "84", "SubAccount": false},
+      {"FullyQualifiedName": "Truck", "Name": "Truck", "Classification": "Asset", "AccountSubType": "Vehicles",
+       "CurrencyRef": {"name": "United States Dollar", "value": "USD"}, "AccountType": "Fixed Asset", "Active": true,
+       "Id": "37", "SubAccount": false},
+      {"FullyQualifiedName": "Truck:Original Cost", "Name": "Original Cost", "Classification": "Asset",
+       "AccountSubType": "Vehicles", "CurrencyRef": {"name": "United States Dollar", "value": "USD"},
+       "AccountType": "Fixed Asset", "Active": true, "Id": "38", "SubAccount": true, "ParentRef": {"value": "37"}},
+      {"FullyQualifiedName": "Opening Balance Equity", "Name": "Opening Balance Equity", "Classification": "Equity",
+       "AccountSubType": "OpeningBalanceEquity", "CurrencyRef": {"name": "United States Dollar", "value": "USD"},
+       "AccountType": "Equity", "Active": true, "Id": "34", "SubAccount": false},
+      {"FullyQualifiedName": "Services", "Name": "Services", "Classification": "Revenue", "AcctNum": "4000",
+       "AccountSubType": "ServiceFeeIncome", "CurrencyRef": {"name": "United States Dollar", "value": "USD"},
+       "AccountType": "Income", "Active": true, "Id": "1", "SubAccount": false},
+      {"FullyQualifiedName": "Meals and Entertainment", "Name": "Meals and Entertainment", "Classification": "Expense",
+       "AccountSubType": "EntertainmentMeals", "CurrencyRef": {"name": "United States Dollar", "value": "USD"},
+       "AccountType": "Expense", "Active": true, "Id": "13", "SubAccount": false},
+      {"FullyQualifiedName": "Interest Expense", "Name": "Interest Expense", "Classification": "Expense",
+       "AccountSubType": "OtherMiscellaneousExpense", "CurrencyRef": {"name": "United States Dollar", "value": "USD"},
+       "AccountType": "Other Expense", "Active": true, "Id": "90", "SubAccount": false}
+    ],
+    "maxResults": 8
+  },
+  "time": "2026-10-22T09:00:00.000-07:00"
+}

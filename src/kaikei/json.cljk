@@ -1,0 +1,84 @@
+(ns kaikei.json
+  "JSON の読み書き。読むのはホスト（ブラウザ／kbb の JSON.parse）、書くのは
+  ここ —— キーの順序を固定し、金額を 10 進のまま正確に出すため。
+
+  - `ordered`: [[k v] …] の順で書く map（nil の値は落とす）。
+  - `decimal`: 10 進の文字列を JSON の数としてそのまま書く印（1234.56 を
+    1234.5600000000001 にしない）。
+
+  dandori.export の JSON writer と同じ形。"
+  (:require [kotoba.lang.text :as text]))
+
+(defn parse
+  "JSON 文字列 → Clojure の値（キーは文字列のまま）。読めなければ例外。"
+  [s]
+  #?(:cljs (js->clj (.parse js/JSON s))
+     :clj (throw (ex-info "JSON の構文解析はホスト（ブラウザ／kbb の JSON.parse）が担う" {}))))
+
+(defn ordered
+  "[[k v] …] から nil 値を除き、書き出し順を保った map を作る。"
+  [pairs]
+  (let [pairs (vec (remove (comp nil? second) pairs))]
+    (with-meta (into {} pairs) {::pairs pairs})))
+
+(defn decimal
+  "10 進の文字列（\"1234.56\"）を、JSON の数として書く値にする。"
+  [s]
+  (with-meta {::decimal s} {::decimal true}))
+
+(defn- code-unit [c]
+  #?(:cljs (.charCodeAt c 0) :clj (int (.charAt ^String c 0))))
+
+(defn- hex4 [n]
+  (let [h (text/lower #?(:cljs (.toString n 16) :clj (Integer/toHexString n)))]
+    (str (apply str (repeat (- 4 (count h)) "0")) h)))
+
+(defn- escape-char [ch]
+  (let [c (str ch)]
+    (case c
+      "\"" "\\\""
+      "\\" "\\\\"
+      "\n" "\\n"
+      "\r" "\\r"
+      "\t" "\\t"
+      (if (< (code-unit c) 32) (str "\\u" (hex4 (code-unit c))) c))))
+
+(defn- json-string [s]
+  (str "\""
+       (if (text/re-find #"[\"\\\u0000-\u001f]" s)
+         (apply str (map escape-char s))
+         s)
+       "\""))
+
+(declare write)
+
+(defn- json-object [pairs indent]
+  (if (empty? pairs)
+    "{}"
+    (let [pad (apply str (repeat (+ indent 2) " "))]
+      (str "{\n"
+           (text/join ",\n" (map (fn [[k v]] (str pad (json-string (name k)) ": " (write v (+ indent 2))))
+                                 pairs))
+           "\n" (apply str (repeat indent " ")) "}"))))
+
+(defn write
+  "値 → JSON 文字列。map は ordered の順か (seq m) の順で書く。"
+  ([v] (write v 0))
+  ([v indent]
+   (cond
+     (nil? v) "null"
+     (true? v) "true"
+     (false? v) "false"
+     (string? v) (json-string v)
+     (keyword? v) (json-string (name v))
+     (number? v) (str v)
+     (and (map? v) (::decimal (meta v))) (::decimal v)
+     (and (map? v) (::pairs (meta v))) (json-object (::pairs (meta v)) indent)
+     (map? v) (json-object (seq v) indent)
+     (sequential? v)
+     (if (empty? v)
+       "[]"
+       (let [pad (apply str (repeat (+ indent 2) " "))]
+         (str "[\n" (text/join ",\n" (map #(str pad (write % (+ indent 2))) v))
+              "\n" (apply str (repeat indent " ")) "]")))
+     :else (json-string (str v)))))

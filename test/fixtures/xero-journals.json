@@ -1,0 +1,39 @@
+{
+  "Id": "00000000-0000-4000-8000-000000000003",
+  "Status": "OK",
+  "ProviderName": "kaikei test fixture",
+  "DateTimeUTC": "/Date(1775001600000)/",
+  "Journals": [
+    {"JournalID": "00000000-0000-4000-8000-0000000000b1", "JournalDate": "/Date(1775001600000+0000)/", "JournalNumber": 1,
+     "CreatedDateUTC": "/Date(1775001600000+0000)/", "Reference": "Owner funds introduced",
+     "SourceID": "00000000-0000-4000-8000-0000000000a1", "SourceType": "MANJOURNAL",
+     "JournalLines": [
+       {"JournalLineID": "00000000-0000-4000-8000-0000000000c1", "AccountID": "00000000-0000-4000-8000-000000000090",
+        "AccountCode": "090", "AccountType": "BANK", "AccountName": "Business Bank Account", "Description": "",
+        "NetAmount": 1000000, "GrossAmount": 1000000, "TaxAmount": 0, "TrackingCategories": []},
+       {"JournalLineID": "00000000-0000-4000-8000-0000000000c2", "AccountID": "00000000-0000-4000-8000-000000000970",
+        "AccountCode": "970", "AccountType": "EQUITY", "AccountName": "Owner A Funds Introduced", "Description": "",
+        "NetAmount": -1000000, "GrossAmount": -1000000, "TaxAmount": 0, "TrackingCategories": []}]},
+    {"JournalID": "00000000-0000-4000-8000-0000000000b2", "JournalDate": "/Date(1776211200000+0000)/", "JournalNumber": 2,
+     "CreatedDateUTC": "/Date(1776211200000+0000)/", "Reference": "INV-0001",
+     "SourceID": "00000000-0000-4000-8000-0000000000d1", "SourceType": "ACCREC",
+     "JournalLines": [
+       {"JournalLineID": "00000000-0000-4000-8000-0000000000c3", "AccountID": "00000000-0000-4000-8000-000000000610",
+        "AccountCode": "610", "AccountType": "CURRENT", "AccountName": "Accounts Receivable", "Description": "",
+        "NetAmount": 330000, "GrossAmount": 330000, "TaxAmount": 0, "TrackingCategories": []},
+       {"JournalLineID": "00000000-0000-4000-8000-0000000000c4", "AccountID": "00000000-0000-4000-8000-000000000200",
+        "AccountCode": "200", "AccountType": "REVENUE", "AccountName": "Sales", "Description": "Consulting",
+        "NetAmount": -330000, "GrossAmount": -330000, "TaxAmount": 0, "TaxType": "NONE", "TaxName": "No Tax",
+        "TrackingCategories": []}]},
+    {"JournalID": "00000000-0000-4000-8000-0000000000b3", "JournalDate": "/Date(1782777600000+0000)/", "JournalNumber": 3,
+     "CreatedDateUTC": "/Date(1782777600000+0000)/", "Reference": "Loan interest",
+     "SourceID": "00000000-0000-4000-8000-0000000000d2", "SourceType": "CASHPAID",
+     "JournalLines": [
+       {"JournalLineID": "00000000-0000-4000-8000-0000000000c5", "AccountID": "00000000-0000-4000-8000-000000000437",
+        "AccountCode": "437", "AccountType": "EXPENSE", "AccountName": "Interest Expense", "Description": "Interest",
+        "NetAmount": 2000, "GrossAmount": 2000, "TaxAmount": 0, "TrackingCategories": []},
+       {"JournalLineID": "00000000-0000-4000-8000-0000000000c6", "AccountID": "00000000-0000-4000-8000-000000000090",
+        "AccountCode": "090", "AccountType": "BANK", "AccountName": "Business Bank Account", "Description": "Interest",
+        "NetAmount": -2000, "GrossAmount": -2000, "TaxAmount": 0, "TrackingCategories": []}]}
+  ]
+}

@@ -1,0 +1,161 @@
+(ns kaikei.core-test
+  "値モデル・金額・日付・仕訳の検証・帳票（試算表・P/L・B/S）。帳票の数は
+  core/sample-import（= guest の sample-ledger）で手計算した値と照合する。"
+  (:require [cljs.test :refer [deftest is testing]]
+            [kaikei.core :as core]))
+
+(def sample-db (:db (core/merge-import core/empty-db core/sample-import)))
+
+(def fy-from 20260401)
+(def fy-to 20270331)
+
+(deftest amounts
+  (testing "10 進の文字列・数 → 最小通貨単位"
+    (is (= {:amount 123456} (core/parse-amount "1,234.56" 2)))
+    (is (= {:amount 123456} (core/parse-amount "1234.560" 2)))
+    (is (= {:amount 1230} (core/parse-amount 12.3 2)))
+    (is (= {:amount 1000000} (core/parse-amount "¥1,000,000" 0)))
+    (is (= {:amount -500} (core/parse-amount "(500)" 0)))
+    (is (= {:amount -500} (core/parse-amount "▲500" 0)))
+    (is (= {:amount -500} (core/parse-amount "-500" 0)))
+    (is (= {:amount 0} (core/parse-amount "" 0))))
+  (testing "丸めない・推測しない"
+    (is (= {:error :precision} (core/parse-amount "1234.567" 2)))
+    (is (= {:error :precision} (core/parse-amount "1.5" 0)))
+    (is (= {:error :format} (core/parse-amount "abc" 0)))
+    (is (= {:error :format} (core/parse-amount "1e5" 0)))
+    (is (= {:error :format} (core/parse-amount "(500" 0)))
+    (is (= {:error :range} (core/parse-amount "12345678901234567" 0))))
+  (testing "書き出しと表示"
+    (is (= "1234.56" (core/format-amount 123456 2)))
+    (is (= "-0.05" (core/format-amount -5 2)))
+    (is (= "0" (core/format-amount 0 0)))
+    (is (= "1,234,567" (core/display-amount 1234567 0)))
+    (is (= "-1,234.56" (core/display-amount -123456 2))))
+  (testing "通貨の桁は表にあるものだけ"
+    (is (= 0 (core/exponent "JPY")))
+    (is (= 2 (core/exponent "USD")))
+    (is (= 3 (core/exponent "KWD")))
+    (is (nil? (core/exponent "XXX")))))
+
+(deftest dates
+  (is (= "2026-04-01" (core/parse-date "2026/4/1")))
+  (is (= "2026-04-01" (core/parse-date "2026-04-01T00:00:00")))
+  (is (= "2026-04-01" (core/parse-date "20260401")))
+  (is (= "2026-04-01" (core/parse-date "R08/04/01")))
+  (is (= "2026-04-01" (core/parse-date "令和8年4月1日")))
+  (is (= "2026-04-01" (core/parse-date "/Date(1775001600000+0000)/")))
+  (is (= "2024-02-29" (core/parse-date "2024/02/29")))
+  (is (nil? (core/parse-date "2026-02-29")))
+  (is (nil? (core/parse-date "2026-13-01")))
+  (is (nil? (core/parse-date "")))
+  (is (= 20260401 (core/date-int "2026-04-01")))
+  (is (= "2026/04/01" (core/slash-date "2026-04-01"))))
+
+(deftest entry-problems
+  (let [ok {:date "2026-04-01" :lines [{:account "現金" :debit 100 :credit 0}
+                                       {:account "売上高" :debit 0 :credit 100}]}]
+    (is (= #{} (core/entry-problems ok)))
+    (is (= #{:unbalanced} (core/entry-problems (assoc-in ok [:lines 1 :credit] 90))))
+    (is (= #{:missing-account} (core/entry-problems (assoc-in ok [:lines 0 :account] ""))))
+    (is (= #{:invalid-date} (core/entry-problems (assoc ok :date "2026-02-30"))))
+    (is (= #{:empty} (core/entry-problems (assoc ok :lines []))))
+    (is (= #{:both-sides :unbalanced}
+           (core/entry-problems (assoc-in ok [:lines 0 :credit] 50))))))
+
+(deftest classification
+  (testing "既定の表"
+    (is (= :current-asset (core/account-class core/empty-db "普通預金")))
+    (is (= :unclassified (core/account-class core/empty-db "謎の科目"))))
+  (testing "取り込み元の区分は既定の表より強く、画面で付けた区分は動かない"
+    (let [db (core/ensure-account core/empty-db "普通預金" {:class :non-current-asset :class-source :vendor})]
+      (is (= :non-current-asset (core/account-class db "普通預金")))
+      (let [db (core/set-class db "普通預金" :current-asset)
+            db (core/ensure-account db "普通預金" {:class :equity :class-source :vendor})]
+        (is (= :current-asset (core/account-class db "普通預金")))))))
+
+(deftest merging
+  (is (= 10 (count (:entries sample-db))))
+  (is (= ["e1" "e2"] (take 2 (map :id (:entries sample-db)))))
+  (testing "同じ仕訳をもう一度取り込むと重複として飛ばす"
+    (let [{:keys [added duplicates db]} (core/merge-import sample-db core/sample-import)]
+      (is (= 0 added))
+      (is (= 10 duplicates))
+      (is (= 10 (count (:entries db))))))
+  (testing "通貨の違う帳簿へは合流しない"
+    (let [{:keys [error db]} (core/merge-import sample-db (assoc core/sample-import :currency "USD"))]
+      (is (string? error))
+      (is (= sample-db db))))
+  (testing ":replace は仕訳を入れ替え、画面で付けた区分だけ残す"
+    (let [db (core/set-class sample-db "謎の科目" :operating-expense)
+          {:keys [db]} (core/merge-import db {:currency "USD" :accounts [] :entries []} :replace)]
+      (is (= [] (:entries db)))
+      (is (= "USD" (:currency db)))
+      (is (= :operating-expense (core/account-class db "謎の科目"))))))
+
+(deftest trial-balance
+  (let [{:keys [rows totals]} (core/trial-balance sample-db fy-from fy-to)
+        row (fn [a] (first (filter #(= a (:account %)) rows)))]
+    (testing "B/S の科目は期首前の累計から始まる"
+      (is (= {:opening 1000000 :debit 205500 :credit 202000 :closing 1003500}
+             (select-keys (row "普通預金") [:opening :debit :credit :closing])))
+      (is (= 330000 (:closing (row "売掛金"))))
+      (is (= -1000000 (:closing (row "元入金")))))
+    (testing "P/L の科目は期間の分だけ"
+      (is (= -330000 (:closing (row "売上高")))))
+    (testing "貸借一致"
+      (is (= (:debit totals) (:credit totals)))
+      (is (= 0 (:closing totals))))
+    (testing "期首前の損益は繰越損益の行にまとまる"
+      (let [{:keys [rows totals]} (core/trial-balance sample-db 20260501 fy-to)
+            retained (first (filter :synthetic rows))]
+        (is (= -220000 (:opening retained)))
+        (is (= 0 (:closing totals)))))))
+
+(deftest profit-and-loss
+  (let [{:keys [stages sections]} (core/profit-and-loss sample-db fy-from fy-to)
+        buf (core/statement-buffer sample-db)]
+    (is (= {:gross 220000 :operating 140000 :ordinary 138500 :pre-tax 133500 :net 103500} stages))
+    (testing "段階利益は guest と同じ式（statement-buffer に profit-stage を掛けた値）"
+      (is (= (mapv #(core/profit-stage buf % fy-from fy-to) [1 2 3 4 5])
+             (mapv stages core/stage-keys))))
+    (testing "区分の合計は class-balance と一致する"
+      (doseq [{:keys [class total]} sections]
+        (is (= (core/class-balance buf (core/class-code class) fy-from fy-to) total) (str class))))))
+
+(deftest balance-sheet
+  (let [{:keys [totals retained net-income]} (core/balance-sheet sample-db fy-from fy-to)]
+    (is (= {:assets 1333500 :liabilities 230000 :equity 1103500 :difference 0} totals))
+    (is (= 0 retained))
+    (is (= 103500 net-income)))
+  (testing "期首を 5 月にしても B/S は同じ（繰越損益 + 当期純利益 = 損益の累計）"
+    (let [{:keys [totals retained net-income]} (core/balance-sheet sample-db 20260501 fy-to)]
+      (is (= 220000 retained))
+      (is (= -116500 net-income))
+      (is (= 1103500 (:equity totals)))
+      (is (= 0 (:difference totals)))))
+  (testing "期首時点の B/S"
+    (is (= {:assets 1000000 :liabilities 0 :equity 1000000 :difference 0}
+           (:totals (core/balance-sheet sample-db 20260101 20260331))))))
+
+(deftest checks
+  (is (= {:buffer-valid? true :unclassified-lines 0 :unclassified-accounts [] :invalid-entries 0
+          :bs-difference 0 :balanced? true}
+         (core/checks sample-db fy-to)))
+  (testing "未分類の科目があれば帳票は不完全"
+    (let [{:keys [db]} (core/merge-import sample-db
+                                          {:currency "JPY" :accounts []
+                                           :entries [{:date "2026-06-01"
+                                                      :lines [{:account "謎の科目" :debit 100 :credit 0}
+                                                              {:account "普通預金" :debit 0 :credit 100}]}]})
+          c (core/checks db fy-to)]
+      (is (= ["謎の科目"] (:unclassified-accounts c)))
+      (is (= 1 (:unclassified-lines c)))
+      (is (false? (:balanced? c))))))
+
+(deftest periods
+  (is (= [{:from "2026-04-01" :to "2027-03-31" :label "2026 年度（2026-04-01 〜 2027-03-31）"}
+          {:from "2025-04-01" :to "2026-03-31" :label "2025 年度（2025-04-01 〜 2026-03-31）"}]
+         (core/fiscal-years sample-db 4)))
+  (is (= ["2027 年" "2026 年"] (map :label (core/fiscal-years sample-db 1))))
+  (is (= {:from "2027-03-01" :to "2027-03-31" :label "2027 年 3 月"} (first (core/months sample-db)))))

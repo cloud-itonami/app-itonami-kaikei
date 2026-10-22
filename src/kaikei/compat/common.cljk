@@ -1,0 +1,161 @@
+(ns kaikei.compat.common
+  "各形式の adapter が共通に使う部品。
+
+  取り込みの結果は全形式で同じ形:
+
+    {:format :mf :currency \"JPY\"
+     :accounts [{:name \"普通預金\" :class :current-asset :class-source :vendor …}]
+     :entries [{:date \"2026-04-01\" :memo … :lines […] :origin {…}}]
+     :warnings [\"…\"]
+     :rejected 2}          ; 読めなかったので取り込まない仕訳の数
+
+  金額や日付を読めない仕訳は、黙って 0 や今日にせず、仕訳ごと落として
+  :warnings に理由を書く（:rejected に数える）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]))
+
+(defn blank->nil [s]
+  (when (and (some? s) (not (text/blank? (str s)))) (text/trim (str s))))
+
+(defn read-amount
+  "金額を読む。{:amount n} か {:problem \"…\"}。"
+  [x exp where]
+  (let [{:keys [amount error]} (core/parse-amount x exp)]
+    (if error
+      {:problem (str where ": 金額 \"" x "\" を読めません"
+                     (case error
+                       :precision (str "（小数の桁が通貨の桁 " exp " を超えています。丸めません）")
+                       :range "（桁が大きすぎます）"
+                       ""))}
+      {:amount amount})))
+
+(defn finish
+  "仕訳の候補（{:entry …} か {:problem …}）の列 → 取り込み結果の一部。"
+  [candidates]
+  {:entries (vec (keep :entry candidates))
+   :warnings (vec (keep :problem candidates))
+   :rejected (count (filter :problem candidates))})
+
+(defn first-problem
+  "読んだ部品の列のうち最初の {:problem …}（無ければ nil）。"
+  [parts]
+  (some #(when (:problem %) %) parts))
+
+(defn tax-code
+  "行の税区分を scheme（:mf :yayoi :freee :xero :qbo）の形式で書くときの値。
+  別の形式の税区分は写さない（写し方を推測しない）。"
+  [line scheme]
+  (when (= scheme (get-in line [:tax :scheme])) (get-in line [:tax :code])))
+
+(defn invoice-code [line scheme]
+  (when (= scheme (get-in line [:invoice :scheme])) (get-in line [:invoice :code])))
+
+(defn lossy-note
+  "書き出しで落ちる項目の注記。fields は {:sub-account \"補助科目\" …}。"
+  [db scheme fields]
+  (let [lines (for [e (:entries db), l (:lines e)] l)
+        dropped (for [[k label] fields
+                      :let [n (count (filter (fn [l]
+                                               (case k
+                                                 :tax (and (:tax l) (not= scheme (get-in l [:tax :scheme])))
+                                                 :invoice (and (:invoice l) (not= scheme (get-in l [:invoice :scheme])))
+                                                 (some? (get l k))))
+                                             lines))]
+                      :when (pos? n)]
+                  (str label " " n " 行"))]
+    (when (seq dropped)
+      (str "この形式には受け皿が無いので書き出していない項目: " (text/join "、" dropped)))))
+
+(defn pair-rows
+  "仕訳 → [借方の行 貸方の行] の組の列。日本の仕訳帳 CSV は 1 行に借方と
+  貸方を 1 つずつ持つので、借方の行と貸方の行を出現順に組にする（足りない
+  側は nil）。"
+  [entry]
+  (let [debits (filterv #(pos? (:debit % 0)) (:lines entry))
+        credits (filterv #(pos? (:credit % 0)) (:lines entry))
+        others (filterv #(and (not (pos? (:debit % 0))) (not (pos? (:credit % 0)))) (:lines entry))
+        n (max (count debits) (count credits))]
+    (concat (for [i (range n)] [(get debits i) (get credits i)])
+            ;; 0 円の行（検証で弾かれる形）も落とさずに借方側へ書く
+            (for [l others] [l nil]))))
+
+(defn generate-codes
+  "コードの無い勘定科目に、区分ごとの番号（区分コード × 100 + 連番。未分類は
+  9900 台）を振る。既にあるコードとは重ねない。戻りは {名前 コード} と、
+  振った数。"
+  [db names existing-code]
+  (let [taken (atom (set (keep existing-code names)))
+        counters (atom {})
+        assigned (into {}
+                       (for [n names
+                             :let [c (existing-code n)]]
+                         [n (or c
+                                (let [k (core/class-code (core/account-class db n))]
+                                  (loop []
+                                    (let [i (inc (get @counters k 0))
+                                          code (str (+ (* (if (zero? k) 99 k) 100) i))]
+                                      (swap! counters assoc k i)
+                                      (if (contains? @taken code)
+                                        (recur)
+                                        (do (swap! taken conj code) code))))))]))]
+    {:codes assigned
+     :generated (count (remove existing-code names))}))
+
+;; ───────── 地域で並びの変わる日付（QBO・Xero の CSV） ─────────
+
+(def date-orders
+  "日付の並び。QBO・Xero の CSV は利用者の地域で変わる（Xero の英国版は
+  dd/mm/yyyy・dd mmm yyyy、米国版は mm/dd/yyyy・mmm dd yyyy）。"
+  ["ymd" "mdy" "dmy"])
+
+(def ^:private month-names
+  {"jan" 1 "feb" 2 "mar" 3 "apr" 4 "may" 5 "jun" 6 "jul" 7 "aug" 8 "sep" 9 "oct" 10 "nov" 11 "dec" 12})
+
+(defn- iso [y m d] (core/parse-date (str y "-" m "-" d)))
+
+(defn parse-ordered-date
+  "日付の文字列 → \"YYYY-MM-DD\"（読めなければ nil）。4 桁の年が先頭なら並びに
+  関係なく年月日。月名（Jun・June）があれば並びは月名の位置で決まる。数だけの
+  ときは order（\"mdy\" か \"dmy\"）に従う。"
+  [s order]
+  (when-let [s (blank->nil s)]
+    (or (core/parse-date s)
+        (when-let [[_ d mon y] (text/re-matches #"(\d{1,2})[\s-]([A-Za-z]{3,9})\.?,?[\s-](\d{4})" s)]
+          (when-let [m (month-names (text/lower (subs mon 0 3)))] (iso y m d)))
+        (when-let [[_ mon d y] (text/re-matches #"([A-Za-z]{3,9})\.?\s(\d{1,2}),?\s(\d{4})" s)]
+          (when-let [m (month-names (text/lower (subs mon 0 3)))] (iso y m d)))
+        (when-let [[_ a b y] (text/re-matches #"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})" s)]
+          (case order
+            "mdy" (iso y a b)
+            "dmy" (iso y b a)
+            nil)))))
+
+(defn detect-date-order
+  "数だけの日付の列から並びを推す。最初の数が 12 を超える日付があれば dmy、
+  2 番目が 12 を超えれば mdy。どちらも無ければ nil（判定できない）。"
+  [strings]
+  (let [pairs (keep #(when-let [[_ a b] (text/re-matches #"\s*(\d{1,2})[/.-](\d{1,2})[/.-]\d{4}\s*" (str %))]
+                       [(parse-long a) (parse-long b)])
+                    strings)]
+    (cond
+      (some #(> (first %) 12) pairs) "dmy"
+      (some #(> (second %) 12) pairs) "mdy"
+      :else nil)))
+
+(defn format-ordered-date
+  "\"YYYY-MM-DD\" → order の並びの文字列（\"mdy\" は 06/30/2026、\"dmy\" は
+  30/06/2026、\"ymd\" はそのまま）。"
+  [date order]
+  (let [[y m d] (text/split date #"-")]
+    (case order
+      "mdy" (str m "/" d "/" y)
+      "dmy" (str d "/" m "/" y)
+      date)))
+
+(defn month-name-date
+  "\"YYYY-MM-DD\" → \"31 March 2027\"（Xero の帳票の ReportDate の形）。"
+  [date]
+  (let [[y m d] (text/split date #"-")
+        full ["January" "February" "March" "April" "May" "June" "July" "August" "September"
+              "October" "November" "December"]]
+    (str (parse-long d) " " (nth full (dec (parse-long m))) " " y)))

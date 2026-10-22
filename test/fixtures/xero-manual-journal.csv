@@ -1,0 +1,5 @@
+*Narration,*Date,Description,*AccountCode,*TaxRate,*Amount,TrackingName1,TrackingOption1,TrackingName2,TrackingOption2
+Opening balance,01/04/2026,Bank,090,No VAT,5000.00,,,,
+,,Owner funds,970,No VAT,-5000.00,,,,
+Accrued rent for April,30/04/2026,Rent,469,No VAT,1200.00,Region,North,,
+,,Accrued rent,820,No VAT,-1200.00,,,,

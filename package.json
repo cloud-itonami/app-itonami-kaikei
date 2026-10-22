@@ -1,0 +1,16 @@
+{
+  "name": "kaikei",
+  "version": "0.2.0",
+  "private": true,
+  "license": "SEE LICENSE IN NOTICE",
+  "description": "kaikei — MoneyForward・freee・弥生・QuickBooks Online・Xero 互換の会計帳簿 itonami dapp（ブラウザ内完結）",
+  "scripts": {
+    "test": "kbb --backend sci --classpath src:test:../../kotoba-lang/text/src test/run_tests.cljk",
+    "check:guest": "../../kotoba-lang/amu/bin/amu check aiueos/kaikei_journal.cljk",
+    "test:guest": "../../kotoba-lang/amu/bin/amu test aiueos/kaikei_journal.cljk --fuel 4096",
+    "build:guest": "../../kotoba-lang/amu/bin/amu compile aiueos/kaikei_journal.cljk --target wasm32-browser --policy aiueos/kaikei_journal.policy.edn --output aiueos/kaikei_journal.wasm",
+    "test:guest-parity": "node test/guest_parity.mjs ../../kotoba-lang/amu/runtime/browser-host.mjs",
+    "build:site": "kbb --backend sci --classpath src:site:../../kotoba-lang/text/src:../../kotoba-lang/jp-go-digital-design-system/src:../../kotoba-lang/html/src:../../kotoba-lang/css/src scripts/build-site.cljk",
+    "mcp": "kbb bin/kaikei-mcp"
+  }
+}

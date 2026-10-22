@@ -1,0 +1,109 @@
+(ns kaikei.encoding
+  "文字コード — バイト列と文字列の変換。日本の会計ソフトの CSV は Shift_JIS
+  が多い（弥生インポート形式は Shift_JIS）。
+
+  - **読み**: BOM があれば UTF-8。BOM が無ければ UTF-8 として厳密に読んで
+    みて、壊れていれば Shift_JIS（WHATWG の Shift_JIS デコーダ、
+    `TextDecoder(\"shift_jis\")`）。
+  - **書き**: UTF-8 は `TextEncoder`。Shift_JIS は `TextEncoder` に無いので、
+    同じホストの Shift_JIS デコーダを全 2 バイト符号に掛けて逆引きの表を作る。
+    表の作り方は WHATWG Encoding Standard の Shift_JIS エンコーダと同じ規則:
+    最初に現れる符号を採り、NEC 選定 IBM 拡張（先頭バイト 0xED・0xEE、
+    pointer 8272〜8835）は使わない。U+00A5 → 0x5C、U+203E → 0x7E、
+    U+2212 → U+FF0D として引く。表に無い文字は置き換えずに
+    {:error :unmappable} で返す（帳簿の文字を黙って ? にしない）。
+
+  表は外から持ち込まない（取得もしない）—— 使うホストのデコーダから作る。"
+  (:require [kotoba.lang.text :as text]))
+
+(def encodings ["utf-8" "utf-8-bom" "shift_jis"])
+
+(defn bytes-length [b] #?(:cljs (.-length b) :clj (count b)))
+
+(defn decode
+  "バイト列（Uint8Array）→ {:text :encoding}。encoding を渡せばそれで読む。"
+  ([b] (decode b nil))
+  ([b encoding]
+   #?(:cljs
+      (let [bom? (and (>= (.-length b) 3) (= 0xEF (aget b 0)) (= 0xBB (aget b 1)) (= 0xBF (aget b 2)))
+            utf8 (fn [] (try (.decode (js/TextDecoder. "utf-8" #js {:fatal true}) b)
+                             (catch :default _ nil)))]
+        (cond
+          (= encoding "shift_jis") {:text (.decode (js/TextDecoder. "shift_jis") b) :encoding "shift_jis"}
+          (#{"utf-8" "utf-8-bom"} encoding) {:text (.decode (js/TextDecoder. "utf-8") b) :encoding "utf-8"}
+          bom? {:text (.decode (js/TextDecoder. "utf-8") b) :encoding "utf-8"}
+          :else (if-let [t (utf8)]
+                  {:text t :encoding "utf-8"}
+                  {:text (.decode (js/TextDecoder. "shift_jis") b) :encoding "shift_jis"})))
+      :clj (throw (ex-info "バイト列の解読はホストの TextDecoder が担う" {})))))
+
+#?(:cljs
+   (def ^:private sjis-table
+     (delay
+       (let [pairs (into [] (for [lead (concat (range 0x81 0xA0) (range 0xE0 0xFD))
+                                  :when (not (#{0xED 0xEE} lead))
+                                  trail (concat (range 0x40 0x7F) (range 0x80 0xFD))]
+                              [lead trail]))
+             n (count pairs)
+             buf (js/Uint8Array. (* 3 n))]
+         (dotimes [i n]
+           (let [[lead trail] (nth pairs i)]
+             (aset buf (* 3 i) lead)
+             (aset buf (+ (* 3 i) 1) trail)
+             (aset buf (+ (* 3 i) 2) 10)))
+         ;; 1 組ずつ \n で区切ってまとめて解読する。符号の無い組は U+FFFD（と、
+         ;; 2 バイト目が ASCII ならその文字）になるので、1 文字で U+FFFD でない
+         ;; ものだけを採る。
+         (let [parts (.split (.decode (js/TextDecoder. "shift_jis") buf) "\n")
+               table (js/Map.)]
+           (dotimes [i n]
+             (let [p (aget parts i)]
+               (when (and (= 1 (.-length p)) (not= p "�") (not (.has table p)))
+                 (.set table p (nth pairs i)))))
+           table)))))
+
+(defn- encode-sjis [s]
+  #?(:cljs
+     (let [table @sjis-table
+           out (js/Array.)
+           bad (js/Array.)]
+       ;; Array.from は符号位置ごとに分ける（サロゲート対を 1 文字として報告する）。
+       (doseq [ch (array-seq (js/Array.from s))]
+         (let [c (.charCodeAt ch 0)]
+           (cond
+             (< c 0x80) (.push out c)
+             (= c 0xA5) (.push out 0x5C)
+             (= c 0x203E) (.push out 0x7E)
+             (<= 0xFF61 c 0xFF9F) (.push out (+ (- c 0xFF61) 0xA1))
+             :else (if-let [[lead trail] (.get table (if (= c 0x2212) "－" ch))]
+                     (do (.push out lead) (.push out trail))
+                     (.push bad ch)))))
+       (if (pos? (.-length bad))
+         {:error :unmappable :chars (vec (distinct (array-seq bad)))}
+         {:bytes (js/Uint8Array.from out)}))
+     :clj (throw (ex-info "Shift_JIS の符号化はホストの TextDecoder から作る表が担う" {}))))
+
+(defn encode
+  "文字列 → {:bytes Uint8Array} か {:error :unmappable :chars [...]}。"
+  [s encoding]
+  #?(:cljs
+     (case encoding
+       "shift_jis" (encode-sjis s)
+       "utf-8-bom" {:bytes (.encode (js/TextEncoder.) (str "﻿" s))}
+       {:bytes (.encode (js/TextEncoder.) s)})
+     :clj (throw (ex-info "符号化はホストが担う" {}))))
+
+(defn base64->bytes
+  "base64 文字列 → Uint8Array。読めなければ例外。"
+  [s]
+  #?(:cljs (let [bin (js/atob (text/replace (str s) #"\s" ""))
+                 b (js/Uint8Array. (.-length bin))]
+             (dotimes [i (.-length bin)] (aset b i (.charCodeAt bin i)))
+             b)
+     :clj (throw (ex-info "base64 の解読はホストが担う" {}))))
+
+(defn bytes->base64 [b]
+  #?(:cljs (let [chunk 32768]
+             (js/btoa (apply str (for [i (range 0 (.-length b) chunk)]
+                                   (.apply (.-fromCharCode js/String) nil (.subarray b i (+ i chunk)))))))
+     :clj (throw (ex-info "base64 の符号化はホストが担う" {}))))
