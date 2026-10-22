@@ -1,8 +1,9 @@
 # kaikei 会計 dapp — aiueos 上の分散型設計（itonami agent 前提）
 
 状態: 設計 + 第 1 スライス（2026-10-19、判断コア guest）+ 第 2 スライス
-（2026-10-22、5 社の形式・帳票・画面・MCP）。正本はこの文書。
-追跡: Linear JUN-115（第 1）、JUN-304（第 2）。
+（2026-10-22、5 社の形式・帳票・画面・MCP）+ 第 3 スライス（2026-10-22、請求書）。
+正本はこの文書。
+追跡: Linear JUN-115（第 1）、JUN-304（第 2）、JUN-321（第 3）。
 
 ## 目標
 
@@ -19,13 +20,14 @@ Object / KV を状態置き場にしない）。
 
 | 層 | 実体 | 状態 |
 |---|---|---|
-| 判断コア（guest） | `aiueos/kaikei_journal.cljk` — 仕訳の検証 / 帳簿の貸借一致 / 区分・期間の純額・段階利益・B/S の照合。`:effects #{}` の pure 計算 | **実装済み・実測**（下記） |
+| 判断コア（guest） | `aiueos/kaikei_journal.cljk` — 仕訳の検証 / 帳簿の貸借一致 / 区分・期間の純額・段階利益・B/S の照合 / 請求書の税率ごとの税額（1 請求書・税率ごとに 1 回の端数処理）・登録番号の形・経過措置の控除割合。`:effects #{}` の pure 計算 | **実装済み・実測**（下記） |
 | アプリ記述子 | `aiueos/kaikei.edn`（`examples/apps/notes.edn` 形、`:aiueos/kind :app`） | **実装済み**。aiueos session/grant への配線は未実装 |
 | adapter | `src/kaikei/core.cljk` — guest と同名・同結果の判定 + 値モデル（帳簿・勘定科目・区分）+ 試算表・P/L・B/S | **実装済み・実測**（kbb、parity 表） |
-| 形式 | `src/kaikei/ingest.cljk`・`export.cljk`・`compat/{native,xero,qbo,yayoi,mf,freee}.cljk`・`encoding.cljk`（Shift_JIS） | **実装済み・実測**（第 2 スライスの節） |
+| 形式 | `src/kaikei/ingest.cljk`・`export.cljk`・`compat/{native,xero,qbo,yayoi,mf,freee}.cljk`・`encoding.cljk`（Shift_JIS）、請求書は `compat/{xero,qbo}_invoices.cljk` | **実装済み・実測**（第 2・第 3 スライスの節） |
+| 請求書 | `src/kaikei/invoice.cljk` — 値モデル・税率ごとの合計・適格請求書の記載事項の検査・売掛／買掛の仕訳の計上 | **実装済み・実測**（第 3 スライスの節） |
 | 画面 | `src/kaikei/view.cljk`（純 hiccup）+ `site/app.cljk`（Re-frame / Reagent、scittle）+ `site/kaikei/page.cljk`（SSR の殻、DADS） | **実装済み・ブラウザで実測** |
 | 状態 | IndexedDB（`itonami.kaikei` の `state`）。使えなければ localStorage。1 ブラウザに閉じる | **実装済み** |
-| agent 統合（MCP） | `bin/kaikei-mcp` + `src/kaikei/mcp.cljk` — stdio MCP、tool 5 つ。pure | **実装済み・実測** |
+| agent 統合（MCP） | `bin/kaikei-mcp` + `src/kaikei/mcp.cljk` — stdio MCP、tool 8 つ。pure | **実装済み・実測** |
 | 旧 appview adapter | `appview/.../cljs/src/kaikei/journal.cljk` — 第 1 スライスの map API（正本は `src/kaikei/core.cljk`） | 旧 SPA のビルドの再配線を決めるまで残す |
 | 分散状態 | 仕訳は署名済み topic エンベロープ（`aiueos.network-topic` v1）で複製。永続は AT Protocol MST + IPFS、参照を Base L2 に anchor | **未実装**（設計のみ） |
 | 決済 | USDC on Base L2 + ERC-4337 + TitheRouter 10% split（MIGRATION-TODO の codemod 方向） | **未実装**（MIGRATION-TODO の正本どおり） |
@@ -250,8 +252,144 @@ amu は `kotoba-lang/amu` 74ca4aa6 の `bin/amu`。kbb の `kotoba-lang/text` �
 
 ### 次の一手（第 2 スライスの後）
 
-1. 公開（network-awai/cloud-itonami の sites.edn、app org）と登録（itonami-registry の `mcp/kaikei`）。
-2. 第 3 スライス: 請求書（QBO・Xero の Invoice、Zoho Invoice・FreshBooks、freee／MF、適格請求書）。
+1. 公開（network-awai/cloud-itonami の sites.edn、app org）と登録（itonami-registry の `mcp/kaikei`）。→ 済み（JUN-304）
+2. 第 3 スライス: 請求書（QBO・Xero の Invoice、Zoho Invoice・FreshBooks、freee／MF、適格請求書）。→ 下の節（JUN-321）
 3. 第 4 スライス: 明細・経費・AP（CSV／OFX、Ramp・Expensify・Brex、BILL）と仕訳候補。
 4. QBO の Journal／General Ledger の帳票の形を固定して、帳簿の全体を読む。
 5. ブラウザの判定を wasm guest に寄せる（parity 表はそのまま回帰テストになる）。
+
+
+## 第 3 スライス（2026-10-22、Linear JUN-321）
+
+請求書を、ブラウザの中だけで作り・取り込み・書き出し、適格請求書の記載事項を検査して、
+売掛金・買掛金の仕訳として計上する。設計の承認はオーナー（2026-10-22）:
+
+- 画面で作る・直す・印刷するまで入れる（送付はしない）。
+- 入金・支払の消込は第 4 スライス（明細の取り込みと照合）に回す。第 3 では取り込み元の
+  入金済み・未回収の額を表示するだけ。
+- Zoho Invoice と FreshBooks は読むだけ。
+
+国税庁の登録番号の照会（公表サイトの Web-API）、メールでの送付、Peppol は外部
+operation で、共通ブローカー（`kotoba-lang/wasm-webcomponent/src/kotoba-client-runtime.js`、
+未着地）が要るので行わない。
+
+### 値モデル
+
+db に `:invoices`・`:business`（自社の名称・登録番号）・`:invoice-settings`（経理方式・
+端数処理の既定・科目）を足した。kaikei.ledger.v1 には任意のキー（`invoices`・`business`・
+`invoice_settings`）として入り、版は v1 のまま。形は `src/kaikei/invoice.cljk` の docstring。
+
+- 金額は最小通貨単位の整数。数量と単価は 10 進の文字列のまま持つ（表示と往復のため）。
+- 税率は basis points（1000 = 10%）。免税・非課税・不課税は税率 0 で `:category` が区別する。
+  8% の軽減と 8% の標準は、税率の数が同じでも区分が違うので別に丸める。
+- `:stated` は取り込み元が書いていた税率ごとの税額。仕訳には書かれた額を使う（請求書は
+  発行したとおりに記帳する）。売上の請求書で kaikei の計算と違えば検査で知らせる。
+- 取り込みでは、書かれた税額を再現する端数処理の向き（切捨て → 四捨五入 → 切上げ）を
+  請求書ごとに選ぶ（向きは任意。国税庁 Q&A 問 57）。どれでも再現できなければ差を出す。
+
+### 数の規則（guest）
+
+`[rate amount] × n` の buffer に、`rate-base` `rate-tax` `invoice-tax` `invoice-total`
+`rate-net` `tax-share` `invoice-buffer-valid?` `registration-format?` `deduction-percent`
+を足した（式は guest の docstring）。
+
+- 税率ごとの消費税額は、税率ごとに合計した対価に 1 回だけ掛けて丸める。税抜は
+  合計 × rate / 10000、税込は 合計 × rate / (10000 + rate)（消費税法施行令 70 条の 10、
+  基通 1-8-15）。
+- `tax-share` は行への割り当て: 他の行は行の税額を切り捨て、差は同じ税率でいちばん
+  大きい行（同額なら上の行）が持つ。freee が取引を起こすときと同じ規則（freee ヘルプ
+  23500770784153）。仕訳を科目ごとに分けるときと、Xero の `LineItem.TaxAmount` に書く
+  ときに使う。
+- 掛け算は base = a·d + b に分けて a·rate + R(b·rate / d) とし、guest の i64 と adapter の
+  JS の数（2^53 まで正確）で同じ値にする（9×10^14 の行で確かめた）。
+- `registration-format?` は「T」＋数字 13 桁（国税庁 Q&A 問 18、公表サイトのリソース
+  定義書）。全角→半角と T の後の「-」の除去は adapter が先に行う。法人番号の検査用数字は
+  使わない（個人事業者の登録番号に当てはまるという一次資料が無く、公表サイトの Web-API も
+  形しか検査しない）。
+- `deduction-percent` は仕入税額控除の割合: 適格なら 100、そうでなければ経過措置
+  （国税庁 Q&A 問 113、令和 8 年 5 月改訂）で 2026-09-30 まで 80、2028-09-30 まで 70、
+  2030-09-30 まで 50、2031-09-30 まで 30、以降 0。
+
+### 適格請求書の検査
+
+法 57 条の 4 ①の 6 項目（発行者の名称と登録番号、取引年月日、内容と軽減税率の旨、
+税率ごとの対価と適用税率、税率ごとの消費税額、受け取る事業者の名称）の欠けを、請求書
+ごとに「要確認」として出す。売上の請求書は自社が発行者、受け取った請求書は取引先が
+発行者。適格請求書であることは保証しない。登録番号の無い受け取った請求書には、経過措置の
+割合を表示する（控除できない分の振替はしない）。
+
+### 計上
+
+画面の「帳簿に計上」・MCP の `kaikei_invoice_post` で仕訳を起こす。取り込んだだけでは
+起こさない（Xero の Journals を取り込んだ帳簿には、請求書の仕訳がもう入っているため）。
+
+- 税抜経理（既定）: 売上は 借 売掛金 ／ 貸 科目・税率ごとの税抜 ／ 貸 仮受消費税（税率
+  ごと）。仕入は左右が逆で仮払消費税と買掛金。税込の請求書の税抜は、行の税込から
+  `tax-share` を引いたもの。税込経理では税の行を起こさない。
+- 仕訳の origin は `{:format :invoice :invoice-id …}`。計上したかはこの仕訳があるかで
+  決まる。取消にすると仕訳を消し、直すと計上し直す。
+- 同じ請求書の仕訳が帳簿にあれば計上しない（Xero の Journals の SourceID を origin に
+  残すようにした）。源泉徴収のある請求書は計上しない。
+- 生成した仕訳を MF・freee・弥生に書き出すときは、全行の税区分を「対象外」と書いて
+  注記する。消費税はもう仮受・仮払の行に分けてあり、税区分を空にすると取り込み先が科目の
+  既定の税区分で税を計算し直して二重になるため。
+
+### 形式（請求書）
+
+| id | 形式 | 読み | 書き | 形の正本（2026-10-22 に確認） |
+|---|---|---|---|---|
+| `kaikei-json` | kaikei.ledger.v1（invoices・business・invoice_settings を含む） | ○ | ○ | kaikei |
+| `xero-invoices-json` | Xero の Invoices（ACCREC・ACCPAY）。TaxRates・Accounts が同じ JSON にあれば引く | ○ | ○ | XeroAPI/Xero-OpenAPI `5a115f3`（Invoice L22386、LineItem L20731、TaxRate L25200）、Xero developer docs（invoices、Rounding in Xero） |
+| `qbo-invoices-json` | QuickBooks Online の Invoice・Bill（query の応答） | ○ | ○ | intuit/QuickBooks-V3-Java-SDK `c4d5dfa`（Finance.xsd の Invoice L5803、Bill L9498、TxnTaxDetail L5094）、Intuit developer docs（invoice、bill、sales tax） |
+
+- **Xero**: 行ごとに 2 桁で丸めて足す（「Rounding in Xero」）ので、取り込んだ売上の請求書は
+  日本の規則と差が出ることがある。`TaxType` は組織ごとのコードで、税率は `TaxRates` の
+  `EffectiveRate` にある。書き出しでは Xero から来ていない行に kaikei の仮のコード
+  （`KAIKEI-10`・`KAIKEI-8-REDUCED`・`KAIKEI-EXEMPT` など）を書いて `TaxRates` を添える
+  （読み戻すと同じ税率に戻る。Xero に入れる前に組織の TaxType に置き換える）。
+  `TaxAmount` には `tax-share` の額を書く。DRAFT・SUBMITTED は下書き、AUTHORISED は発行済み、
+  PAID は入金・支払済み、VOIDED・DELETED は取消。支払済みは AUTHORISED と書く（支払いは
+  Xero で別に登録する）。クレジットノート・前受・過払いと、帳簿と違う通貨の請求書は数えて飛ばす。
+- **QBO**: 税は `TxnTaxDetail.TaxLine` が税率ごとに持つ（課税の行の合計に掛ける）。行の税率は、
+  同じ `TaxCodeRef` の行の合計が `NetAmountTaxable` と一致する TaxLine から決める（推測は
+  しない）。1 つの税コードに TaxLine が 2 つ以上当たる請求書（米国の税のグループ）は飛ばす。
+  `TaxInclusive` でも `Line.Amount` は税抜で、すべての課税の行に `TaxInclusiveAmt` があれば
+  税込で読む。取消は金額 0 で `PrivateNote` が Voided で始まるもの。書き出しの
+  `TaxCodeRef` は QBO から来た行だけ value を持ち、どの行にも name（「10%」「8%（軽減）」）を書く。
+- **登録番号**の受け皿は QBO・Xero の形に無い（kaikei-json だけが持つ）。
+
+### 未確認のまま実装したもの
+
+- Xero の丸めの向き（「rounding to two decimal places」としか書かれていない）と、数が
+  文字列で来る文書の例。
+- QBO の売上の税が入る勘定と、取消の Bill の形（取消の操作が文書に無い）。
+- QBO の `TxnStatus` の Draft が請求書の応答に現れるか（書き出しの下書きはこれで表す）。
+
+### 実測（2026-10-22）
+
+- **guest**
+  - `amu check aiueos/kaikei_journal.cljk` → `:ok true`, `:effects #{}`。
+  - `amu test aiueos/kaikei_journal.cljk --fuel 4096` → **84/84 passed**（test 28 本 × `[:jvm-kir :js :wasm]`）。
+    期待値を 1 つ変えた写し（`tax-share` の 211 → 212）は 81/84 FAILED で、3 target とも落ちる。
+  - `amu compile … --policy aiueos/kaikei_journal.policy.edn` → 16,412 bytes（sha256 `fefc27ec…d003`）。
+    別の出力先にもう一度作って同じ sha256。
+  - **wasm parity**: `node test/guest_parity.mjs` → **110/110 rows match**（第 2 スライスの 52 行 + 請求書の 58 行）。
+  - 例の出所: 国税庁 Q&A 問 57（税込 60,000・40,000 → 5,454 + 2,962）、freee ヘルプの配分
+    （426・2,100・1,885・220 → 463、2,100 の行が 211）、Xero の「Rounding in Xero」（行ごと 11.44、
+    税率ごと 11.45）。
+- **adapter・形式・画面・MCP**: `npm test`（kbb）→ **76 tests, 759 assertions, 0 failures**。
+- **MCP**: `bin/kaikei-mcp` を `/` から起こし、`kaikei_invoice_totals` が Q&A 問 57 の 8,416 を返す。
+- **ブラウザ**（built-in browser、ローカルの静的サーバ、`scripts/build-site.cljk` の公開物）:
+  - サンプル → 検査の欄に「未計上 2 件」「記載事項の欠け 1 件」→ 請求書の詳細（6 項目）→ 計上 →
+    印刷（`window.print` を差し替えて呼び出しを確かめ、印刷用の CSS を画面に当てて請求書だけが
+    残ることを見た）→ 新しい請求書を作る（10% 30,000・8%（軽減）1,620 → 消費税 3,129、合計 34,749）→
+    保存 → 未計上をすべて計上 → 試算表で 売掛金 424,069・仮受消費税 8,449・仮払消費税 330、貸借一致。
+  - 再読み込みで IndexedDB から請求書 4 件・仕訳 13 件・自社の設定が戻る。
+  - Xero・QBO の請求書 JSON・kaikei-json・MF の書き出しを Blob で受け、Xero の JSON を取り込み直すと
+    4 件とも同じ請求書として飛ばされる。
+  - 375px 幅で 10 の画面（帳票 5・請求書の一覧・詳細・編集・設定・取り込み）とも横スクロールなし。
+  - network は 127.0.0.1 だけ（https の要求は 0）。console のエラーは調べるために打った式のものだけ。
+  - built-in browser の pane が隠れていると `requestAnimationFrame` が止まり、再読み込みの後の描画が
+    進まない（第 2 スライスの「測れなかったもの」と同じ原因）。描画の確認は、`requestAnimationFrame` を
+    setTimeout に差し替える 1 行を先頭に入れた調べる用の写し（公開物には入れない）で行った。
+

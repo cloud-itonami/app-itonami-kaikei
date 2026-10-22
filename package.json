@@ -1,9 +1,9 @@
 {
   "name": "kaikei",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "license": "SEE LICENSE IN NOTICE",
-  "description": "kaikei — MoneyForward・freee・弥生・QuickBooks Online・Xero 互換の会計帳簿 itonami dapp（ブラウザ内完結）",
+  "description": "kaikei — MoneyForward・freee・弥生・QuickBooks Online・Xero 互換の会計帳簿と請求書の itonami dapp（ブラウザ内完結）",
   "scripts": {
     "test": "kbb --backend sci --classpath src:test:../../kotoba-lang/text/src test/run_tests.cljk",
     "check:guest": "../../kotoba-lang/amu/bin/amu check aiueos/kaikei_journal.cljk",

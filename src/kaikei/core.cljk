@@ -612,21 +612,26 @@
 
 (defn- merge-invoices
   "請求書を合流する。戻りは [db 元の id → 帳簿の id の表 追加した数 重複の数]。
-  id は used（入れ替える前の請求書も含めて、使ったことのある id）の次から振る
-  —— 入れ替えた請求書の id を使い回すと、残った仕訳の :invoice-id が別の請求書を
-  指してしまうため。"
+  取り込み元の id（i1, i2, …）は、帳簿で使われていなければ保つ（MCP の tool の間で
+  帳簿 JSON を受け渡しても id が変わらないように）。使われていれば、used（入れ替える
+  前の請求書も含めて、使ったことのある id）と取り込み元の id のどれよりも大きい
+  番号を振る —— 入れ替えた請求書の id を使い回すと、残った仕訳の :invoice-id が
+  別の請求書を指してしまうため。"
   [db invoices used]
-  (let [first-id (inc (reduce max 0 (map invoice-number (concat (:invoices db) used))))
-        [d m added dup _]
-        (reduce (fn [[d m added dup seen] inv]
+  (let [own-id (fn [inv] (when (some->> (:id inv) str (text/re-matches #"i\d+")) (:id inv)))
+        taken (set (concat (keep :id (:invoices db)) (keep :id used)))
+        counter (atom (reduce max 0 (map invoice-number (concat (:invoices db) used invoices))))
+        fresh! (fn [] (str "i" (swap! counter inc)))
+        [d m added dup _ _]
+        (reduce (fn [[d m added dup seen taken] inv]
                   (let [fp (invoice-fingerprint inv)
                         remember (fn [m id] (if (:id inv) (assoc m (:id inv) id) m))]
                     (if-let [id (seen fp)]
-                      [d (remember m id) added (inc dup) seen]
-                      (let [id (str "i" (+ first-id added))]
+                      [d (remember m id) added (inc dup) seen taken]
+                      (let [id (let [own (own-id inv)] (if (and own (not (taken own))) own (fresh!)))]
                         [(update d :invoices (fnil conj []) (assoc inv :id id))
-                         (remember m id) (inc added) dup (assoc seen fp id)]))))
-                [db {} 0 0 (into {} (map (juxt invoice-fingerprint :id) (:invoices db)))]
+                         (remember m id) (inc added) dup (assoc seen fp id) (conj taken id)]))))
+                [db {} 0 0 (into {} (map (juxt invoice-fingerprint :id) (:invoices db))) taken]
                 invoices)]
     [d m added dup]))
 

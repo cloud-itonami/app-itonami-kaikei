@@ -20,6 +20,7 @@
             [kaikei.core :as core]
             [kaikei.ingest :as ingest]
             [kaikei.export :as export]
+            [kaikei.invoice :as invoice]
             [kaikei.view :as view]))
 
 (def storage-key "itonami.kaikei.v1")
@@ -101,6 +102,20 @@
      (-> (.arrayBuffer file)
          (.then (fn [buf] (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file)])))))))
 
+(rf/reg-fx
+ ::print
+ (fn [_]
+   ;; 印刷用の CSS（kaikei.page/app-css の @media print）が請求書だけを残す。
+   ;; 送信はしない（ブラウザの印刷ダイアログで PDF にもできる）。
+   (js/setTimeout #(.print js/window) 0)))
+
+(defn- today
+  "この端末の今日（\"YYYY-MM-DD\"）。新しい請求書の取引年月日の既定値。"
+  []
+  (let [d (js/Date.)]
+    (str (.getFullYear d) "-" (text/pad-left (str (inc (.getMonth d))) 2 "0") "-"
+         (text/pad-left (str (.getDate d)) 2 "0"))))
+
 ;; ───────── events ─────────
 
 (defn- saved-state [db]
@@ -133,7 +148,8 @@
          (or (not= (:data db) (:data db'))
              (not= (saved-state db) (saved-state db')))
          (assoc ::store {:backend (:backend db')
-                         :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db'))))
+                         :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db')))
+                                          (seq (:invoices (:data db'))) (seq (:business (:data db'))))
                                   (saved-state db'))}))))))
 
 (defn- reg-ui-event [id f]
@@ -177,13 +193,14 @@
 
 (defn- import-into [db result]
   (let [mode (if (= "replace" (get-in db [:ui :import-mode])) :replace :append)
-        {data :db :keys [added duplicates error]} (core/merge-import (:data db) result mode)]
+        {data :db :keys [added duplicates error] :as merged} (core/merge-import (:data db) result mode)]
     (-> db
         (assoc :data data)
         (update :ui assoc
-                :import-result (merge (select-keys result [:format :encoding :rejected :warnings])
-                                      {:added added :duplicates duplicates :error error})
-                :import-open? (zero? (or added 0))
+                :import-result (merge (select-keys result [:format :encoding :rejected :warnings :invoices-rejected])
+                                      {:added added :duplicates duplicates :error error}
+                                      (select-keys merged [:invoices-added :invoices-duplicates :invoices-dropped]))
+                :import-open? (zero? (+ (or added 0) (or (:invoices-added merged) 0)))
                 :period nil
                 :journal-page 0))))
 
@@ -227,6 +244,93 @@
                                (cond-> {} (:export-encoding ui) (assoc :encoding (:export-encoding ui))))]
      (cond-> {:db (assoc-in db [:ui :export-result] (select-keys result [:error :notes :filename]))}
        (:bytes result) (assoc ::download (select-keys result [:filename :mime :bytes]))))))
+
+;; ───────── 請求書（第 3 スライス、JUN-321） ─────────
+
+(defn- exp-of [db] (core/exponent (get-in db [:data :currency])))
+
+(reg-ui-event :set-invoice-kind (fn [db [_ k]] (update db :ui assoc :invoice-kind k :invoice nil)))
+(reg-ui-event :set-invoice-filter (fn [db [_ v]] (assoc-in db [:ui :invoice-filter] v)))
+(reg-ui-event :show-invoices (fn [db [_ f]] (update db :ui assoc :mode :invoices :invoice-filter (or f "all"))))
+(reg-ui-event :select-invoice (fn [db [_ id]] (update db :ui assoc :invoice id :invoice-draft nil :confirm-delete-invoice nil)))
+(reg-ui-event :close-invoice (fn [db _] (update db :ui assoc :invoice nil)))
+(reg-ui-event :toggle-invoice-settings (fn [db _] (update-in db [:ui :invoice-settings-open?] not)))
+(reg-ui-event :dismiss-invoice-result (fn [db _] (assoc-in db [:ui :invoice-result] nil)))
+(reg-ui-event :ask-delete-invoice (fn [db [_ id]] (assoc-in db [:ui :confirm-delete-invoice] id)))
+(reg-ui-event :cancel-delete-invoice (fn [db _] (assoc-in db [:ui :confirm-delete-invoice] nil)))
+
+(reg-ui-event :new-invoice
+              (fn [db [_ kind]]
+                (update db :ui assoc :mode :invoices :invoice-kind kind :invoice nil :invoice-errors nil
+                        :invoice-draft (invoice/new-draft (:data db) kind (today)))))
+
+(reg-ui-event :edit-invoice
+              (fn [db [_ id]]
+                (if-let [inv (invoice/invoice-by-id (:data db) id)]
+                  (update db :ui assoc :invoice-draft (invoice/invoice->draft inv (exp-of db)) :invoice-errors nil)
+                  db)))
+
+(reg-ui-event :cancel-draft (fn [db _] (update db :ui assoc :invoice-draft nil :invoice-errors nil)))
+
+(def ^:private keyword-fields #{:kind :status :tax-mode :rounding})
+
+(reg-ui-event :set-draft
+              (fn [db [_ field v]]
+                (assoc-in db [:ui :invoice-draft field] (if (keyword-fields field) (keyword v) v))))
+
+(reg-ui-event :set-draft-line (fn [db [_ i field v]] (assoc-in db [:ui :invoice-draft :lines i field] v)))
+(reg-ui-event :add-draft-line (fn [db _] (update-in db [:ui :invoice-draft :lines] conj invoice/empty-draft-line)))
+(reg-ui-event :remove-draft-line
+              (fn [db [_ i]]
+                (update-in db [:ui :invoice-draft :lines]
+                           (fn [ls] (if (> (count ls) 1) (vec (concat (subvec ls 0 i) (subvec ls (inc i)))) ls)))))
+
+(reg-data-event
+ :save-draft
+ (fn [db _]
+   (let [draft (get-in db [:ui :invoice-draft])
+         base (some->> (:id draft) (invoice/invoice-by-id (:data db)))
+         {:keys [invoice errors]} (invoice/draft->invoice draft (exp-of db) base)]
+     (if errors
+       (assoc-in db [:ui :invoice-errors] errors)
+       (let [{data :db :keys [id]} (invoice/save-invoice (:data db) invoice)]
+         (-> db
+             (assoc :data data)
+             (update :ui assoc :invoice-draft nil :invoice-errors nil :invoice id
+                     :invoice-kind (:kind invoice) :period nil)))))))
+
+(defn- after-posting [db data]
+  (-> db (assoc :data data) (assoc-in [:ui :period] nil)))
+
+(reg-data-event :post-invoice (fn [db [_ id]] (after-posting db (:db (invoice/post (:data db) id)))))
+(reg-data-event :repost-invoice (fn [db [_ id]] (after-posting db (:db (invoice/repost (:data db) id)))))
+(reg-data-event :unpost-invoice (fn [db [_ id]] (after-posting db (invoice/unpost (:data db) id))))
+
+(reg-data-event
+ :post-all-invoices
+ (fn [db _]
+   (let [{data :db :keys [posted skipped]} (invoice/post-all (:data db))]
+     (-> (after-posting db data)
+         (assoc-in [:ui :invoice-result] {:posted posted :skipped skipped})))))
+
+(reg-data-event
+ :delete-invoice
+ (fn [db [_ id]]
+   (-> (after-posting db (invoice/delete-invoice (:data db) id))
+       (update :ui assoc :invoice nil :confirm-delete-invoice nil))))
+
+(reg-data-event
+ :set-business
+ (fn [db [_ field v]]
+   (let [business (assoc (get-in db [:data :business]) field v)]
+     (assoc-in db [:data :business] (into {} (remove (comp text/blank? str val)) business)))))
+
+(reg-data-event :set-invoice-setting
+                (fn [db [_ k v]] (assoc-in db [:data :invoice-settings k] (keyword v))))
+(reg-data-event :set-invoice-account
+                (fn [db [_ k v]] (assoc-in db [:data :invoice-settings :accounts k] v)))
+
+(rf/reg-event-fx :print-invoice (fn [_ _] {::print true}))
 
 ;; ───────── subscription / 描画 ─────────
 

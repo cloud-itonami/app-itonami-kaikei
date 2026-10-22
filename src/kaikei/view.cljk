@@ -16,7 +16,8 @@
   nil を返す h を渡すので、HTML に関数は混ざらない。"
   (:require [kotoba.lang.text :as text]
             [kaikei.core :as core]
-            [kaikei.ingest :as ingest]))
+            [kaikei.ingest :as ingest]
+            [kaikei.invoice :as invoice]))
 
 ;; ───────── 小部品（dandori.view と同じ形） ─────────
 
@@ -74,7 +75,10 @@
    :fy-start 4 :period nil :pl-style :jp
    :export-format "kaikei-json" :export-encoding nil :export-result nil
    :journal-page 0 :problems-only? false :account nil
-   :confirm-clear? false})
+   :confirm-clear? false
+   :invoice-kind :sales :invoice-filter "all" :invoice nil :invoice-draft nil
+   :invoice-errors nil :invoice-settings-open? false :invoice-result nil
+   :confirm-delete-invoice nil})
 
 (def page-size 100)
 
@@ -104,6 +108,7 @@
    [:h1 {:class "kk-title"} "kaikei " [:span {:class "kk-title-sub"} "会計"]]
    [:p {:class "kk-lead"}
     "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をこのブラウザの中だけで作ります。"
+    "請求書を作って適格請求書の記載事項を確かめ、売掛金・買掛金の仕訳として計上できます。"
     "マネーフォワード クラウド会計・freee 会計・弥生会計・QuickBooks Online・Xero の形式を読み書きします。"
     "データはどこにも送信されず、この端末のブラウザの中（IndexedDB）にだけ保存されます。"]])
 
@@ -113,6 +118,8 @@
     "勘定科目の区分への写し方、段階利益と繰越損益の数え方は kaikei の規則で、各社の計算の再現ではありません。"
     "各社の API には接続しません。"]
    [:p "この道具は帳簿の確認と移行のためのものです。電子帳簿保存法への適合を主張せず、申告書の作成・提出もしません。"]
+   [:p "請求書の検査は適格請求書の記載事項の欠けを知らせるだけで、適格請求書であることを保証しません。"
+    "登録番号は形（T＋数字 13 桁）だけを見て、国税庁の公表サイトには照会しません。請求書を送付する機能はありません。"]
    [:p "マネーフォワード、freee、弥生、QuickBooks、Xero はそれぞれの権利者の商標です。"
     "kaikei は形式の互換を名乗るだけで、各社との提携も同一性も主張しません。"]
    [:p "ソース: cloud-itonami/kaikei（Apache License 2.0 + etzhayyim Charter Compliance Rider v3.1。NOTICE を参照）"]])
@@ -121,10 +128,10 @@
 
 (def ^:private modes
   [[:trial-balance "試算表"] [:profit-and-loss "損益計算書"] [:balance-sheet "貸借対照表"]
-   [:journal "仕訳帳"] [:accounts "勘定科目"]])
+   [:journal "仕訳帳"] [:accounts "勘定科目"] [:invoices "請求書"]])
 
 (defn toolbar [{:keys [data ui]} h]
-  (let [empty? (empty? (:entries data))]
+  (let [empty? (and (empty? (:entries data)) (empty? (:invoices data)))]
     [:div {:class "kk-toolbar" :role "toolbar" :aria-label "操作"}
      [:div {:class "kk-toolbar-group"}
       (btn h [:toggle-import] (if (:import-open? ui) "取り込みを閉じる" "取り込む") {:type "solid-fill"})
@@ -159,7 +166,7 @@
 
 (defn import-panel [{:keys [ui data]} h]
   [:section {:class "kk-panel" :aria-labelledby "kk-import-heading"}
-   [:h2 {:id "kk-import-heading" :class "kk-h2"} "仕訳を取り込む"]
+   [:h2 {:id "kk-import-heading" :class "kk-h2"} "仕訳・請求書を取り込む"]
    [:p {:class "kk-help"}
     "会計ソフトから書き出したファイルを選ぶか、テキストを貼り付けてください。"
     "読み込みはこのブラウザの中で行い、何も送信しません。Shift_JIS のファイルはファイル選択で読み込んでください（貼り付けは UTF-8 だけです）。"]
@@ -194,15 +201,24 @@
     (btn h [:run-import-text] "貼り付けたテキストを取り込む"
          {:type "solid-fill" :disabled (text/blank? (or (:import-text ui) ""))})]])
 
-(defn import-result [{:keys [format encoding added duplicates rejected warnings error]} h]
+(defn import-result [{:keys [format encoding added duplicates rejected warnings error
+                             invoices-added invoices-duplicates invoices-rejected invoices-dropped]} h]
   [:div {:class (str "kk-result" (when error " kk-result--error")) :role "status"}
    (if error
      [:p {:class "kk-warnings"} error]
      [:p (str (or (:label (ingest/format-by-id (some-> format name))) "入力")
               (when encoding (str "（" (ingest/encoding-label encoding) "）"))
-              " から " added " 件の仕訳を取り込みました。"
+              " から "
+              (text/join "、" (remove nil? [(when (or (pos? (or added 0)) (zero? (or invoices-added 0)))
+                                              (str added " 件の仕訳"))
+                                            (when (pos? (or invoices-added 0)) (str invoices-added " 件の請求書"))]))
+              "を取り込みました。"
               (when (pos? (or duplicates 0)) (str "同じ仕訳 " duplicates " 件は飛ばしました。"))
-              (when (pos? (or rejected 0)) (str "読めなかった仕訳 " rejected " 件は取り込んでいません。")))])
+              (when (pos? (or invoices-duplicates 0)) (str "同じ請求書 " invoices-duplicates " 件は飛ばしました。"))
+              (when (pos? (or rejected 0)) (str "読めなかった仕訳 " rejected " 件は取り込んでいません。"))
+              (when (pos? (or invoices-rejected 0)) (str "読めなかった請求書 " invoices-rejected " 件は取り込んでいません。"))
+              (when (pos? (or invoices-dropped 0))
+                (str "通貨が変わったので、帳簿にあった請求書 " invoices-dropped " 件は残せませんでした。")))])
    (when (seq warnings)
      (into [:ul {:class "kk-warnings"}]
            (concat (map (fn [w] [:li w]) (take 20 warnings))
@@ -234,15 +250,33 @@
      (field "kk-to" "終了日"
             (text-input h [:set-period-date :to] (:to p) {:id "kk-to" :type "date"}))]))
 
+(defn invoice-counts
+  "検査の欄に出す請求書の数: 計上できるのにまだの請求書と、記載事項の欠けた請求書。"
+  [data]
+  (let [is (:invoices data)]
+    {:unposted (count (filter #(and (#{:issued :paid} (:status %)) (nil? (invoice/post-blocker data %))) is))
+     :missing (count (filter #(and (not= :void (:status %)) (invoice/missing-items? data %)) is))}))
+
 (defn checks-panel [{:keys [data]} {:keys [checks]} h]
   (let [{:keys [unclassified-accounts unclassified-lines invalid-entries bs-difference balanced?]} checks
-        exp (core/exponent (:currency data))]
-    [:div {:class (str "kk-checks" (when-not (and balanced? (zero? invalid-entries)) " kk-checks--warn"))
+        exp (core/exponent (:currency data))
+        {:keys [unposted missing]} (invoice-counts data)
+        invoice-items (concat
+                       (when (pos? unposted)
+                         [[:li (chip "未計上" "orange") " 計上していない請求書が " unposted " 件あります。"
+                           (btn h [:show-invoices "unposted"] "請求書で見る" {:type "text"})]])
+                       (when (pos? missing)
+                         [[:li (chip "要確認" "orange") " 適格請求書の記載事項の欠けた請求書が " missing " 件あります。"
+                           (btn h [:show-invoices "problems"] "請求書で見る" {:type "text"})]]))]
+    [:div {:class (str "kk-checks" (when-not (and balanced? (zero? invalid-entries) (empty? invoice-items)) " kk-checks--warn"))
            :role "status"}
-     (if (and balanced? (zero? invalid-entries))
+     (if (and balanced? (zero? invalid-entries) (empty? invoice-items))
        [:p (chip "完全" "green") " すべての仕訳が貸借一致し、勘定科目はすべて区分されています。"]
        (into [:ul]
              (concat
+              (when (and balanced? (zero? invalid-entries))
+                [[:li (chip "完全" "green") " すべての仕訳が貸借一致し、勘定科目はすべて区分されています。"]])
+              invoice-items
               (when (pos? invalid-entries)
                 [[:li (chip "要確認" "red") " 問題のある仕訳が " invalid-entries " 件あります。"
                   (btn h [:show-problems] "仕訳帳で見る" {:type "text"})]])
@@ -487,18 +521,297 @@
      (when-let [a (:account ui)]
        (when period (account-ledger data a period)))]))
 
+;; ───────── 請求書（第 3 スライス、JUN-321） ─────────
+
+(defn- yen [data n] (money data n))
+
+(defn- issuer-and-recipient
+  "[発行者 発行者の登録番号 受け取る事業者]。売上は自社が発行者。"
+  [data inv]
+  (if (= :sales (:kind inv))
+    [(get-in data [:business :name]) (get-in data [:business :registration]) (get-in inv [:partner :name])]
+    [(get-in inv [:partner :name]) (get-in inv [:partner :registration]) (get-in data [:business :name])]))
+
+(defn invoice-document
+  "適格請求書の形（画面の詳細と印刷）。記載事項（法 57 条の 4 ①）の 6 項目を並べる。"
+  [data inv]
+  (let [t (invoice/totals inv)
+        [issuer registration recipient] (issuer-and-recipient data inv)
+        reduced? (some :reduced? (:lines inv))
+        mode (:tax-mode inv)]
+    [:article {:class "kk-invoice" :aria-label (str "請求書 " (:number inv))}
+     [:header {:class "kk-invoice-head"}
+      [:h3 {:class "kk-invoice-title"} (if (= :sales (:kind inv)) "請求書" "請求書（受領）")]
+      [:dl {:class "kk-invoice-meta"}
+       [:dt "番号"] [:dd (or (:number inv) "")]
+       [:dt "取引年月日"] [:dd (or (:date inv) "")]
+       (when (:due-date inv) [:dt "期日"]) (when (:due-date inv) [:dd (:due-date inv)])]]
+     [:div {:class "kk-invoice-parties"}
+      [:div [:p {:class "kk-invoice-to"} (str (or (not-empty recipient) "（受け取る事業者の名称）") " 御中")]
+       (when (:subject inv) [:p (str "件名: " (:subject inv))])]
+      [:div {:class "kk-invoice-from"}
+       [:p (or (not-empty issuer) "（発行者の名称）")]
+       [:p (str "登録番号 " (or (some-> registration invoice/normalize-registration) "（なし）"))]]]
+     [:p {:class "kk-invoice-total"} "ご請求金額 " [:strong (str (yen data (:total t)) " 円")]
+      (when (not= "JPY" (:currency data)) (str "（" (:currency data) "）"))]
+     [:div {:class "kk-table-wrap"}
+      [:table {:class "kk-table"}
+       [:thead [:tr [:th {:scope "col"} "内容"] [:th {:scope "col" :class "kk-num"} "数量"]
+                [:th {:scope "col" :class "kk-num"} "単価"]
+                [:th {:scope "col" :class "kk-num"} (str "金額（" (invoice/tax-mode-label mode) "）")]
+                [:th {:scope "col"} "税率"]]]
+       (into [:tbody]
+             (map (fn [l]
+                    [:tr [:td (str (:description l) (when (:reduced? l) " ※"))]
+                     [:td {:class "kk-num"} (or (:quantity l) "")]
+                     [:td {:class "kk-num"} (or (:unit-price l) "")]
+                     [:td {:class "kk-num"} (yen data (:amount l 0))]
+                     [:td (invoice/group-label (invoice/group-key l))]])
+                  (:lines inv)))]]
+     [:div {:class "kk-table-wrap"}
+      [:table {:class "kk-table kk-invoice-rates"}
+       [:caption "税率ごとの合計"]
+       [:thead [:tr [:th {:scope "col"} "区分"] [:th {:scope "col" :class "kk-num"} "対価（税抜）"]
+                [:th {:scope "col" :class "kk-num"} "消費税額"] [:th {:scope "col" :class "kk-num"} "税込"]]]
+       (into [:tbody]
+             (map (fn [g]
+                    [:tr [:th {:scope "row"} (str (:label g) "対象")]
+                     [:td {:class "kk-num"} (yen data (:net g))]
+                     [:td {:class "kk-num"} (yen data (:used-tax g))]
+                     [:td {:class "kk-num"} (yen data (:gross g))]])
+                  (:groups t)))
+       [:tfoot [:tr [:th {:scope "row"} "合計"] [:td {:class "kk-num"} (yen data (:net t))]
+                [:td {:class "kk-num"} (yen data (:tax t))] [:td {:class "kk-num"} (yen data (:total t))]]]]]
+     [:p {:class "kk-help"}
+      (when reduced? "※ は軽減税率の対象です。")
+      (if (= mode :none)
+        "消費税を記載しない請求書です。"
+        (str "消費税額は税率ごとに 1 回、" (invoice/rounding-label (:rounding inv)) "で計算しています。"))]]))
+
+(defn- invoice-problem-list [data inv]
+  (let [exp (core/exponent (:currency data))
+        ps (invoice/problems data inv)]
+    (if (seq ps)
+      (into [:ul {:class "kk-warnings"}] (map (fn [p] [:li (invoice/problem-label p inv exp)]) ps))
+      [:p (chip "記載事項あり" "green") " 適格請求書の記載事項の欠けは見つかりません（保証ではありません）。"])))
+
+(defn- invoice-detail [{:keys [data ui]} inv h]
+  (let [posted (invoice/posted-entry data (:id inv))
+        blocker (invoice/post-blocker data inv)]
+    [:section {:class "kk-report" :aria-labelledby "kk-invoice-detail-heading"}
+     [:div {:class "kk-report-head kk-no-print"}
+      [:h2 {:id "kk-invoice-detail-heading" :class "kk-h2"} (str "請求書 " (:number inv))]
+      [:div {:class "kk-actions"}
+       (if posted
+         [:span (chip "計上済み" "green") " " (btn h [:repost-invoice (:id inv)] "計上し直す")
+          (btn h [:unpost-invoice (:id inv)] "計上を取り消す" {:type "text"})]
+         (btn h [:post-invoice (:id inv)] "帳簿に計上" {:type "solid-fill" :disabled (some? blocker)}))
+       (btn h [:edit-invoice (:id inv)] "編集")
+       (btn h [:print-invoice] "印刷")
+       (if (= (:id inv) (:confirm-delete-invoice ui))
+         [:span {:class "kk-confirm"}
+          (btn h [:delete-invoice (:id inv)] "本当に消す" {:type "solid-fill" :class "kk-danger"})
+          (btn h [:cancel-delete-invoice] "やめる")]
+         (btn h [:ask-delete-invoice (:id inv)] "削除" {:type "text"}))
+       (btn h [:close-invoice] "閉じる" {:type "text"})]]
+     [:div {:class "kk-no-print"}
+      (when (and blocker (not posted) (not= blocker :status))
+        [:p {:class "kk-warnings"} (invoice/blocker-label blocker)])
+      (when (= blocker :status)
+        [:p {:class "kk-help"} "下書き・取消の請求書は計上しません。状態を「発行済み」にすると計上できます。"])
+      (when-let [pct (invoice/deduction-percent inv)]
+        [:p {:class "kk-help"} (str "仕入税額控除の割合の目安: " pct "%（"
+                                    (if (invoice/qualified? inv) "適格請求書発行事業者" "登録番号なし。経過措置（国税庁 Q&A 問 113）")
+                                    "）。表示だけで、仕訳は請求書の消費税額のまま起こします。")])
+      (when (or (:amount-paid inv) (:amount-due inv))
+        [:p {:class "kk-help"} (str "取り込み元の値: 入金・支払済み " (yen data (or (:amount-paid inv) 0))
+                                    "、未回収・未払い " (yen data (or (:amount-due inv) 0))
+                                    "（消込は今後の版で扱います）")])
+      (invoice-problem-list data inv)]
+     (invoice-document data inv)]))
+
+(defn- draft-line-row [data draft i l h]
+  (let [exp (core/exponent (:currency data))
+        computed (invoice/draft-line-amount (assoc l :amount "") exp)]
+    [:tr
+     [:td (text-input h [:set-draft-line i :description] (:description l) {:aria-label (str "行 " (inc i) " の内容")})]
+     [:td (text-input h [:set-draft-line i :quantity] (:quantity l) {:aria-label (str "行 " (inc i) " の数量") :input-mode "decimal"})]
+     [:td (text-input h [:set-draft-line i :unit-price] (:unit-price l) {:aria-label (str "行 " (inc i) " の単価") :input-mode "decimal"})]
+     [:td (text-input h [:set-draft-line i :amount] (:amount l)
+                      {:aria-label (str "行 " (inc i) " の金額")  :input-mode "decimal"
+                       :placeholder (if (:amount computed) (core/format-amount (:amount computed) exp) "")})]
+     [:td (select-el h [:set-draft-line i :choice] (:choice l) (invoice/choice-options draft)
+                     {:aria-label (str "行 " (inc i) " の税率")})]
+     [:td (text-input h [:set-draft-line i :account] (:account l) {:aria-label (str "行 " (inc i) " の科目")})]
+     [:td (btn h [:remove-draft-line i] "削除" {:type "text" :disabled (= 1 (count (:lines draft)))})]]))
+
+(defn invoice-editor [{:keys [data ui]} h]
+  (let [draft (:invoice-draft ui)
+        exp (core/exponent (:currency data))
+        t (invoice/draft-preview draft exp)
+        sales? (= :sales (:kind draft))]
+    [:section {:class "kk-panel" :aria-labelledby "kk-invoice-editor-heading"}
+     [:h2 {:id "kk-invoice-editor-heading" :class "kk-h2"}
+      (str (if (:id draft) "請求書を直す" "新しい請求書") "（" (invoice/kind-label (:kind draft)) "）")]
+     [:div {:class "kk-settings"}
+      (field "kk-inv-kind" "種類"
+             (select-el h [:set-draft :kind] (name (:kind draft)) [["sales" "売上（発行する）"] ["purchase" "仕入（受け取った）"]]
+                        {:id "kk-inv-kind"}))
+      (field "kk-inv-number" "番号" (text-input h [:set-draft :number] (:number draft) {:id "kk-inv-number"}))
+      (field "kk-inv-date" "取引年月日" (text-input h [:set-draft :date] (:date draft) {:id "kk-inv-date" :type "date"}))
+      (field "kk-inv-due" "期日" (text-input h [:set-draft :due-date] (:due-date draft) {:id "kk-inv-due" :type "date"}))
+      (field "kk-inv-status" "状態"
+             (select-el h [:set-draft :status] (name (:status draft))
+                        (map (fn [st] [(name st) (invoice/status-label (:kind draft) st)]) invoice/statuses)
+                        {:id "kk-inv-status"}))]
+     [:div {:class "kk-settings"}
+      (field "kk-inv-partner" (if sales? "取引先（受け取る事業者）" "取引先（発行者）")
+             (text-input h [:set-draft :partner-name] (:partner-name draft) {:id "kk-inv-partner"}))
+      (field "kk-inv-registration" "取引先の登録番号"
+             (text-input h [:set-draft :partner-registration] (:partner-registration draft)
+                         {:id "kk-inv-registration" :placeholder "T1234567890123"})
+             (if sales? "売上の請求書では書かなくてよい" "受け取った請求書の発行者の番号"))
+      (field "kk-inv-subject" "件名" (text-input h [:set-draft :subject] (:subject draft) {:id "kk-inv-subject"}))
+      (field "kk-inv-mode" "金額"
+             (select-el h [:set-draft :tax-mode] (name (:tax-mode draft))
+                        (map (fn [m] [(name m) (invoice/tax-mode-label m)]) invoice/tax-modes) {:id "kk-inv-mode"}))
+      (field "kk-inv-rounding" "消費税の端数処理"
+             (select-el h [:set-draft :rounding] (name (:rounding draft))
+                        (map (fn [r] [(name r) (invoice/rounding-label r)]) invoice/roundings) {:id "kk-inv-rounding"})
+             "税率ごとに 1 回")]
+     [:div {:class "kk-table-wrap"}
+      [:table {:class "kk-table kk-invoice-lines"}
+       [:thead [:tr [:th {:scope "col"} "内容"] [:th {:scope "col"} "数量"] [:th {:scope "col"} "単価"]
+                [:th {:scope "col"} "金額"] [:th {:scope "col"} "税率"] [:th {:scope "col"} "科目（空なら既定）"]
+                [:th {:scope "col"} [:span {:class "kk-visually-hidden"} "操作"]]]]
+       (into [:tbody] (map-indexed (fn [i l] (draft-line-row data draft i l h)) (:lines draft)))]]
+     [:div {:class "kk-actions"} (btn h [:add-draft-line] "行を足す")]
+     [:p {:class "kk-help"} "金額が空の行は 単価 × 数量 を四捨五入した額です。"]
+     (into [:ul {:class "kk-notes" :aria-live "polite"}]
+           (concat (map (fn [g] [:li (str (:label g) "対象 " (yen data (:net g)) "（消費税 " (yen data (:used-tax g)) "）")])
+                        (:groups t))
+                   [[:li [:strong (str "合計 " (yen data (:total t)))]]]))
+     (when-let [errors (seq (:invoice-errors ui))]
+       (into [:ul {:class "kk-warnings" :role "alert"}]
+             (map (fn [{:keys [code line]}] [:li (str (invoice/draft-error-label code) (when line (str line "）")))]) errors)))
+     [:div {:class "kk-actions"}
+      (btn h [:save-draft] "保存する" {:type "solid-fill"})
+      (btn h [:cancel-draft] "やめる" {:type "text"})]]))
+
+(defn invoice-settings-panel [{:keys [data]} h]
+  (let [st (invoice/settings data)
+        business (:business data)]
+    [:section {:class "kk-panel" :aria-labelledby "kk-invoice-settings-heading"}
+     [:h2 {:id "kk-invoice-settings-heading" :class "kk-h2"} "請求書の設定"]
+     [:div {:class "kk-settings"}
+      (field "kk-business-name" "自社の名称（売上の請求書の発行者）"
+             (text-input h [:set-business :name] (:name business) {:id "kk-business-name"}))
+      (field "kk-business-registration" "自社の登録番号"
+             (text-input h [:set-business :registration] (:registration business)
+                         {:id "kk-business-registration" :placeholder "T1234567890123"})
+             (cond
+               (empty? (str (:registration business))) "適格請求書発行事業者なら入れてください"
+               (invoice/registration-valid? (:registration business)) "形は正しい（国税庁には照会しません）"
+               :else "「T」＋数字 13 桁の形ではありません"))]
+     [:div {:class "kk-settings"}
+      (field "kk-accounting" "経理方式"
+             (select-el h [:set-invoice-setting :accounting] (name (:accounting st))
+                        [["tax-excluded" "税抜経理（消費税を仮受・仮払の科目に分ける）"] ["tax-included" "税込経理"]]
+                        {:id "kk-accounting"}))
+      (field "kk-default-rounding" "新しい請求書の端数処理"
+             (select-el h [:set-invoice-setting :rounding] (name (:rounding st))
+                        (map (fn [r] [(name r) (invoice/rounding-label r)]) invoice/roundings) {:id "kk-default-rounding"}))]
+     (into [:div {:class "kk-settings"}]
+           (for [k [:receivable :payable :output-tax :input-tax :sales :purchase]]
+             (field (str "kk-account-" (name k)) (invoice/account-setting-label k)
+                    (text-input h [:set-invoice-account k] (get-in st [:accounts k]) {:id (str "kk-account-" (name k))}))))
+     [:div {:class "kk-actions"} (btn h [:toggle-invoice-settings] "閉じる" {:type "text"})]]))
+
+(def ^:private invoice-filters
+  [["all" "すべて"] ["unposted" "未計上"] ["problems" "記載事項の欠け"] ["draft" "下書き"]])
+
+(defn- filter-invoices [data kind f]
+  (filterv (fn [inv]
+             (and (= kind (:kind inv))
+                  (case f
+                    "unposted" (and (#{:issued :paid} (:status inv)) (nil? (invoice/posted-entry data (:id inv))))
+                    "problems" (and (not= :void (:status inv)) (invoice/missing-items? data inv))
+                    "draft" (= :draft (:status inv))
+                    true)))
+           (:invoices data)))
+
+(defn invoices-view [{:keys [data ui] :as state} h]
+  (let [kind (:invoice-kind ui :sales)
+        invs (sort-by (juxt :date :number) #(compare %2 %1) (filter-invoices data kind (:invoice-filter ui "all")))
+        selected (some->> (:invoice ui) (invoice/invoice-by-id data))
+        {:keys [unposted]} (invoice-counts data)]
+    [:div
+     [:section {:class "kk-report kk-no-print" :aria-labelledby "kk-invoices-heading"}
+      [:div {:class "kk-report-head"}
+       [:h2 {:id "kk-invoices-heading" :class "kk-h2"} "請求書"]
+       [:div {:class "kk-actions"}
+        (btn h [:set-invoice-kind :sales] "売上の請求書" {:aria-pressed (= kind :sales) :type (if (= kind :sales) "solid-fill" "outline")})
+        (btn h [:set-invoice-kind :purchase] "受け取った請求書" {:aria-pressed (= kind :purchase) :type (if (= kind :purchase) "solid-fill" "outline")})]]
+      [:div {:class "kk-settings"}
+       (field "kk-invoice-filter" "表示"
+              (select-el h [:set-invoice-filter] (:invoice-filter ui "all") invoice-filters {:id "kk-invoice-filter"}))
+       [:div {:class "kk-actions"}
+        (btn h [:new-invoice kind] (if (= kind :sales) "新しい請求書" "受け取った請求書を入れる") {:type "solid-fill"})
+        (btn h [:post-all-invoices] (str "未計上をすべて計上する（" unposted " 件）") {:disabled (zero? unposted)})
+        (btn h [:toggle-invoice-settings] "設定")]]
+      (when-let [{:keys [posted skipped]} (:invoice-result ui)]
+        [:div {:class "kk-result" :role "status"}
+         [:p (str (count posted) " 件の請求書を計上しました。"
+                  (when (seq skipped) (str "計上できなかった請求書 " (count skipped) " 件: "
+                                           (text/join "、" (for [{:keys [id reason]} skipped]
+                                                            (str (:number (invoice/invoice-by-id data id)) "（" (invoice/blocker-label reason) "）"))))))]
+         (btn h [:dismiss-invoice-result] "閉じる" {:type "text"})])
+      [:p {:class "kk-help"}
+       "売上の請求書は自社が発行者、受け取った請求書は取引先が発行者です。消費税額は 1 請求書・税率ごとに 1 回の端数処理で確かめます"
+       "（消費税法施行令 70 条の 10、基通 1-8-15）。「帳簿に計上」で売掛金・買掛金の仕訳を起こします。"]
+      (if (empty? invs)
+        [:p "請求書がありません。"]
+        [:div {:class "kk-table-wrap"}
+         [:table {:class "kk-table"}
+          [:thead [:tr [:th {:scope "col"} "番号"] [:th {:scope "col"} "日付"] [:th {:scope "col"} "期日"]
+                   [:th {:scope "col"} "取引先"] [:th {:scope "col" :class "kk-num"} "税抜"]
+                   [:th {:scope "col" :class "kk-num"} "消費税"] [:th {:scope "col" :class "kk-num"} "合計"]
+                   [:th {:scope "col"} "状態"] [:th {:scope "col"} "計上"] [:th {:scope "col"} "検査"]]]
+          (into [:tbody]
+                (map (fn [inv]
+                       (let [t (invoice/totals inv)
+                             missing? (and (not= :void (:status inv)) (invoice/missing-items? data inv))]
+                         [:tr {:class (when missing? "kk-row--warn")}
+                          [:th {:scope "row"}
+                           [:button (with-handler {:type "button" :class "kk-link"} :on-click (h :click [:select-invoice (:id inv)]))
+                            (if (text/blank? (str (:number inv))) "（番号なし）" (:number inv))]]
+                          [:td (:date inv)] [:td (or (:due-date inv) "")]
+                          [:td (get-in inv [:partner :name])]
+                          [:td {:class "kk-num"} (yen data (:net t))]
+                          [:td {:class "kk-num"} (yen data (:tax t))]
+                          [:td {:class "kk-num"} (yen data (:total t))]
+                          [:td (invoice/status-label (:kind inv) (:status inv))]
+                          [:td (if (invoice/posted-entry data (:id inv)) "済" "")]
+                          [:td (if missing? (chip "要確認" "orange") "")]]))
+                     invs))]])]
+     (when (:invoice-settings-open? ui) (invoice-settings-panel state h))
+     (cond
+       (:invoice-draft ui) (invoice-editor state h)
+       selected (invoice-detail state selected h))]))
+
 ;; ───────── 空の状態・全体 ─────────
 
 (defn empty-state [h]
   [:section {:class "kk-empty"}
    [:h2 {:class "kk-h2"} "まだ仕訳がありません"]
    [:p "会計ソフトから書き出した仕訳帳（CSV）か、QuickBooks Online・Xero の API の JSON を取り込んでください。"
-    "試すだけなら、合成データのサンプルを読み込めます。"]
+    "請求書から始めることもできます。試すだけなら、合成データのサンプル（仕訳と請求書）を読み込めます。"]
    [:noscript [:p {:class "kk-noscript"}
                "この道具は JavaScript で動きます（すべてブラウザの中で処理し、何も送信しません）。"]]
    [:div {:class "kk-actions"}
     (btn h [:load-sample] "サンプルを読み込む" {:type "solid-fill"})
-    (btn h [:toggle-import] "取り込む")]])
+    (btn h [:toggle-import] "取り込む")
+    (btn h [:new-invoice :sales] "請求書を作る")]])
 
 (defn booting []
   [:section {:class "kk-empty" :aria-live "polite"}
@@ -515,15 +828,20 @@
 
 (defn- workspace [{:keys [ui] :as state} derived h]
   [:div {:class "kk-workspace"}
-   (period-bar state derived h)
-   (checks-panel state derived h)
+   (when derived (period-bar state derived h))
+   (when derived (checks-panel state derived h))
    (tabs state h)
-   (case (:mode ui)
-     :profit-and-loss (profit-and-loss-view state derived h)
-     :balance-sheet (balance-sheet-view state derived h)
-     :journal (journal-view state derived h)
-     :accounts (accounts-view state derived h)
-     (trial-balance-view state derived h))])
+   (cond
+     (= :invoices (:mode ui)) (invoices-view state h)
+     (nil? derived) [:section {:class "kk-report"}
+                     [:p "仕訳がまだありません。請求書を計上するか、仕訳を取り込むと帳票が出ます。"]]
+     :else
+     (case (:mode ui)
+       :profit-and-loss (profit-and-loss-view state derived h)
+       :balance-sheet (balance-sheet-view state derived h)
+       :journal (journal-view state derived h)
+       :accounts (accounts-view state derived h)
+       (trial-balance-view state derived h)))])
 
 (defn root
   "画面全体。state = {:data db :ui ui}、derived = (derive data period)。:ui の
@@ -537,7 +855,8 @@
      (when-let [r (:export-result ui)] (export-result r h))
      (when (:import-open? ui) (import-panel state h))
      (when-let [r (:import-result ui)] (import-result r h))
-     (if (or (empty? (:entries data)) (nil? derived))
+     (if (and (empty? (:entries data)) (empty? (:invoices data))
+              (not= :invoices (:mode ui)))
        (empty-state h)
        (workspace state derived h))
      (footer)]))

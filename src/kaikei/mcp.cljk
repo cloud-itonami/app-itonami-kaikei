@@ -6,16 +6,20 @@
   map（通知なら nil）を返す純関数だけを持つ。判定は画面と同じ adapter
   （kaikei.core / ingest / export）で、書き直さない。
 
-  tool は 5 つ。どれも送信せず、保存せず、各社（MoneyForward・freee・弥生・
-  QuickBooks・Xero）の API にも接続しない:
+  tool は 8 つ。どれも送信せず、保存せず、各社（MoneyForward・freee・弥生・
+  QuickBooks・Xero・Zoho・FreshBooks）の API にも、国税庁の公表サイトにも接続しない:
 
-    kaikei_import    仕訳のファイル（テキストか base64 のバイト列）→ kaikei の帳簿 JSON
-    kaikei_validate  帳簿 JSON の検査（貸借一致・未分類の勘定科目・問題のある仕訳）
-    kaikei_report    帳簿 JSON → 試算表・P/L・B/S（kaikei・QBO・Xero の形）
-    kaikei_export    帳簿 JSON → 各形式のテキスト（Shift_JIS は base64）
-    kaikei_convert   仕訳のファイル → 別の形式（import と export を 1 回で）
+    kaikei_import          仕訳・請求書のファイル（テキストか base64 のバイト列）→ kaikei の帳簿 JSON
+    kaikei_validate        帳簿 JSON の検査（貸借一致・未分類の勘定科目・問題のある仕訳）
+    kaikei_report          帳簿 JSON → 試算表・P/L・B/S（kaikei・QBO・Xero の形）
+    kaikei_export          帳簿 JSON → 各形式のテキスト（Shift_JIS は base64）
+    kaikei_convert         仕訳・請求書のファイル → 別の形式（import と export を 1 回で）
+    kaikei_invoice_totals  請求書の明細 → 税率ごとの対価・消費税額・合計（1 請求書・税率ごとに 1 回の端数処理）
+    kaikei_invoice_check   帳簿 JSON の請求書の検査（適格請求書の記載事項の欠け・税額の差・経過措置の割合）
+    kaikei_invoice_post    帳簿 JSON の請求書から売掛・買掛の仕訳を起こす
 
-  帳簿 JSON は kaikei.ledger.v1（kaikei.compat.native）。tool の間で受け渡す。
+  帳簿 JSON は kaikei.ledger.v1（kaikei.compat.native）。請求書（invoices）も
+  運ぶ（第 3 スライス、JUN-321）。tool の間で受け渡す。
 
   入力の不正は JSON-RPC の error ではなく tool の結果（isError true、本文は
   {\"error\" \"<名前>\" …}）で返す。"
@@ -24,12 +28,13 @@
             [kaikei.encoding :as enc]
             [kaikei.export :as export]
             [kaikei.ingest :as ingest]
+            [kaikei.invoice :as invoice]
             [kaikei.json :as json]
             [kaikei.compat.common :as common]
             [kaikei.compat.native :as native]))
 
 (def server-name "kaikei")
-(def server-version "0.1.0")
+(def server-version "0.2.0")
 (def default-protocol-version "2024-11-05")
 
 (def max-bytes
@@ -85,7 +90,7 @@
     (let [{:keys [warnings] :as parsed} (native/read-data v)]
       (when (seq warnings)
         (throw (tool-error "invalid-ledger" "detail" (vec warnings))))
-      (:db (core/merge-import core/empty-db parsed)))))
+      (:db (core/merge-import (assoc core/empty-db :currency (:currency parsed "JPY")) parsed)))))
 
 ;; ───────── 出力の形 ─────────
 
@@ -108,7 +113,7 @@
 
 (defn- read-input [args]
   (let [parsed (ingest/ingest-bytes (input-bytes args) (import-opts args))
-        {:keys [db error]} (core/merge-import core/empty-db parsed)]
+        {:keys [db error]} (core/merge-import (assoc core/empty-db :currency (:currency parsed "JPY")) parsed)]
     (when error (throw (tool-error "currency-mismatch" "detail" error)))
     {:parsed parsed :db db}))
 
@@ -130,7 +135,9 @@
     {"format" (some-> (:format parsed) name)
      "encoding" (:encoding parsed)
      "entries" (count (:entries db))
-     "rejected" (:rejected parsed 0)
+     "invoices" (count (:invoices db))
+     "rejected" (+ (:rejected parsed 0) (:invoices-rejected parsed 0))
+     "skipped" (:invoices-skipped parsed 0)
      "warnings" (vec (:warnings parsed))
      "checks" (checks-out db)
      "ledger" (ledger-out db)}))
@@ -177,8 +184,133 @@
     (merge (export-out db to-fmt args)
            {"from" (some-> (:format parsed) name)
             "entries" (count (:entries db))
+            "invoices" (count (:invoices db))
             "rejected" (:rejected parsed 0)
             "warnings" (vec (:warnings parsed))})))
+
+;; ───────── 請求書の tools（第 3 スライス、JUN-321） ─────────
+
+(def ^:private categories ["taxable" "zero-rated" "exempt" "out-of-scope"])
+
+(defn- plain
+  "json/decimal を含む値 → JSON の数（書いて読み直す。report-tool と同じ）。"
+  [v]
+  (json/parse (json/write v)))
+
+(defn- money-out [n exp] (json/decimal (core/format-amount n exp)))
+
+(defn- group-out [g exp]
+  (let [[rate x] (:key g)]
+    (json/ordered [["label" (:label g)]
+                   ["rate" (when-not (keyword? x) (some-> rate (core/format-amount 2) json/decimal))]
+                   ["reduced" (when (true? x) true)]
+                   ["category" (if (keyword? x) (name x) "taxable")]
+                   ["base" (money-out (:base g) exp)]
+                   ["net" (money-out (:net g) exp)]
+                   ["tax" (money-out (:used-tax g) exp)]
+                   ["computed_tax" (when (not= (:tax g) (:used-tax g)) (money-out (:tax g) exp))]
+                   ["gross" (money-out (:gross g) exp)]])))
+
+(defn- totals-line [exp i m]
+  (when-not (map? m)
+    (throw (tool-error "invalid-argument" "argument" "lines" "detail" (str "line " (inc i) " is not an object"))))
+  (let [{:keys [amount error]} (core/parse-amount (get m "amount") exp)
+        category (keyword (get m "category" "taxable"))
+        rate (when (some? (get m "rate"))
+               (or (common/percent->rate (get m "rate"))
+                   (throw (tool-error "invalid-argument" "argument" "lines" "detail" (str "line " (inc i) ": rate is a percent like 10 or 8")))))]
+    (when (or error (nil? (get m "amount")))
+      (throw (tool-error "invalid-argument" "argument" "lines" "detail" (str "line " (inc i) ": amount is a decimal in currency units"))))
+    (when-not (some #{(name category)} categories)
+      (throw (tool-error "invalid-argument" "argument" "lines" "expected" categories)))
+    (when (and (= category :taxable) (nil? rate))
+      (throw (tool-error "invalid-argument" "argument" "lines" "detail" (str "line " (inc i) ": taxable lines need a rate"))))
+    (cond-> {:amount amount :category category :description (str (get m "description" ""))}
+      (= category :taxable) (assoc :rate rate :reduced? (true? (get m "reduced")))
+      (not= category :taxable) (assoc :rate 0))))
+
+(defn invoice-totals-tool [args]
+  (reject-unknown args ["lines" "tax_mode" "rounding" "currency"])
+  (let [currency (enum-arg args "currency" (sort (keys core/currency-exponent)) "JPY")
+        exp (core/exponent currency)
+        lines (get args "lines")]
+    (when-not (and (sequential? lines) (seq lines))
+      (throw (tool-error "invalid-argument" "argument" "lines" "detail" "a non-empty array of lines")))
+    (let [inv {:tax-mode (keyword (enum-arg args "tax_mode" ["exclusive" "inclusive" "none"] "exclusive"))
+               :rounding (keyword (enum-arg args "rounding" ["floor" "half-up" "ceil"] "floor"))
+               :lines (vec (map-indexed (partial totals-line exp) lines))}
+          t (invoice/totals inv)]
+      (when-not (:valid? t)
+        (throw (tool-error "invalid-invoice" "detail" "a tax rate's total is negative, or an amount is out of range")))
+      (plain
+       {"currency" currency
+       "tax_mode" (name (:tax-mode inv))
+       "rounding" (name (:rounding inv))
+       "groups" (mapv #(group-out % exp) (:groups t))
+       "net" (money-out (:net t) exp)
+       "tax" (money-out (:tax t) exp)
+       "total" (money-out (:total t) exp)
+       "line_tax" (vec (for [i (range (count (:lines inv)))] (money-out (get (:line-tax t) i 0) exp)))
+       "rule" "Consumption tax is computed once per invoice per tax rate (消費税法施行令 70 条の 10, 基通 1-8-15); line_tax splits it: other lines are truncated and the largest line of the rate takes the difference."}))))
+
+(defn- invoice-check-out [db inv exp]
+  (let [t (invoice/totals inv)
+        posted (invoice/posted-entry db (:id inv))]
+    (json/ordered
+     [["id" (:id inv)]
+      ["kind" (name (:kind inv))]
+      ["number" (:number inv)]
+      ["date" (:date inv)]
+      ["status" (name (:status inv))]
+      ["partner" (get-in inv [:partner :name])]
+      ["registration_format_ok" (let [reg (if (= :sales (:kind inv)) (get-in db [:business :registration]) (get-in inv [:partner :registration]))]
+                                  (when reg (invoice/registration-valid? reg)))]
+      ["groups" (mapv #(group-out % exp) (:groups t))]
+      ["total" (money-out (:total t) exp)]
+      ["tax" (money-out (:tax t) exp)]
+      ["problems" (mapv (fn [p] (json/ordered [["code" (name (:code p))] ["message" (invoice/problem-label p inv exp)]]))
+                        (invoice/problems db inv))]
+      ["missing_items" (invoice/missing-items? db inv)]
+      ["posted" (some? posted)]
+      ["post_blocker" (some-> (invoice/post-blocker db inv) name)]
+      ["deduction_percent" (invoice/deduction-percent inv)]])))
+
+(defn invoice-check-tool [args]
+  (reject-unknown args ["ledger"])
+  (let [db (ledger-arg args)
+        exp (core/exponent (:currency db))
+        invs (:invoices db)]
+    {"invoices" (plain (mapv #(invoice-check-out db % exp) invs))
+     "missing_items" (count (filter #(and (not= :void (:status %)) (invoice/missing-items? db %)) invs))
+     "unposted" (count (filter #(and (#{:issued :paid} (:status %)) (nil? (invoice/post-blocker db %))) invs))
+     "note" "Checks the contents a qualified invoice must state (消費税法 57 条の 4 ①). It does not certify an invoice, and it only checks the registration number's form (T + 13 digits); it does not query the NTA."}))
+
+(defn invoice-post-tool [args]
+  (reject-unknown args ["ledger" "invoice_ids" "accounting"])
+  (let [db (cond-> (ledger-arg args)
+             (get args "accounting")
+             (assoc-in [:invoice-settings :accounting]
+                       (keyword (enum-arg args "accounting" ["tax-excluded" "tax-included"] nil))))
+        ids (get args "invoice_ids")
+        _ (when (and (some? ids) (not (and (sequential? ids) (every? string? ids))))
+            (throw (tool-error "invalid-argument" "argument" "invoice_ids" "expected" "array of invoice ids")))
+        {:keys [db posted skipped]}
+        (if (some? ids)
+          (reduce (fn [acc id]
+                    (let [{db' :db :keys [skipped]} (invoice/post (:db acc) id)]
+                      (if skipped
+                        (update acc :skipped conj {:id id :reason skipped})
+                        (-> acc (assoc :db db') (update :posted conj id)))))
+                  {:db db :posted [] :skipped []}
+                  ids)
+          (invoice/post-all db))]
+    {"posted" posted
+     "skipped" (mapv (fn [{:keys [id reason]}]
+                       {"id" id "reason" (name reason)
+                        "message" (get invoice/blocker-label reason "請求書がありません")})
+                     skipped)
+     "checks" (checks-out db)
+     "ledger" (ledger-out db)}))
 
 ;; ───────── tool の宣言 ─────────
 
@@ -254,7 +386,47 @@
                                         "output_date_order" {"type" "string" "enum" common/date-orders}})
                    "required" ["to"]
                    "additionalProperties" false}
-    "run" convert-tool}])
+    "run" convert-tool}
+   {"name" "kaikei_invoice_totals"
+    "description" (str "Per-rate totals of an invoice: for each tax rate, the consideration, the consumption tax rounded once per "
+                       "invoice per rate (as a Japanese qualified invoice requires, 消費税法施行令 70 条の 10) and the total, "
+                       "plus each line's share of the tax. No ledger needed; use it to draft an invoice.")
+    "inputSchema" {"type" "object"
+                   "properties" {"lines" {"type" "array"
+                                          "items" {"type" "object"
+                                                   "properties" {"description" {"type" "string"}
+                                                                 "amount" {"type" ["number" "string"] "description" "Line amount in currency units (tax-exclusive or inclusive per tax_mode)."}
+                                                                 "rate" {"type" ["number" "string"] "description" "Tax rate in percent, e.g. 10 or 8."}
+                                                                 "reduced" {"type" "boolean" "description" "Japanese reduced rate (軽減税率)."}
+                                                                 "category" {"type" "string" "enum" categories "default" "taxable"}}
+                                                   "required" ["amount"]}}
+                                 "tax_mode" {"type" "string" "enum" ["exclusive" "inclusive" "none"] "default" "exclusive"}
+                                 "rounding" {"type" "string" "enum" ["floor" "half-up" "ceil"] "default" "floor"}
+                                 "currency" currency-schema}
+                   "required" ["lines"]
+                   "additionalProperties" false}
+    "run" invoice-totals-tool}
+   {"name" "kaikei_invoice_check"
+    "description" (str "Check the invoices in a kaikei ledger: missing qualified-invoice contents (issuer name and registration "
+                       "number form, date, description, tax rate, per-rate tax, recipient), differences between the stated tax "
+                       "and one rounding per rate, the transitional deduction percent for purchases from unregistered sellers, "
+                       "and whether each invoice can be posted. Does not query the NTA or certify anything.")
+    "inputSchema" {"type" "object" "properties" {"ledger" ledger-schema} "required" ["ledger"]
+                   "additionalProperties" false}
+    "run" invoice-check-tool}
+   {"name" "kaikei_invoice_post"
+    "description" (str "Post invoices in a kaikei ledger as journal entries (accounts receivable / sales / output tax, or the "
+                       "purchase side) and return the updated ledger. Posts every issued or paid invoice not yet posted, or "
+                       "only invoice_ids. Skips drafts, voids, invoices with withholding, and invoices already in the ledger "
+                       "(e.g. from Xero Journals). Pure: returns a new ledger; nothing is stored.")
+    "inputSchema" {"type" "object"
+                   "properties" {"ledger" ledger-schema
+                                 "invoice_ids" {"type" "array" "items" {"type" "string"}}
+                                 "accounting" {"type" "string" "enum" ["tax-excluded" "tax-included"]
+                                               "description" "Overrides the ledger's setting (default tax-excluded: tax goes to 仮受消費税・仮払消費税)."}}
+                   "required" ["ledger"]
+                   "additionalProperties" false}
+    "run" invoice-post-tool}])
 
 (def ^:private tool-by-name (into {} (map (juxt #(get % "name") identity)) tools))
 

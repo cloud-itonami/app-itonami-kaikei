@@ -521,3 +521,125 @@
           {:error :range}
           (let [n (cond-> (parse-long whole) up? inc)]
             {:amount (if (and neg? (pos? n)) (- n) n)}))))))
+
+;; ───────── 画面の入力（下書き） ─────────
+;;
+;; 画面の編集は文字列の下書きで持つ（入力の途中の値を壊さないため）。
+;;   {:id :kind :number :date :due-date :status :partner-name :partner-registration
+;;    :subject :tax-mode :rounding
+;;    :lines [{:description :quantity :unit-price :amount :choice :account}]}
+;; :choice は税率の選び方: 課税は \"1000\"・\"800r\"（r は軽減）、ほかは区分の名前。
+
+(def rate-choices
+  [["1000" "10%"] ["800r" "8%（軽減）"] ["800" "8%"]
+   ["zero-rated" "免税"] ["exempt" "非課税"] ["out-of-scope" "不課税"]])
+
+(defn line-choice [l]
+  (let [category (:category l :taxable)]
+    (cond
+      (not= :taxable category) (name category)
+      (nil? (:rate l)) ""
+      :else (str (:rate l) (when (:reduced? l) "r")))))
+
+(defn choice-options
+  "税率の選択肢。既定の 6 つに、下書きにある別の税率（取り込んだ 15% など）を足す。"
+  [draft]
+  (let [known (set (map first rate-choices))
+        extra (distinct (remove #(or (known %) (= "" %)) (map :choice (:lines draft))))]
+    (vec (concat (when (some #(= "" (:choice %)) (:lines draft)) [["" "税率を選ぶ"]])
+                 rate-choices
+                 (for [c extra
+                       :let [[_ bp r] (text/re-matches #"(\d+)(r?)" c)]
+                       :when bp]
+                   [c (group-label [(parse-long bp) (= r "r")])])))))
+
+(defn- choice->fields [choice]
+  (if-let [[_ bp r] (some->> choice (text/re-matches #"(\d+)(r?)"))]
+    {:category :taxable :rate (parse-long bp) :reduced? (= r "r")}
+    (if-let [c (some #(when (= choice (name %)) %) [:zero-rated :exempt :out-of-scope])]
+      {:category c :rate 0 :reduced? false}
+      {:category :taxable :rate nil :reduced? false})))
+
+(def empty-draft-line {:description "" :quantity "1" :unit-price "" :amount "" :choice "1000" :account ""})
+
+(defn new-draft
+  "新しい請求書の下書き。date は今日（\"YYYY-MM-DD\"。画面が渡す）。"
+  [db kind date]
+  {:kind kind :number (next-number db kind) :date date :due-date "" :status :issued
+   :partner-name "" :partner-registration "" :subject ""
+   :tax-mode :exclusive :rounding (:rounding (settings db))
+   :lines [empty-draft-line]})
+
+(defn invoice->draft [inv exp]
+  {:id (:id inv) :kind (:kind inv) :number (or (:number inv) "") :date (or (:date inv) "")
+   :due-date (or (:due-date inv) "") :status (:status inv)
+   :partner-name (or (get-in inv [:partner :name]) "")
+   :partner-registration (or (get-in inv [:partner :registration]) "")
+   :subject (or (:subject inv) "")
+   :tax-mode (:tax-mode inv :exclusive) :rounding (:rounding inv :floor)
+   :lines (mapv (fn [l] {:description (or (:description l) "") :quantity (or (:quantity l) "")
+                         :unit-price (or (:unit-price l) "")
+                         :amount (core/format-amount (:amount l 0) exp)
+                         :choice (line-choice l) :account (or (:account l) "")})
+                (:lines inv))})
+
+(defn draft-line-amount
+  "下書きの行の金額。:amount が空なら 単価 × 数量 を四捨五入。{:amount} か {:error}。"
+  [l exp]
+  (if (blank? (:amount l))
+    (if (blank? (:unit-price l))
+      {:amount 0}
+      (line-amount (:quantity l) (:unit-price l) exp :half-up))
+    (core/parse-amount (:amount l) exp)))
+
+(def draft-error-label
+  {:date "取引年月日が読めません（YYYY-MM-DD）"
+   :due-date "期日が読めません（YYYY-MM-DD）"
+   :amount "金額が読めない明細があります（行 "
+   :lines "明細がありません"})
+
+(defn draft->invoice
+  "下書き → 請求書。戻りは {:invoice} か {:errors [{:code … :line n}]}。base は
+  編集する前の請求書（取り込み元の情報を残す。明細を直したので :stated は捨てる
+  —— 書かれていた税額は、もう直した明細の額ではないため）。"
+  [draft exp base]
+  (let [amounts (mapv #(draft-line-amount % exp) (:lines draft))
+        errors (cond-> []
+                 (nil? (core/parse-date (:date draft))) (conj {:code :date})
+                 (and (not (blank? (:due-date draft))) (nil? (core/parse-date (:due-date draft)))) (conj {:code :due-date})
+                 (empty? (:lines draft)) (conj {:code :lines})
+                 true (into (keep-indexed (fn [i a] (when (:error a) {:code :amount :line (inc i)})) amounts)))]
+    (if (seq errors)
+      {:errors errors}
+      {:invoice (cond-> (merge (dissoc base :stated)
+                               {:kind (:kind draft)
+                                :number (text/trim (str (:number draft)))
+                                :date (core/parse-date (:date draft))
+                                :status (:status draft)
+                                :partner (cond-> {:name (text/trim (str (:partner-name draft)))}
+                                           (not (blank? (:partner-registration draft)))
+                                           (assoc :registration (normalize-registration (:partner-registration draft))))
+                                :tax-mode (:tax-mode draft)
+                                :rounding (:rounding draft)
+                                :lines (mapv (fn [l a]
+                                               (cond-> (merge {:description (text/trim (str (:description l)))
+                                                               :amount (:amount a)}
+                                                              (choice->fields (:choice l)))
+                                                 (not (blank? (:quantity l))) (assoc :quantity (text/trim (:quantity l)))
+                                                 (not (blank? (:unit-price l))) (assoc :unit-price (text/trim (:unit-price l)))
+                                                 (not (blank? (:account l))) (assoc :account (text/trim (:account l)))))
+                                             (:lines draft) amounts)})
+                  (:id draft) (assoc :id (:id draft))
+                  (not (blank? (:due-date draft))) (assoc :due-date (core/parse-date (:due-date draft)))
+                  (blank? (:due-date draft)) (dissoc :due-date)
+                  (not (blank? (:subject draft))) (assoc :subject (text/trim (:subject draft)))
+                  (blank? (:subject draft)) (dissoc :subject)
+                  (not= (:kind draft) (:kind base)) (dissoc :origin))})))
+
+(defn draft-preview
+  "入力の途中の下書きの合計（読めない金額は 0 として）。"
+  [draft exp]
+  (totals {:tax-mode (:tax-mode draft) :rounding (:rounding draft)
+           :lines (mapv (fn [l] (merge {:amount (or (:amount (draft-line-amount l exp)) 0)}
+                                       (choice->fields (:choice l))))
+                        (:lines draft))}))

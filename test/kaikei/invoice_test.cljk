@@ -203,6 +203,12 @@
   (is (= "INV-0003" (inv/next-number sample-db :sales)))
   (is (= "A-103" (inv/next-number sample-db :purchase)))
   (is (= "INV-0001" (inv/next-number core/empty-db :sales)))
+  (testing "取り込み元の id（i1, i3）は保ち、新しい請求書はその次の番号"
+    (let [db (:db (core/merge-import core/empty-db {:currency "JPY" :invoices [(assoc (by-number sample-db "INV-0001") :id "i1")
+                                                                             (assoc (by-number sample-db "A-102") :id "i3")]}))
+          {db :db id :id} (inv/save-invoice db (invoice :id nil :lines [(line "作業" 100 1000)]))]
+      (is (= ["i1" "i3" "i4"] (mapv :id (:invoices db))))
+      (is (= "i4" id))))
   (testing "同じ請求書は重複として飛ばす"
     (let [{:keys [invoices-added invoices-duplicates]} (core/merge-import sample-db core/sample-import)]
       (is (= [0 3] [invoices-added invoices-duplicates])))))
@@ -219,3 +225,30 @@
   (testing "読めない値・桁のあふれ"
     (is (= {:error :format} (inv/line-amount "2" "abc" 0 :floor)))
     (is (= {:error :range} (inv/line-amount "99999999.999" "9999999999999.999" 0 :floor)))))
+
+(deftest drafts
+  (testing "新しい下書き → 請求書（金額が空なら 単価 × 数量）"
+    (let [d (-> (inv/new-draft sample-db :sales "2026-11-20")
+                (assoc :partner-name "株式会社みなと" :subject "11 月分")
+                (assoc :lines [{:description "作業" :quantity "2" :unit-price "15000" :amount "" :choice "1000" :account ""}
+                               {:description "弁当" :quantity "3" :unit-price "540" :amount "" :choice "800r" :account ""}]))
+          {:keys [invoice errors]} (inv/draft->invoice d 0 nil)]
+      (is (nil? errors))
+      (is (= "INV-0003" (:number invoice)))
+      (is (= [[30000 1000 false] [1620 800 true]] (mapv (juxt :amount :rate :reduced?) (:lines invoice))))
+      (is (= {:net 31620 :tax 3129 :total 34749} (select-keys (inv/totals invoice) [:net :tax :total])))
+      (is (= (inv/totals invoice) (inv/draft-preview d 0)))))
+  (testing "読めない値は保存しない"
+    (let [d (assoc (inv/new-draft sample-db :sales "2026-11-20")
+                   :date "11/20" :lines [{:description "x" :quantity "1" :unit-price "" :amount "abc" :choice "1000"}])]
+      (is (= #{:date :amount} (set (map :code (:errors (inv/draft->invoice d 0 nil))))))))
+  (testing "取り込んだ請求書を直すと、書かれていた税額（:stated）は捨て、origin は残す"
+    (let [s3 (by-number sample-db "A-102")
+          d (inv/invoice->draft s3 0)
+          {:keys [invoice]} (inv/draft->invoice (assoc-in d [:lines 0 :amount] "3500") 0 (assoc s3 :origin {:format :mf-invoice-csv}))]
+      (is (nil? (:stated invoice)))
+      (is (= 3500 (get-in invoice [:lines 0 :amount])))
+      (is (= "消耗品費" (get-in invoice [:lines 0 :account])))
+      (is (= {:format :mf-invoice-csv} (:origin invoice)))))
+  (testing "税率の選択肢に、取り込んだ別の税率を足す"
+    (is (= ["1500" "15%"] (last (inv/choice-options {:lines [{:choice "1500"}]}))))))
