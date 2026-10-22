@@ -20,10 +20,10 @@
             [kaikei.core :as core]
             [kaikei.view :as view]))
 
-(def ^:private site-title "kaikei — 会計帳簿（MF・freee・弥生・QuickBooks・Xero 互換）")
+(def ^:private site-title "kaikei — 会計帳簿と請求書（MF・freee・弥生・QuickBooks・Xero 互換）")
 
 (def ^:private site-description
-  "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作ります。データは送信されません。")
+  "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作ります。請求書を作り、適格請求書の記載事項を確かめて計上できます。データは送信されません。")
 
 (def app-css
   "DADS の上に載せる配置だけ。色は DADS の custom property から引く。"
@@ -47,7 +47,7 @@
 .kk-settings,.kk-period{display:flex;flex-wrap:wrap;gap:1rem;align-items:end;margin:.75rem 0;}
 .kk-panel .dads-textarea{width:100%;}
 .kk-report-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:.5rem 1rem;}
-.kk-table-wrap{overflow-x:auto;max-width:100%;}
+.kk-table-wrap{overflow-x:auto;max-width:100%;position:relative;}
 .kk-table{width:100%;border-collapse:collapse;font-size:.875rem;}
 .kk-table th,.kk-table td{padding:.375rem .5rem;border-bottom:1px solid var(--color-neutral-solid-gray-100,#eee);text-align:left;vertical-align:top;}
 .kk-table thead th{font-weight:700;border-bottom-width:2px;white-space:nowrap;}
@@ -73,7 +73,28 @@
 .kk-check{display:flex;gap:.25rem;align-items:center;}
 .kk-danger{color:var(--color-primitive-red-800,#b00);}
 .kk-footer{margin-top:3rem;font-size:.8125rem;color:var(--color-neutral-solid-gray-600,#666);line-height:1.7;}
-.kk-noscript{font-weight:700;}")
+.kk-noscript{font-weight:700;}
+.kk-visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;}
+.kk-invoice{border:1px solid var(--color-neutral-solid-gray-200,#ddd);border-radius:.5rem;padding:1.5rem;margin-top:1rem;background:var(--color-neutral-white,#fff);}
+.kk-invoice-head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.5rem 1rem;align-items:start;}
+.kk-invoice-title{font-size:1.5rem;font-weight:700;margin:0;letter-spacing:.2em;}
+.kk-invoice-meta{display:grid;grid-template-columns:auto auto;gap:.125rem .75rem;margin:0;font-size:.875rem;}
+.kk-invoice-meta dt{font-weight:700;}
+.kk-invoice-meta dd{margin:0;}
+.kk-invoice-parties{display:flex;flex-wrap:wrap;justify-content:space-between;gap:1rem;margin:1rem 0;}
+.kk-invoice-parties p{margin:.125rem 0;}
+.kk-invoice-to{font-size:1.125rem;font-weight:700;border-bottom:1px solid currentcolor;}
+.kk-invoice-from{text-align:right;}
+.kk-invoice-total{font-size:1.125rem;margin:1rem 0;}
+.kk-invoice-rates{max-width:36rem;margin-top:1rem;}
+.kk-invoice-rates caption{text-align:left;font-weight:700;padding:.25rem 0;}
+.kk-invoice-lines .dads-input-text,.kk-invoice-lines .dads-input-text__input{min-width:5rem;max-width:100%;}
+@media print{
+body *{visibility:hidden;}
+.kk-invoice,.kk-invoice *{visibility:visible;}
+.kk-invoice{position:absolute;left:0;top:0;width:100%;border:0;margin:0;padding:0;}
+.kk-no-print{display:none;}
+}")
 
 (def ssr-state
   "SSR で描く状態。保存した仕訳はブラウザでしか分からないので、

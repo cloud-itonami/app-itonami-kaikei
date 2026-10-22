@@ -22,9 +22,10 @@
 (defn- fixture-text [f] (str (fs/readFileSync (str "test/fixtures/" f) "utf8")))
 (defn- fixture-base64 [f] (enc/bytes->base64 (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" f)))))
 
-(deftest lists-five-tools
+(deftest lists-eight-tools
   (let [tools (get-in (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "tools/list"}) ["result" "tools"])]
-    (is (= ["kaikei_import" "kaikei_validate" "kaikei_report" "kaikei_export" "kaikei_convert"]
+    (is (= ["kaikei_import" "kaikei_validate" "kaikei_report" "kaikei_export" "kaikei_convert"
+            "kaikei_invoice_totals" "kaikei_invoice_check" "kaikei_invoice_post"]
            (map #(get % "name") tools)))
     (is (every? #(get-in % ["inputSchema" "type"]) tools))
     (is (not-any? #(contains? % "run") tools))))
@@ -86,3 +87,43 @@
     (is (= -32601 (get-in (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "nope"}) ["error" "code"])))
     (is (nil? (mcp/handle {"jsonrpc" "2.0" "method" "notifications/initialized"})))
     (is (re-find #"-32700" (mcp/handle-line "{not json")))))
+
+;; ───────── 請求書（第 3 スライス、JUN-321） ─────────
+
+(deftest invoice-totals
+  (testing "国税庁 Q&A 問 57: 税込 60,000（10%）と 40,000（8%、軽減）を切捨て"
+    (let [r (ok "kaikei_invoice_totals" {"lines" [{"amount" 60000 "rate" 10} {"amount" "40000" "rate" 8 "reduced" true}]
+                                         "tax_mode" "inclusive"})]
+      (is (= ["5454" "2962"] (mapv #(str (get % "tax")) (get r "groups"))))
+      (is (= ["8416" "100000"] [(str (get r "tax")) (str (get r "total"))]))))
+  (testing "行への割り当ては、いちばん大きい行が差を持つ（freee ヘルプの例）"
+    (is (= ["42" "211" "188" "22"]
+           (mapv str (get (ok "kaikei_invoice_totals" {"lines" (for [a [426 2100 1885 220]] {"amount" a "rate" 10})})
+                          "line_tax")))))
+  (testing "セントの通貨"
+    (is (= "11.45" (str (get (ok "kaikei_invoice_totals" {"lines" [{"amount" "25.06" "rate" 15} {"amount" "25.61" "rate" 15}
+                                                                     {"amount" "25.63" "rate" 15}]
+                                                            "rounding" "half-up" "currency" "USD"})
+                             "tax")))))
+  (testing "不正な入力"
+    (is (= "invalid-argument" (err "kaikei_invoice_totals" {"lines" []})))
+    (is (= "invalid-argument" (err "kaikei_invoice_totals" {"lines" [{"amount" 100}]})))
+    (is (= "invalid-argument" (err "kaikei_invoice_totals" {"lines" [{"amount" "abc" "rate" 10}]})))))
+
+(deftest invoice-check-and-post
+  (let [{:strs [ledger invoices]} (ok "kaikei_import" {"text" (fixture-text "xero-invoices.json")})
+        check (ok "kaikei_invoice_check" {"ledger" ledger})
+        by-number (fn [rows n] (first (filter #(= n (get % "number")) rows)))]
+    (is (= 4 invoices))
+    (testing "Xero の行ごとの丸めの請求書に tax-mismatch"
+      (is (some #(= "tax-mismatch" (get % "code")) (get (by-number (get check "invoices") "INV-0102") "problems"))))
+    (testing "登録番号の無い受け取った請求書に、経過措置の割合 70%"
+      (is (= 70 (get (by-number (get check "invoices") "A-102") "deduction_percent"))))
+    (let [posted (ok "kaikei_invoice_post" {"ledger" ledger})
+          again (ok "kaikei_invoice_post" {"ledger" (get posted "ledger") "invoice_ids" (get posted "posted")})]
+      (testing "発行済み・支払済みを計上する（取消は飛ばす）"
+        (is (= 3 (count (get posted "posted"))))
+        (is (true? (get-in posted ["checks" "balanced"]))))
+      (testing "帳簿 JSON を受け渡しても id が変わらず、二重には計上しない"
+        (is (= [] (get again "posted")))
+        (is (= #{"already-posted"} (set (map #(get % "reason") (get again "skipped")))))))))

@@ -12,6 +12,13 @@
     qbo-csv      QuickBooks Online の journal entries 取り込み CSV
     xero-csv     Xero の manual journal 取り込み CSV
 
+  請求書の形式（第 3 スライス、JUN-321。:content :invoices）:
+
+    xero-invoices-json  Xero Accounting API の Invoices（ACCREC・ACCPAY）
+    qbo-invoices-json   QuickBooks Online の Invoice・Bill（query の応答）
+
+  :content は :journal（仕訳と勘定科目）・:invoices（請求書）・:all（kaikei-json）。
+
   この ns はネットワークに触れない。JSON の構文解析はホスト（JSON.parse）、
   文字コードの解読はホストの TextDecoder（kaikei.encoding）。"
   (:require [kotoba.lang.text :as text]
@@ -21,29 +28,40 @@
             [kaikei.compat.native :as native]
             [kaikei.compat.xero :as xero]
             [kaikei.compat.qbo :as qbo]
+            [kaikei.compat.xero-invoices :as xero-invoices]
+            [kaikei.compat.qbo-invoices :as qbo-invoices]
             [kaikei.compat.yayoi :as yayoi]
             [kaikei.compat.mf :as mf]
             [kaikei.compat.freee :as freee]))
 
 (def formats
-  [{:id "kaikei-json" :label "kaikei 帳簿 JSON（すべての項目）" :kind :json :encoding "utf-8"
+  [{:id "kaikei-json" :label "kaikei 帳簿 JSON（すべての項目）" :kind :json :encoding "utf-8" :content :all
     :file "kaikei-ledger.json" :mime "application/json"}
-   {:id "xero-json" :label "Xero API JSON（Accounts・ManualJournals）" :kind :json :encoding "utf-8"
+   {:id "xero-json" :content :journal :label "Xero API JSON（Accounts・ManualJournals）" :kind :json :encoding "utf-8"
     :file "kaikei-xero.json" :mime "application/json"}
-   {:id "qbo-json" :label "QuickBooks Online API JSON（Account・JournalEntry）" :kind :json :encoding "utf-8"
+   {:id "qbo-json" :content :journal :label "QuickBooks Online API JSON（Account・JournalEntry）" :kind :json :encoding "utf-8"
     :file "kaikei-quickbooks.json" :mime "application/json"}
-   {:id "yayoi" :label "弥生会計 インポート形式（仕訳日記帳）" :kind :csv :encoding "shift_jis"
+   {:id "yayoi" :content :journal :label "弥生会計 インポート形式（仕訳日記帳）" :kind :csv :encoding "shift_jis"
     :encodings ["shift_jis" "utf-8"] :file "kaikei-yayoi.txt" :mime "text/plain"}
-   {:id "mf" :label "マネーフォワード クラウド会計 仕訳帳 CSV" :kind :csv :encoding "shift_jis"
+   {:id "mf" :content :journal :label "マネーフォワード クラウド会計 仕訳帳 CSV" :kind :csv :encoding "shift_jis"
     :encodings ["shift_jis" "utf-8" "utf-8-bom"] :file "kaikei-moneyforward.csv" :mime "text/csv"}
-   {:id "freee" :label "freee 会計 仕訳 CSV（汎用形式）" :kind :csv :encoding "shift_jis"
+   {:id "freee" :content :journal :label "freee 会計 仕訳 CSV（汎用形式）" :kind :csv :encoding "shift_jis"
     :encodings ["shift_jis" "utf-8" "utf-8-bom"] :file "kaikei-freee.csv" :mime "text/csv"}
-   {:id "qbo-csv" :label "QuickBooks Online journal entries CSV" :kind :csv :encoding "utf-8"
+   {:id "qbo-csv" :content :journal :label "QuickBooks Online journal entries CSV" :kind :csv :encoding "utf-8"
     :encodings ["utf-8" "utf-8-bom"] :file "kaikei-quickbooks-journal.csv" :mime "text/csv"}
-   {:id "xero-csv" :label "Xero manual journal CSV" :kind :csv :encoding "utf-8"
-    :encodings ["utf-8" "utf-8-bom"] :file "kaikei-xero-manual-journal.csv" :mime "text/csv"}])
+   {:id "xero-csv" :content :journal :label "Xero manual journal CSV" :kind :csv :encoding "utf-8"
+    :encodings ["utf-8" "utf-8-bom"] :file "kaikei-xero-manual-journal.csv" :mime "text/csv"}
+   {:id "xero-invoices-json" :content :invoices :label "Xero API JSON（Invoices）" :kind :json :encoding "utf-8"
+    :file "kaikei-xero-invoices.json" :mime "application/json"}
+   {:id "qbo-invoices-json" :content :invoices :label "QuickBooks Online API JSON（Invoice・Bill）" :kind :json
+    :encoding "utf-8" :file "kaikei-quickbooks-invoices.json" :mime "application/json"}])
 
 (def format-ids (mapv :id formats))
+
+(defn content-formats
+  "content（:journal・:invoices）を書ける形式。kaikei-json はどちらにも入る。"
+  [content]
+  (filterv #(#{content :all} (:content %)) formats))
 
 (defn format-by-id [id] (first (filter #(= id (:id %)) formats)))
 
@@ -57,6 +75,10 @@
 (defn detect-json [data]
   (cond
     (native/detect? data) "kaikei-json"
+    ;; 請求書の形は仕訳の形より先に見る（Xero の Invoices と Accounts を 1 つの JSON に
+    ;; 入れたもの、QBO の QueryResponse に Invoice・Bill があるもの）
+    (xero-invoices/detect? data) "xero-invoices-json"
+    (qbo-invoices/detect? data) "qbo-invoices-json"
     (xero/detect? data) "xero-json"
     (qbo/detect? data) "qbo-json"
     :else nil))
@@ -96,8 +118,10 @@
             "kaikei-json" (native/read-data data)
             "xero-json" (xero/read-data data opts)
             "qbo-json" (qbo/read-data data opts)
+            "xero-invoices-json" (xero-invoices/read-data data opts)
+            "qbo-invoices-json" (qbo-invoices/read-data data opts)
             (empty-result fmt (if (nil? fmt)
-                                "JSON の形を判定できません（kaikei の帳簿 JSON、Xero の Accounts・Journals・ManualJournals、QBO の query の応答のどれでもありません）"
+                                "JSON の形を判定できません（kaikei の帳簿 JSON、Xero の Accounts・Journals・ManualJournals・Invoices、QBO の query の応答のどれでもありません）"
                                 (str (:label (format-by-id fmt)) " は JSON ではありません"))))))
       (let [rows (csv/parse s)
             fmt (if (= format "auto") (detect-csv rows) format)]

@@ -1,0 +1,291 @@
+(ns kaikei.compat.qbo-invoices
+  "QuickBooks Online Accounting API の Invoice（売上の請求書）と Bill（受け取った
+  請求書）の JSON。形の正本は intuit/QuickBooks-V3-Java-SDK（Apache-2.0）develop
+  c4d5dfa の Finance.xsd（Invoice L5803、Bill L9498、TxnTaxDetail L5094、
+  TaxLineDetail）と、Intuit の developer docs（invoice・bill・sales tax の
+  workflow。2026-10-22 に読んだ）:
+
+  - 明細は `Line[]`。`DetailType` が SalesItemLineDetail・
+    AccountBasedExpenseLineDetail・ItemBasedExpenseLineDetail の行を読み、
+    DiscountLineDetail は負の行にする（Amount は正で、引かれる）。
+    SubTotalLineDetail と DescriptionOnly（小計の行）は読まない。
+    GroupLineDetail は中の Line を読む。
+  - `Line.Amount` が正（Qty × UnitPrice と違うことがある）。
+  - 税は請求書ごと・税率ごと: `TxnTaxDetail.TaxLine[]` は税率ごとに 1 つで、
+    `TaxLineDetail` の TaxPercent・NetAmountTaxable と Amount（税額）を持つ。QBO は
+    課税の行の合計に掛けて丸める（日本の規則と同じ向き）。
+  - 行は `TaxCodeRef`（会社ごとの税コード）だけを持つ。行の税率は、同じ税コードの
+    行の合計が NetAmountTaxable と一致する TaxLine から決める。税コードが 1 つで
+    TaxLine が 1 つなら、その税率。NON は税なし。決まらなければ税率不明にする
+    （推測しない）。1 つの税コードに TaxLine が 2 つ以上当たる（米国の税の
+    グループ）請求書は、kaikei の 1 行 1 税率に入らないので飛ばす。
+  - `GlobalTaxCalculation`: TaxExcluded（既定）・TaxInclusive・NotApplicable。
+    TaxInclusive でも Line.Amount は税抜で、税込は TaxInclusiveAmt（GB・AU・CA）に
+    ある。すべての課税の行に TaxInclusiveAmt があれば税込で読み、無ければ税抜で
+    読む。
+  - 状態の欄は無い。取消は金額が 0 で PrivateNote が Voided で始まる。Balance が
+    0 なら入金・支払済み。
+
+  ## 書き出し
+
+  {\"QueryResponse\": {\"Invoice\": […], \"Bill\": […]}}（kaikei が読み戻せる形）。
+  TaxCodeRef は QBO から来た行だけ value を書き、どの行にも name（「10%」
+  「8%（軽減）」など）を書く —— POST するには会社の税コードに付け替える。
+  TxnTaxDetail には kaikei の税率ごとの税額を書く。取消の請求書は書き出さない。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.invoice :as invoice]
+            [kaikei.json :as json]
+            [kaikei.compat.common :as common]))
+
+(defn- entities [data k]
+  (let [v (or (get (get data "QueryResponse") k) (get data k))]
+    (cond (sequential? v) (filterv map? v) (map? v) [v] :else [])))
+
+(defn detect? [data]
+  (and (map? data)
+       (or (contains? (get data "QueryResponse") "Invoice")
+           (contains? (get data "QueryResponse") "Bill")
+           (contains? data "Invoice")
+           (contains? data "Bill"))))
+
+;; ───────── 取り込み ─────────
+
+(defn- flatten-lines [lines]
+  (mapcat (fn [l]
+            (if (= "GroupLineDetail" (get l "DetailType"))
+              (filter map? (get-in l ["GroupLineDetail" "Line"] []))
+              [l]))
+          (filter map? lines)))
+
+(def ^:private item-details
+  ["SalesItemLineDetail" "AccountBasedExpenseLineDetail" "ItemBasedExpenseLineDetail" "DiscountLineDetail"])
+
+(defn- ref-key [r] (when (map? r) (or (common/blank->nil (get r "value")) (common/blank->nil (get r "name")))))
+
+(defn- category-from-name [n]
+  (some (fn [[k label]] (when (= label n) k)) (dissoc invoice/category-label :taxable)))
+
+(defn- read-line [exp inclusive? where l]
+  (let [dt (get l "DetailType")
+        d (get l dt)
+        tax-ref (get d "TaxCodeRef")
+        amount-key (if (and inclusive? (some? (get d "TaxInclusiveAmt"))) (get d "TaxInclusiveAmt") (get l "Amount"))
+        {:keys [amount problem]} (common/read-amount (if (nil? amount-key) "" amount-key) exp (str where " Amount"))
+        discount? (= dt "DiscountLineDetail")
+        account (or (get-in d ["ItemAccountRef" "name"]) (get-in d ["AccountRef" "name"])
+                    (when discount? (get-in d ["DiscountAccountRef" "name"])))
+        qty (some-> (get d "Qty") str)
+        unit (some-> (get d "UnitPrice") str)]
+    (if problem
+      {:problem problem}
+      {:line (cond-> {:description (or (common/blank->nil (get l "Description"))
+                                       (get-in d ["ItemRef" "name"])
+                                       (when discount? "値引き")
+                                       "")
+                      :amount (if discount? (- amount) amount)
+                      :category :taxable}
+               (common/blank->nil account) (assoc :account account)
+               qty (assoc :quantity qty)
+               unit (assoc :unit-price unit)
+               (common/blank->nil (get tax-ref "value")) (assoc :tax {:scheme :qbo :code (get tax-ref "value")}))
+       :tax-key (ref-key tax-ref)
+       :tax-name (get tax-ref "name")
+       :has-inclusive? (some? (get d "TaxInclusiveAmt"))})))
+
+(defn- tax-lines [exp inv]
+  (vec (for [tl (get-in inv ["TxnTaxDetail" "TaxLine"] [])
+             :when (map? tl)
+             :let [d (get tl "TaxLineDetail")]]
+         {:rate (common/percent->rate (get d "TaxPercent"))
+          :net (:amount (core/parse-amount (if (nil? (get d "NetAmountTaxable")) "" (get d "NetAmountTaxable")) exp))
+          :tax (:amount (core/parse-amount (if (nil? (get tl "Amount")) "" (get tl "Amount")) exp))})))
+
+(defn- assign-rates
+  "行に税率を付ける。戻りは {:lines …} か {:compound true}。"
+  [parts tls mode inclusive?]
+  (let [tax-keys (distinct (keep :tax-key parts))
+        taxable-keys (remove #(or (= "NON" %) (category-from-name %)) tax-keys)
+        sum-of (fn [k] (reduce + 0 (map #(:amount (:line %) 0) (filter #(= k (:tax-key %)) parts))))
+        rate-of (into {}
+                      (for [k taxable-keys
+                            :let [net (sum-of k)
+                                  hits (filter #(= net (if inclusive? (+ (:net %) (:tax %)) (:net %))) tls)]]
+                        [k (cond
+                             (> (count hits) 1) :compound
+                             (= 1 (count hits)) (:rate (first hits))
+                             (and (= 1 (count taxable-keys)) (= 1 (count tls))) (:rate (first tls))
+                             :else nil)]))]
+    (if (some #(= :compound %) (vals rate-of))
+      {:compound true}
+      {:lines (mapv (fn [{:keys [line tax-key tax-name]}]
+                      (let [category (or (category-from-name tax-key) (category-from-name tax-name)
+                                         (when (or (= "NON" tax-key) (= mode :none)) :out-of-scope))]
+                        (if category
+                          (assoc line :category category :rate 0)
+                          (cond-> (assoc line :rate (get rate-of tax-key))
+                            (and tax-name (text/includes? tax-name "軽減")) (assoc :reduced? true)))))
+                    parts)})))
+
+(defn- read-invoice [{:keys [currency exp]} entity i inv]
+  (let [kind (if (= entity "Bill") :purchase :sales)
+        where (str entity " " (or (common/blank->nil (get inv "DocNumber")) (get inv "Id") (inc i)))
+        code (get-in inv ["CurrencyRef" "value"])]
+    (if (and code (not= code currency))
+      {:skip (str "帳簿と違う通貨（" code "）の請求書")}
+      (let [gtc (get inv "GlobalTaxCalculation")
+            mode (if (= gtc "NotApplicable") :none :exclusive)
+            lines (filter #(some #{(get % "DetailType")} item-details) (flatten-lines (get inv "Line" [])))
+            taxable? (fn [l] (let [k (ref-key (get-in l [(get l "DetailType") "TaxCodeRef"]))] (and k (not= k "NON"))))
+            inclusive? (and (= gtc "TaxInclusive")
+                            (seq lines)
+                            (every? #(some? (get-in % [(get % "DetailType") "TaxInclusiveAmt"])) (filter taxable? lines)))
+            mode (if inclusive? :inclusive mode)
+            parts (map-indexed (fn [j l] (read-line exp inclusive? (str where " 行 " (inc j)) l)) lines)
+            p (common/first-problem parts)
+            tls (tax-lines exp inv)
+            date (core/parse-date (get inv "TxnDate"))
+            money (fn [v] (when (some? v) (:amount (core/parse-amount v exp))))
+            total (money (get inv "TotalAmt"))
+            balance (money (get inv "Balance"))
+            voided? (and (some-> (get inv "PrivateNote") str (text/starts-with? "Voided")) (= 0 (or total 0)))]
+        (cond
+          p {:problem (:problem p)}
+          (nil? date) {:problem (str where ": TxnDate \"" (get inv "TxnDate") "\" を読めません")}
+          :else
+          (let [{:keys [compound] assigned :lines} (assign-rates parts tls mode inclusive?)]
+            (if compound
+              {:skip "1 つの税コードに税が 2 つ以上ある（税のグループの）請求書"}
+              {:invoice (invoice/infer-rounding
+                         (cond-> {:kind kind
+                                 :number (str (get inv "DocNumber" ""))
+                                 :date date
+                                 :status (cond
+                                           voided? :void
+                                           (= "Draft" (get inv "TxnStatus")) :draft
+                                           (and total balance (pos? total) (zero? balance)) :paid
+                                           :else :issued)
+                                 :partner {:name (str (or (get-in inv ["CustomerRef" "name"]) (get-in inv ["VendorRef" "name"]) ""))}
+                                 :tax-mode mode
+                                 :rounding :half-up
+                                 :lines assigned
+                                 :origin (cond-> {:format :qbo-invoices-json :entity entity}
+                                           (get inv "Id") (assoc :id (str (get inv "Id")))
+                                           gtc (assoc :global-tax-calculation gtc))}
+                          (core/parse-date (get inv "DueDate")) (assoc :due-date (core/parse-date (get inv "DueDate")))
+                          (common/blank->nil (get-in inv ["CustomerMemo" "value"]))
+                          (assoc :subject (text/trim (get-in inv ["CustomerMemo" "value"])))
+                          (seq tls)
+                          (assoc :stated (cond-> {:tax-by-rate (vec (for [[rate ts] (group-by :rate tls) :when rate]
+                                                                      {:rate rate :tax (reduce + 0 (keep :tax ts))}))}
+                                           (money (get-in inv ["TxnTaxDetail" "TotalTax"]))
+                                           (assoc :tax (money (get-in inv ["TxnTaxDetail" "TotalTax"])))
+                                           total (assoc :total total)))
+                          (and total balance) (assoc :amount-paid (- total balance) :amount-due balance))
+                         :half-up)
+               :rate-unknown? (some #(and (= :taxable (:category %)) (nil? (:rate %))) assigned)})))))))
+
+(defn read-data
+  "構文解析済みの JSON → 請求書の取り込み結果。通貨は CurrencyRef（いちばん多い
+  もの）、無ければ opts の :currency（既定 JPY）。"
+  [data {:keys [currency] :or {currency "JPY"}}]
+  (let [items (concat (map #(vector "Invoice" %) (entities data "Invoice"))
+                      (map #(vector "Bill" %) (entities data "Bill")))
+        currency (common/currency-of (map #(get-in (second %) ["CurrencyRef" "value"]) items) currency)
+        exp (core/exponent currency)]
+    (if-not exp
+      {:format :qbo-invoices-json :invoices [] :rejected 0
+       :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")]}
+      (let [ctx {:currency currency :exp exp}
+            candidates (map-indexed (fn [i [entity inv]] (read-invoice ctx entity i inv)) items)
+            unknown (count (filter :rate-unknown? candidates))]
+        (-> (merge {:format :qbo-invoices-json :currency currency} (common/finish-invoices candidates))
+            (update :warnings into
+                    (when (pos? unknown)
+                      [(str "税率の分からない明細のある請求書が " unknown " 件あります（TaxCodeRef と TxnTaxDetail の TaxLine が対応しません）")])))))))
+
+;; ───────── 書き出し ─────────
+
+(defn- decimal-string? [s] (boolean (and s (text/re-matches #"-?\d+(\.\d+)?" (str s)))))
+
+(defn- line-out [money inv t i l]
+  (let [sales? (= :sales (:kind inv))
+        k (invoice/group-key l)
+        discount? (neg? (:amount l 0))
+        share (get (:line-tax t) i 0)
+        amount (if (= :inclusive (:tax-mode inv)) (- (:amount l 0) share) (:amount l 0))
+        tax-ref (json/ordered [["value" (or (common/tax-code l :qbo)
+                                            (when (not= :taxable (:category l :taxable)) "NON"))]
+                               ["name" (invoice/group-label k)]])
+        detail-type (cond discount? "DiscountLineDetail" sales? "SalesItemLineDetail" :else "AccountBasedExpenseLineDetail")
+        detail (json/ordered
+                (cond
+                  discount? [["TaxCodeRef" tax-ref]
+                             ["DiscountAccountRef" (when (:account l) (json/ordered [["name" (:account l)]]))]]
+                  sales? [["Qty" (when (decimal-string? (:quantity l)) (json/decimal (:quantity l)))]
+                          ["UnitPrice" (when (decimal-string? (:unit-price l)) (json/decimal (:unit-price l)))]
+                          ["ItemAccountRef" (when (:account l) (json/ordered [["name" (:account l)]]))]
+                          ["TaxCodeRef" tax-ref]
+                          ["TaxInclusiveAmt" (when (= :inclusive (:tax-mode inv)) (money (:amount l 0)))]]
+                  :else [["AccountRef" (when (:account l) (json/ordered [["name" (:account l)]]))]
+                         ["TaxCodeRef" tax-ref]
+                         ["TaxInclusiveAmt" (when (= :inclusive (:tax-mode inv)) (money (:amount l 0)))]]))]
+    (json/ordered [["Description" (:description l)]
+                   ["Amount" (money (if discount? (- amount) amount))]
+                   ["DetailType" detail-type]
+                   [detail-type detail]])))
+
+(defn- invoice-out [db money inv]
+  (let [sales? (= :sales (:kind inv))
+        t (invoice/totals inv)
+        total (:total t)
+        due (or (:amount-due inv) (if (= :paid (:status inv)) 0 total))]
+    (json/ordered
+     [["Id" (when (= :qbo-invoices-json (get-in inv [:origin :format])) (get-in inv [:origin :id]))]
+      ["DocNumber" (:number inv)]
+      ["TxnStatus" (when (= :draft (:status inv)) "Draft")]
+      ["TxnDate" (:date inv)]
+      ["DueDate" (:due-date inv)]
+      [(if sales? "CustomerRef" "VendorRef") (json/ordered [["name" (get-in inv [:partner :name])]])]
+      ["CurrencyRef" (json/ordered [["value" (:currency db)]])]
+      ["GlobalTaxCalculation" (case (:tax-mode inv) :inclusive "TaxInclusive" :none "NotApplicable" "TaxExcluded")]
+      ["CustomerMemo" (when (and sales? (:subject inv)) (json/ordered [["value" (:subject inv)]]))]
+      ["Line" (vec (map-indexed (fn [i l] (line-out money inv t i l)) (:lines inv)))]
+      ["TxnTaxDetail"
+       (when-not (= :none (:tax-mode inv))
+         (json/ordered
+          [["TotalTax" (money (:tax t))]
+           ["TaxLine" (vec (for [g (:groups t) :when (= :taxable (if (keyword? (second (:key g))) :other :taxable))]
+                             (json/ordered [["Amount" (money (:used-tax g))]
+                                            ["DetailType" "TaxLineDetail"]
+                                            ["TaxLineDetail" (json/ordered [["PercentBased" true]
+                                                                            ["TaxPercent" (json/decimal (common/rate->percent (:rate g)))]
+                                                                            ["NetAmountTaxable" (money (:net g))]])]])))]]))]
+      ["TotalAmt" (money total)]
+      ["Balance" (money due)]])))
+
+(defn data
+  "db → {\"QueryResponse\": {\"Invoice\": […], \"Bill\": […]}}。戻りは {:value :notes}。"
+  [db]
+  (let [exp (core/exponent (:currency db))
+        money #(json/decimal (core/format-amount % exp))
+        invoices (remove #(= :void (:status %)) (:invoices db))
+        voids (- (count (:invoices db)) (count invoices))
+        {sales :sales purchases :purchase} (group-by :kind invoices)
+        no-code (count (filter #(and (= :taxable (:category % :taxable)) (nil? (common/tax-code % :qbo)))
+                               (mapcat :lines invoices)))]
+    {:value (json/ordered [["QueryResponse"
+                            (json/ordered [["Invoice" (mapv #(invoice-out db money %) sales)]
+                                           ["Bill" (mapv #(invoice-out db money %) purchases)]])]])
+     :notes (cond-> ["QBO の Invoice・Bill には登録番号の受け皿がありません（自社・取引先とも）"]
+              (pos? no-code)
+              (conj (str "TaxCodeRef の値の無い明細 " no-code " 行: name に税率（「10%」など）を書きました。"
+                         "POST するには会社の税コードに付け替えてください"))
+              (seq invoices)
+              (conj "CustomerRef・VendorRef・ItemAccountRef・AccountRef は名前だけです（QBO の会社の Id に付け替えが要ります）")
+              (pos? voids)
+              (conj (str "取消の請求書 " voids " 件は書き出していません")))}))
+
+(defn write [db]
+  (let [{:keys [value notes]} (data db)]
+    {:text (str (json/write value) "\n") :notes notes}))

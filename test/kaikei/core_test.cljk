@@ -88,10 +88,17 @@
       (is (= sample-db db))))
   (testing ":replace は仕訳を入れ替え、画面で付けた区分だけ残す"
     (let [db (core/set-class sample-db "謎の科目" :operating-expense)
-          {:keys [db]} (core/merge-import db {:currency "USD" :accounts [] :entries []} :replace)]
+          {:keys [db invoices-dropped]} (core/merge-import db {:currency "USD" :accounts [] :entries []} :replace)]
       (is (= [] (:entries db)))
       (is (= "USD" (:currency db)))
-      (is (= :operating-expense (core/account-class db "謎の科目"))))))
+      (is (= :operating-expense (core/account-class db "謎の科目")))
+      (testing "通貨が変わると請求書は残せない（数を返す）"
+        (is (= [] (:invoices db)))
+        (is (= 3 invoices-dropped)))))
+  (testing ":replace で取り込み結果が請求書を持たず、通貨が同じなら、請求書は残す"
+    (let [{:keys [db invoices-dropped]} (core/merge-import sample-db {:currency "JPY" :accounts [] :entries []} :replace)]
+      (is (= 3 (count (:invoices db))))
+      (is (nil? invoices-dropped)))))
 
 (deftest trial-balance
   (let [{:keys [rows totals]} (core/trial-balance sample-db fy-from fy-to)

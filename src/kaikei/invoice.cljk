@@ -1,0 +1,645 @@
+(ns kaikei.invoice
+  "請求書（第 3 スライス、Linear JUN-321）—— 値モデル、税率ごとの合計、
+  適格請求書の記載事項の検査、売掛・買掛の仕訳の計上。I/O は持たない。
+
+  ## 値モデル（db の :invoices）
+
+    {:id \"i1\"
+     :kind :sales                    ; :sales 売上（売掛）／:purchase 仕入（買掛）
+     :number \"INV-0001\"
+     :date \"2026-10-31\"              ; 取引年月日（発行日）
+     :due-date \"2026-11-30\"
+     :status :issued                 ; :draft :issued :paid :void
+     :partner {:name \"株式会社サンプル\" :registration \"T1234567890123\"}
+     :subject \"10 月分\"
+     :tax-mode :exclusive            ; :exclusive 税抜 :inclusive 税込 :none 税なし
+     :rounding :floor                ; :floor 切捨て :half-up 四捨五入 :ceil 切上げ
+     :lines [{:description \"作業費\" :quantity \"10\" :unit-price \"5000\" :amount 50000
+              :account \"売上高\" :category :taxable :rate 1000 :reduced? false}]
+     :stated {:tax-by-rate [{:rate 1000 :reduced? false :tax 5000}] :tax 5000 :total 55000}
+     :amount-paid 0 :amount-due 55000 ; 取り込み元の参考値（消込は第 4 スライス）
+     :withholding nil                ; 源泉徴収税（あれば計上しない）
+     :origin {:format :xero-invoices-json :id \"…\"}}
+
+  - 金額は最小通貨単位の整数。数量と単価は 10 進の文字列のまま持ち、表示と
+    往復に使う（計算は :amount で行う）。
+  - 税率は basis points（1000 = 10%）。:category が :taxable でない行
+    （:zero-rated 免税・:exempt 非課税・:out-of-scope 不課税）は税率 0。
+  - :stated は取り込み元が書いていた額。売上の請求書で kaikei の計算（税率
+    ごとに 1 回の端数処理）と違えば、検査で知らせる。仕訳には書かれた額を使う
+    （請求書は発行したとおりに記帳する）。
+
+  ## 数の規則
+
+  税率ごとの対価・税額・行への割り当ては guest（aiueos/kaikei_journal.cljk）と
+  同じ判定（kaikei.core の rate-tax・rate-net・tax-share）を、税率の区分
+  （10%、8%（軽減）、8%、非課税…）ごとの buffer に掛けて求める。8% の軽減と
+  8% の標準のように税率の数が同じでも、区分が違えば別に丸める。
+
+  ## 計上
+
+  `post` が請求書から仕訳を 1 つ起こし、origin に {:format :invoice
+  :invoice-id …} を付ける。計上したかどうかは、この origin を持つ仕訳が帳簿に
+  あるかで決まる（請求書の側には持たない）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]))
+
+;; ───────── 区分と表示 ─────────
+
+(def kinds [:sales :purchase])
+(def kind-label {:sales "売上" :purchase "仕入"})
+
+(def statuses [:draft :issued :paid :void])
+
+(defn status-label [kind status]
+  (case status
+    :draft "下書き"
+    :issued (if (= kind :purchase) "受領済み" "発行済み")
+    :paid (if (= kind :purchase) "支払済み" "入金済み")
+    :void "取消"
+    (str status)))
+
+(def tax-modes [:exclusive :inclusive :none])
+(def tax-mode-label {:exclusive "税抜" :inclusive "税込" :none "税なし"})
+
+(def roundings [:floor :half-up :ceil])
+(def rounding-label {:floor "切捨て" :half-up "四捨五入" :ceil "切上げ"})
+
+(def categories [:taxable :zero-rated :exempt :out-of-scope])
+(def category-label {:taxable "課税" :zero-rated "免税" :exempt "非課税" :out-of-scope "不課税"})
+
+(def mode-code {:exclusive 0 :inclusive 1 :none 2})
+(def rounding-code {:floor 0 :half-up 1 :ceil 2})
+
+(defn- blank? [s] (or (nil? s) (text/blank? (str s))))
+
+(defn format-rate
+  "basis points → 「10」「8」「12.5」。"
+  [rate]
+  (if (zero? (mod rate 100))
+    (str (quot rate 100))
+    (text/replace (core/format-amount rate 2) #"0+$" "")))
+
+(defn group-key
+  "税率の区分。課税の行は [税率 軽減か]、それ以外は [0 区分]。"
+  [line]
+  (let [category (:category line :taxable)]
+    (if (= :taxable category)
+      [(:rate line) (boolean (:reduced? line))]
+      [0 category])))
+
+(defn group-label [[rate x]]
+  (cond
+    (keyword? x) (category-label x)
+    (nil? rate) "税率不明"
+    x (str (format-rate rate) "%（軽減）")
+    :else (str (format-rate rate) "%")))
+
+;; ───────── 設定 ─────────
+
+(def default-settings
+  {:accounting :tax-excluded   ; :tax-excluded 税抜経理／:tax-included 税込経理
+   :rounding :floor
+   :accounts {:receivable "売掛金" :payable "買掛金"
+              :output-tax "仮受消費税" :input-tax "仮払消費税"
+              :sales "売上高" :purchase "仕入高"}})
+
+(def account-setting-label
+  {:receivable "売掛金の科目" :payable "買掛金の科目" :output-tax "売上の消費税の科目"
+   :input-tax "仕入の消費税の科目" :sales "売上の既定の科目" :purchase "仕入の既定の科目"})
+
+(defn settings [db]
+  (let [s (:invoice-settings db)]
+    (-> (merge default-settings (dissoc s :accounts))
+        (assoc :accounts (merge (:accounts default-settings)
+                                (into {} (remove (comp blank? val)) (:accounts s)))))))
+
+;; ───────── 登録番号 ─────────
+
+(defn normalize-registration
+  "登録番号の表記を揃える。全角を半角に（NFKC）、空白と「-」を除き、大文字に。
+  国税庁 Q&A 問 18 は「半角・全角は問いません」で、T-1234567890123 の例も
+  ある。空なら nil。形が正しいかは registration-valid? で見る。"
+  [s]
+  (when-let [s (some-> s str text/trim not-empty)]
+    (let [s #?(:cljs (.normalize s "NFKC") :clj s)]
+      (not-empty (text/upper (text/replace s #"[\s\-‐‑‒–—]" ""))))))
+
+(defn registration-valid?
+  "「T」＋数字 13 桁か（guest の registration-format?）。形だけを見て、国税庁の
+  公表サイトには照会しない。"
+  [s]
+  (boolean (some-> (normalize-registration s) text/codepoints core/registration-format? (= 1))))
+
+;; ───────── 合計 ─────────
+
+(defn- anchor-position
+  "金額の絶対値がいちばん大きい位置（同じなら前）。guest の tax-share と同じ規則。"
+  [amounts]
+  (first (reduce (fn [[best best-mag] [i a]]
+                   (let [m (if (neg? a) (- a) a)]
+                     (if (> m best-mag) [i m] [best best-mag])))
+                 [-1 -1]
+                 (map-indexed vector amounts))))
+
+(defn- stated-by-group [inv]
+  (into {} (for [{:keys [rate reduced? category tax]} (get-in inv [:stated :tax-by-rate])
+                 :when (some? tax)]
+             [(if (and category (not= category :taxable)) [0 category] [rate (boolean reduced?)]) tax])))
+
+(defn totals
+  "請求書の税率ごとの合計。
+    {:groups [{:key :label :rate :lines [行の番号] :base :net :gross
+               :tax kaikei の計算 :stated-tax 取り込み元の額 :used-tax 使う額}]
+     :net :tax :total :computed-tax
+     :line-tax {行の番号 → 行に割り当てた税額}
+     :valid? guest の invoice-buffer-valid?}
+  :used-tax は、取り込み元の額があればそれ、無ければ kaikei の計算。行への
+  割り当ては guest の tax-share（和は kaikei の計算）で、取り込み元の額との差は
+  その区分でいちばん大きい行が持つ。"
+  [inv]
+  (let [mode (mode-code (:tax-mode inv) 0)
+        rounding (rounding-code (:rounding inv) 0)
+        lines (vec (:lines inv))
+        stated (stated-by-group inv)
+        group-keys (vec (distinct (map group-key lines)))
+        groups
+        (vec (for [k group-keys
+                   :let [idx (vec (keep-indexed (fn [i l] (when (= k (group-key l)) i)) lines))
+                         rate (or (first k) 0)
+                         amounts (mapv #(:amount (lines %) 0) idx)
+                         buf (vec (mapcat (fn [a] [rate a]) amounts))
+                         tax (core/rate-tax buf rate mode rounding)
+                         base (core/rate-base buf rate)
+                         stated-tax (get stated k)
+                         used (if (and (some? stated-tax) (not= mode 2)) stated-tax tax)
+                         shares (mapv #(core/tax-share buf % mode rounding) (range (count idx)))
+                         anchor (anchor-position amounts)
+                         shares (if (and (not= used tax) (>= anchor 0)) (update shares anchor + (- used tax)) shares)]]
+               {:key k :label (group-label k) :rate rate :lines idx
+                :base base
+                :net (if (= mode 1) (- base used) base)
+                :gross (if (= mode 0) (+ base used) base)
+                :tax tax :stated-tax stated-tax :used-tax used
+                :shares (zipmap idx shares)}))
+        full-buf (vec (mapcat (fn [l] [(or (first (group-key l)) 0) (:amount l 0)]) lines))]
+    {:groups (mapv #(dissoc % :shares) groups)
+     :net (reduce + 0 (map :net groups))
+     :tax (reduce + 0 (map :used-tax groups))
+     :computed-tax (reduce + 0 (map :tax groups))
+     :total (reduce + 0 (map :gross groups))
+     :line-tax (apply merge {} (map :shares groups))
+     :valid? (= 1 (core/invoice-buffer-valid? full-buf))}))
+
+;; ───────── 端数処理の向き ─────────
+
+(defn infer-rounding
+  "取り込み元が税率ごとの税額を書いている請求書に、その額を再現する端数処理の向き
+  （:floor → :half-up → :ceil の順に試す）を付ける。どれでも再現できなければ
+  default のまま（検査で差を出す）。丸めの向きは請求書ごとに任意（国税庁 Q&A
+  問 57）で、多くの形式は向きを書かないため。"
+  [inv default]
+  (if (seq (get-in inv [:stated :tax-by-rate]))
+    (or (first (for [r roundings
+                     :let [t (totals (assoc inv :rounding r))]
+                     :when (every? #(or (nil? (:stated-tax %)) (= (:stated-tax %) (:tax %))) (:groups t))]
+                 (assoc inv :rounding r)))
+        (assoc inv :rounding default))
+    (assoc inv :rounding default)))
+
+;; ───────── 適格請求書の検査 ─────────
+
+(defn qualified?
+  "仕入の請求書の発行者（取引先）が、形の正しい登録番号を書いているか。"
+  [inv]
+  (registration-valid? (get-in inv [:partner :registration])))
+
+(defn deduction-percent
+  "仕入の請求書の仕入税額控除の割合（%）。売上の請求書は nil。日付が読めなければ nil。"
+  [inv]
+  (when (= :purchase (:kind inv))
+    (when-let [d (some-> (:date inv) core/parse-date core/date-int)]
+      (core/deduction-percent d (if (qualified? inv) 1 0)))))
+
+(def required-items
+  "法 57 条の 4 ①の記載事項に当たる問題。「記載事項の欠けた請求書」に数える。"
+  #{:issuer-name :issuer-registration :registration-format :invalid-date :description
+    :rate-unknown :tax-mismatch :recipient-name})
+
+(defn problems
+  "請求書の問題の列 [{:code … …}]。空なら記載事項の欠けは見つからない（適格請求書で
+  あることは保証しない）。売上の請求書は自社（db の :business）が発行者、仕入の
+  請求書は取引先が発行者。"
+  [db inv]
+  (let [sales? (= :sales (:kind inv))
+        business (:business db)
+        issuer-name (if sales? (:name business) (get-in inv [:partner :name]))
+        issuer-reg (if sales? (:registration business) (get-in inv [:partner :registration]))
+        recipient (if sales? (get-in inv [:partner :name]) (:name business))
+        t (totals inv)
+        differences (vec (for [g (:groups t)
+                               :when (and (some? (:stated-tax g)) (not= (:stated-tax g) (:tax g)))]
+                           {:group (:label g) :stated (:stated-tax g) :computed (:tax g)}))]
+    (cond-> []
+      (empty? (:lines inv)) (conj {:code :no-lines})
+      (nil? (some-> (:date inv) core/parse-date)) (conj {:code :invalid-date})
+      (blank? issuer-name) (conj {:code :issuer-name})
+      (blank? issuer-reg) (conj {:code :issuer-registration})
+      (and (not (blank? issuer-reg)) (not (registration-valid? issuer-reg))) (conj {:code :registration-format})
+      (some #(blank? (:description %)) (:lines inv)) (conj {:code :description})
+      (some #(and (= :taxable (:category % :taxable)) (nil? (:rate %))) (:lines inv)) (conj {:code :rate-unknown})
+      (blank? recipient) (conj {:code :recipient-name})
+      (not (:valid? t)) (conj {:code :buffer})
+      (and sales? (seq differences)) (conj {:code :tax-mismatch :differences differences})
+      (pos? (or (:withholding inv) 0)) (conj {:code :withholding}))))
+
+(defn missing-items? [db inv]
+  (boolean (some #(required-items (:code %)) (problems db inv))))
+
+(defn problem-label
+  "問題の説明（画面と MCP）。exp は通貨の小数桁。"
+  [{:keys [code differences]} inv exp]
+  (let [sales? (= :sales (:kind inv))]
+    (case code
+      :no-lines "明細がありません"
+      :invalid-date "取引年月日が読めません"
+      :issuer-name (if sales? "発行者（自社）の名称がありません。設定で入れてください" "発行者（取引先）の名称がありません")
+      :issuer-registration (if sales?
+                             "発行者（自社）の登録番号がありません。設定で入れてください"
+                             (str "発行者の登録番号がありません（適格請求書ではありません。仕入税額控除の割合の目安 "
+                                  (deduction-percent inv) "%）"))
+      :registration-format "登録番号が「T」＋数字 13 桁の形ではありません"
+      :description "内容（品名）の無い明細があります"
+      :rate-unknown "税率の分からない明細があります"
+      :recipient-name (if sales? "受け取る事業者（取引先）の名称がありません" "受け取る事業者（自社）の名称がありません。設定で入れてください")
+      :buffer "金額の形が壊れています（税率ごとの合計が負など）"
+      :tax-mismatch (str "消費税額が「1 請求書・税率ごとに 1 回の端数処理」と合いません（"
+                         (text/join "、" (for [{:keys [group stated computed]} differences]
+                                          (str group " 記載 " (core/display-amount stated exp)
+                                               "・計算 " (core/display-amount computed exp))))
+                         "）。行ごとに丸めて足した額の可能性があります")
+      :withholding "源泉徴収があります。この請求書は計上しません（源泉所得税の扱いは手で記帳してください）"
+      (str code))))
+
+;; ───────── 計上 ─────────
+
+(defn posted-entry
+  "請求書から起こした仕訳（無ければ nil）。"
+  [db invoice-id]
+  (first (filter #(= invoice-id (get-in % [:origin :invoice-id])) (:entries db))))
+
+(defn- in-ledger?
+  "Xero の Journals の取り込みで、この請求書の仕訳がもう帳簿にあるか（SourceID）。"
+  [db inv]
+  (let [src (get-in inv [:origin :id])]
+    (boolean (and src (some #(= src (get-in % [:origin :source-id])) (:entries db))))))
+
+(def blocker-label
+  {:status "下書き・取消の請求書は計上しません"
+   :already-posted "計上済みです"
+   :in-ledger "この請求書の仕訳は、取り込んだ帳簿（Xero の Journals）にもうあります"
+   :withholding "源泉徴収のある請求書は計上しません"
+   :no-lines "明細がありません"
+   :invalid-date "取引年月日が読めません"
+   :rate-unknown "税率の分からない明細があります"
+   :buffer "金額の形が壊れています"
+   :empty "金額が 0 です"})
+
+(defn post-blocker
+  "計上できない理由（できるなら nil）。"
+  [db inv]
+  (let [t (totals inv)]
+    (cond
+      (not (#{:issued :paid} (:status inv))) :status
+      (posted-entry db (:id inv)) :already-posted
+      (in-ledger? db inv) :in-ledger
+      (pos? (or (:withholding inv) 0)) :withholding
+      (empty? (:lines inv)) :no-lines
+      (nil? (some-> (:date inv) core/parse-date)) :invalid-date
+      (some #(and (= :taxable (:category % :taxable)) (nil? (:rate %))) (:lines inv)) :rate-unknown
+      (not (:valid? t)) :buffer
+      (zero? (:total t)) :empty
+      :else nil)))
+
+(defn tax-code
+  "生成した仕訳の行に付ける税の区分（kaikei の形式。表示用で、各社の税区分には
+  写さない）。"
+  [kind [rate x :as k]]
+  (if (keyword? x)
+    (str (category-label x) (if (= kind :sales) "売上" "仕入"))
+    (str (if (= kind :sales) "課税売上 " "課税仕入 ") (group-label k))))
+
+(defn- side-line
+  "金額を normal の側（:debit／:credit）に置く行。負なら反対の側。0 なら nil。"
+  [normal amount m]
+  (let [other (if (= normal :debit) :credit :debit)]
+    (cond
+      (pos? amount) (merge m {normal amount other 0})
+      (neg? amount) (merge m {other (- amount) normal 0})
+      :else nil)))
+
+(defn journal-entry
+  "請求書 → 仕訳（kaikei の値モデル）。計上できるかは post-blocker で先に見る。
+
+  税抜経理: 売上は 借 売掛金（合計）／貸 科目・税率ごとの税抜／貸 仮受消費税
+  （税率ごと）。仕入は左右が逆で、仮払消費税と買掛金。税込の請求書の税抜は、
+  行の税込から行に割り当てた税額（tax-share）を引いたもの。税込経理: 税の行を
+  起こさず、科目・税率ごとの税込。"
+  [db inv]
+  (let [{:keys [accounting accounts]} (settings db)
+        sales? (= :sales (:kind inv))
+        included? (= :tax-included accounting)
+        t (totals inv)
+        lines (vec (:lines inv))
+        partner (some-> (get-in inv [:partner :name]) text/trim not-empty)
+        description (str (if sales? "請求書 " "受け取った請求書 ") (:number inv))
+        default-account (if sales? (:sales accounts) (:purchase accounts))
+        body (fn [i]
+               (let [a (:amount (lines i) 0)
+                     share (get (:line-tax t) i 0)]
+                 (case (:tax-mode inv)
+                   :inclusive (if included? a (- a share))
+                   :none a
+                   (if included? (+ a share) a))))
+        grouped (reduce (fn [acc i]
+                          (let [l (lines i)
+                                k [(or (some-> (:account l) text/trim not-empty) default-account) (group-key l)]]
+                            (if (some #(= k (first %)) acc)
+                              (mapv (fn [[kk v]] (if (= kk k) [kk (+ v (body i))] [kk v])) acc)
+                              (conj acc [k (body i)]))))
+                        []
+                        (range (count lines)))
+        normal (if sales? :credit :debit)
+        qualification (when-not sales?
+                        (if (qualified? inv) "適格" (str (deduction-percent inv) "%控除")))
+        meta-of (fn [k] (cond-> {:description description
+                                 :tax {:scheme :kaikei :code (tax-code (:kind inv) k)}}
+                          partner (assoc :partner partner)
+                          qualification (assoc :invoice {:scheme :kaikei :code qualification})))
+        body-lines (keep (fn [[[account k] amount]] (side-line normal amount (assoc (meta-of k) :account account)))
+                         grouped)
+        tax-lines (when-not included?
+                    (keep (fn [g]
+                            (side-line normal (:used-tax g)
+                                       (assoc (meta-of (:key g))
+                                              :account (if sales? (:output-tax accounts) (:input-tax accounts)))))
+                          (:groups t)))
+        counter (side-line (if sales? :debit :credit) (:total t)
+                           (cond-> {:account (if sales? (:receivable accounts) (:payable accounts))
+                                    :description description}
+                             partner (assoc :partner partner)))]
+    (cond-> {:date (core/parse-date (:date inv))
+             :number (:number inv)
+             :lines (vec (remove nil? (concat [counter] body-lines tax-lines)))
+             :origin {:format :invoice :invoice-id (:id inv) :kind (:kind inv)}}
+      (or partner (:subject inv)) (assoc :memo (text/join " " (remove blank? [partner (:subject inv)]))))))
+
+(defn unpost
+  "請求書から起こした仕訳を消す。"
+  [db invoice-id]
+  (update db :entries #(filterv (fn [e] (not= invoice-id (get-in e [:origin :invoice-id]))) %)))
+
+(defn invoice-by-id [db id]
+  (first (filter #(= id (:id %)) (:invoices db))))
+
+(defn post
+  "請求書 id を計上する。戻りは {:db :entry-id} か {:db db :skipped 理由}。"
+  [db id]
+  (if-let [inv (invoice-by-id db id)]
+    (if-let [reason (post-blocker db inv)]
+      {:db db :skipped reason}
+      (let [[db' entry-id] (core/append-entry db (journal-entry db inv))]
+        {:db db' :entry-id entry-id}))
+    {:db db :skipped :not-found}))
+
+(defn repost
+  "計上し直す（仕訳を消してから起こす）。計上できない状態なら消すだけ。"
+  [db id]
+  (post (unpost db id) id))
+
+(defn post-all
+  "まだ計上していない、発行済み・入金済みの請求書をすべて計上する。戻りは
+  {:db :posted [id …] :skipped [{:id :reason} …]}（下書き・取消・計上済みは
+  :skipped に入れない）。"
+  [db]
+  (reduce (fn [{:keys [db] :as acc} inv]
+            (if (or (not (#{:issued :paid} (:status inv))) (posted-entry db (:id inv)))
+              acc
+              (let [{db' :db :keys [skipped]} (post db (:id inv))]
+                (if skipped
+                  (update acc :skipped conj {:id (:id inv) :reason skipped})
+                  (-> acc (assoc :db db') (update :posted conj (:id inv)))))))
+          {:db db :posted [] :skipped []}
+          (:invoices db)))
+
+;; ───────── 作成・編集 ─────────
+
+(defn- invoice-id-number [inv]
+  (or (some->> (:id inv) (text/re-matches #"i(\d+)") second parse-long) 0))
+
+(defn next-number
+  "次の請求書番号。同じ種類の請求書の番号のうち、末尾の数がいちばん大きいものの
+  次（桁と前置きを保つ）。売上の請求書が無ければ INV-0001。"
+  [db kind]
+  (let [nums (keep (fn [inv]
+                     (when (= kind (:kind inv))
+                       (when-let [[_ prefix digits] (some->> (:number inv) (text/re-matches #"(.*?)(\d+)"))]
+                         [prefix digits (parse-long digits)])))
+                   (:invoices db))]
+    (if-let [[prefix digits n] (last (sort-by #(nth % 2) nums))]
+      (str prefix (text/pad-left (str (inc n)) (count digits) "0"))
+      (if (= kind :sales) "INV-0001" ""))))
+
+(defn save-invoice
+  "請求書を足すか置き換える（:id が帳簿にあれば置き換え）。計上済みの請求書は
+  計上し直す —— 取消・下書きになったら仕訳を消すだけ。戻りは {:db :id}。"
+  [db inv]
+  (let [existing (when (:id inv) (invoice-by-id db (:id inv)))
+        id (or (:id existing)
+               (str "i" (inc (reduce max 0 (map invoice-id-number (:invoices db))))))
+        inv (assoc inv :id id)
+        was-posted? (some? (posted-entry db id))
+        db (if existing
+             (update db :invoices (fn [is] (mapv #(if (= id (:id %)) inv %) is)))
+             (update db :invoices (fnil conj []) inv))]
+    {:db (if was-posted? (:db (repost db id)) db) :id id}))
+
+(defn delete-invoice
+  "請求書を消す（起こした仕訳も消す）。"
+  [db id]
+  (-> (unpost db id)
+      (update :invoices #(filterv (fn [inv] (not= id (:id inv))) %))))
+
+;; ───────── 単価 × 数量 ─────────
+
+(defn- parse-decimal
+  "10 進の文字列 → {:neg? :digits \"12345\" :scale 2}（読めなければ nil）。"
+  [s]
+  (let [s (some-> s str text/trim (text/replace #"[,\s]" ""))]
+    (when-let [[_ sign int-part frac] (some->> s (text/re-matches #"([-−]?)(\d*)(?:\.(\d+))?"))]
+      (when (or (seq int-part) (seq frac))
+        {:neg? (boolean (seq sign)) :digits (str int-part frac) :scale (count (or frac ""))}))))
+
+(defn- digit-vals [s] (mapv #(parse-long (str %)) (reverse s)))
+
+(defn- multiply-digits
+  "数字の文字列 2 つの積（筆算。JS の数の桁を超えても正確）。"
+  [a b]
+  (let [x (digit-vals a) y (digit-vals b)
+        cells (reduce (fn [acc [i j]] (update acc (+ i j) + (* (x i) (y j))))
+                      (vec (repeat (+ (count x) (count y)) 0))
+                      (for [i (range (count x)) j (range (count y))] [i j]))
+        [digits carry] (reduce (fn [[out carry] c]
+                                 (let [v (+ c carry)] [(conj out (mod v 10)) (quot v 10)]))
+                               [[] 0] cells)
+        s (text/replace (apply str (reverse (concat digits (when (pos? carry) (digit-vals (str carry))))))
+                        #"^0+(?=\d)" "")]
+    (if (= s "") "0" s)))
+
+(defn line-amount
+  "単価 × 数量 → {:amount 最小通貨単位} か {:error :format|:range}。exp は通貨の
+  小数桁、rounding は :floor・:half-up・:ceil（絶対値で丸める）。数量が空なら 1。"
+  [quantity unit-price exp rounding]
+  (let [q (if (blank? quantity) {:neg? false :digits "1" :scale 0} (parse-decimal quantity))
+        p (parse-decimal unit-price)]
+    (if (or (nil? q) (nil? p))
+      {:error :format}
+      (let [digits (multiply-digits (:digits q) (:digits p))
+            scale (+ (:scale q) (:scale p))
+            neg? (not= (:neg? q) (:neg? p))
+            [whole rest-digits] (if (<= scale exp)
+                                  [(str digits (apply str (repeat (- exp scale) "0"))) ""]
+                                  (let [cut (- scale exp)
+                                        padded (text/pad-left digits (inc cut) "0")]
+                                    [(subs padded 0 (- (count padded) cut)) (subs padded (- (count padded) cut))]))
+            whole (let [t (text/replace whole #"^0+(?=\d)" "")] (if (= t "") "0" t))
+            up? (case rounding
+                  :half-up (and (seq rest-digits) (>= (parse-long (subs rest-digits 0 1)) 5))
+                  :ceil (boolean (text/re-find #"[1-9]" rest-digits))
+                  false)]
+        (if (> (count whole) 15)
+          {:error :range}
+          (let [n (cond-> (parse-long whole) up? inc)]
+            {:amount (if (and neg? (pos? n)) (- n) n)}))))))
+
+;; ───────── 画面の入力（下書き） ─────────
+;;
+;; 画面の編集は文字列の下書きで持つ（入力の途中の値を壊さないため）。
+;;   {:id :kind :number :date :due-date :status :partner-name :partner-registration
+;;    :subject :tax-mode :rounding
+;;    :lines [{:description :quantity :unit-price :amount :choice :account}]}
+;; :choice は税率の選び方: 課税は \"1000\"・\"800r\"（r は軽減）、ほかは区分の名前。
+
+(def rate-choices
+  [["1000" "10%"] ["800r" "8%（軽減）"] ["800" "8%"]
+   ["zero-rated" "免税"] ["exempt" "非課税"] ["out-of-scope" "不課税"]])
+
+(defn line-choice [l]
+  (let [category (:category l :taxable)]
+    (cond
+      (not= :taxable category) (name category)
+      (nil? (:rate l)) ""
+      :else (str (:rate l) (when (:reduced? l) "r")))))
+
+(defn choice-options
+  "税率の選択肢。既定の 6 つに、下書きにある別の税率（取り込んだ 15% など）を足す。"
+  [draft]
+  (let [known (set (map first rate-choices))
+        extra (distinct (remove #(or (known %) (= "" %)) (map :choice (:lines draft))))]
+    (vec (concat (when (some #(= "" (:choice %)) (:lines draft)) [["" "税率を選ぶ"]])
+                 rate-choices
+                 (for [c extra
+                       :let [[_ bp r] (text/re-matches #"(\d+)(r?)" c)]
+                       :when bp]
+                   [c (group-label [(parse-long bp) (= r "r")])])))))
+
+(defn- choice->fields [choice]
+  (if-let [[_ bp r] (some->> choice (text/re-matches #"(\d+)(r?)"))]
+    {:category :taxable :rate (parse-long bp) :reduced? (= r "r")}
+    (if-let [c (some #(when (= choice (name %)) %) [:zero-rated :exempt :out-of-scope])]
+      {:category c :rate 0 :reduced? false}
+      {:category :taxable :rate nil :reduced? false})))
+
+(def empty-draft-line {:description "" :quantity "1" :unit-price "" :amount "" :choice "1000" :account ""})
+
+(defn new-draft
+  "新しい請求書の下書き。date は今日（\"YYYY-MM-DD\"。画面が渡す）。"
+  [db kind date]
+  {:kind kind :number (next-number db kind) :date date :due-date "" :status :issued
+   :partner-name "" :partner-registration "" :subject ""
+   :tax-mode :exclusive :rounding (:rounding (settings db))
+   :lines [empty-draft-line]})
+
+(defn invoice->draft [inv exp]
+  {:id (:id inv) :kind (:kind inv) :number (or (:number inv) "") :date (or (:date inv) "")
+   :due-date (or (:due-date inv) "") :status (:status inv)
+   :partner-name (or (get-in inv [:partner :name]) "")
+   :partner-registration (or (get-in inv [:partner :registration]) "")
+   :subject (or (:subject inv) "")
+   :tax-mode (:tax-mode inv :exclusive) :rounding (:rounding inv :floor)
+   :lines (mapv (fn [l] {:description (or (:description l) "") :quantity (or (:quantity l) "")
+                         :unit-price (or (:unit-price l) "")
+                         :amount (core/format-amount (:amount l 0) exp)
+                         :choice (line-choice l) :account (or (:account l) "")})
+                (:lines inv))})
+
+(defn draft-line-amount
+  "下書きの行の金額。:amount が空なら 単価 × 数量 を四捨五入。{:amount} か {:error}。"
+  [l exp]
+  (if (blank? (:amount l))
+    (if (blank? (:unit-price l))
+      {:amount 0}
+      (line-amount (:quantity l) (:unit-price l) exp :half-up))
+    (core/parse-amount (:amount l) exp)))
+
+(def draft-error-label
+  {:date "取引年月日が読めません（YYYY-MM-DD）"
+   :due-date "期日が読めません（YYYY-MM-DD）"
+   :amount "金額が読めない明細があります（行 "
+   :lines "明細がありません"})
+
+(defn draft->invoice
+  "下書き → 請求書。戻りは {:invoice} か {:errors [{:code … :line n}]}。base は
+  編集する前の請求書（取り込み元の情報を残す。明細を直したので :stated は捨てる
+  —— 書かれていた税額は、もう直した明細の額ではないため）。"
+  [draft exp base]
+  (let [amounts (mapv #(draft-line-amount % exp) (:lines draft))
+        errors (cond-> []
+                 (nil? (core/parse-date (:date draft))) (conj {:code :date})
+                 (and (not (blank? (:due-date draft))) (nil? (core/parse-date (:due-date draft)))) (conj {:code :due-date})
+                 (empty? (:lines draft)) (conj {:code :lines})
+                 true (into (keep-indexed (fn [i a] (when (:error a) {:code :amount :line (inc i)})) amounts)))]
+    (if (seq errors)
+      {:errors errors}
+      {:invoice (cond-> (merge (dissoc base :stated)
+                               {:kind (:kind draft)
+                                :number (text/trim (str (:number draft)))
+                                :date (core/parse-date (:date draft))
+                                :status (:status draft)
+                                :partner (cond-> {:name (text/trim (str (:partner-name draft)))}
+                                           (not (blank? (:partner-registration draft)))
+                                           (assoc :registration (normalize-registration (:partner-registration draft))))
+                                :tax-mode (:tax-mode draft)
+                                :rounding (:rounding draft)
+                                :lines (mapv (fn [l a]
+                                               (cond-> (merge {:description (text/trim (str (:description l)))
+                                                               :amount (:amount a)}
+                                                              (choice->fields (:choice l)))
+                                                 (not (blank? (:quantity l))) (assoc :quantity (text/trim (:quantity l)))
+                                                 (not (blank? (:unit-price l))) (assoc :unit-price (text/trim (:unit-price l)))
+                                                 (not (blank? (:account l))) (assoc :account (text/trim (:account l)))))
+                                             (:lines draft) amounts)})
+                  (:id draft) (assoc :id (:id draft))
+                  (not (blank? (:due-date draft))) (assoc :due-date (core/parse-date (:due-date draft)))
+                  (blank? (:due-date draft)) (dissoc :due-date)
+                  (not (blank? (:subject draft))) (assoc :subject (text/trim (:subject draft)))
+                  (blank? (:subject draft)) (dissoc :subject)
+                  (not= (:kind draft) (:kind base)) (dissoc :origin))})))
+
+(defn draft-preview
+  "入力の途中の下書きの合計（読めない金額は 0 として）。"
+  [draft exp]
+  (totals {:tax-mode (:tax-mode draft) :rounding (:rounding draft)
+           :lines (mapv (fn [l] (merge {:amount (or (:amount (draft-line-amount l exp)) 0)}
+                                       (choice->fields (:choice l))))
+                        (:lines draft))}))

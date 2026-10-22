@@ -11,6 +11,14 @@
 ;; :buffers の名前（keyword）は :args の中でその buffer に置き換わる。
 ;; :sample は guest の sample-ledger と同じ帳簿（[date class debit credit] × 20 行）。
 ;; 区分: 1 流動資産 … 6 純資産、7 売上高 … 14 法人税等（guest の docstring）。
+;;
+;; 請求書の buffer は [rate amount] × n（rate は basis points）。mode 0 税抜・
+;; 1 税込・2 税なし、rounding 0 切捨て・1 四捨五入・2 切上げ。例の出所:
+;;   :freee         freee ヘルプ 23500770784153（10%: 426・2,100・1,885・220 → 463、
+;;                  いちばん大きい行が差を持つ）
+;;   :nta57         国税庁 Q&A 問 57（税込 10% 60,000 → 5,454、8% 40,000 → 2,962）
+;;   :xero-rounding Xero「Rounding in Xero」（15%: 25.06・25.61・25.63。行ごとの
+;;                  丸めの和は 11.44、税率ごとに 1 回なら 11.45）
 {:buffers
  {:sample [20260331 1 1000000 0       20260331 6 0 1000000
            20260401 1 200000 0        20260401 5 0 200000
@@ -23,7 +31,12 @@
            20260901 1 5000 0          20260901 12 0 5000
            20270331 14 30000 0        20270331 4 0 30000]
   :unclassified [20260101 0 100 0 20260101 1 0 100]
-  :unbalanced [20260101 1 100 0 20260101 7 0 90]}
+  :unbalanced [20260101 1 100 0 20260101 7 0 90]
+  :mixed [1000 50000 1000 33333 800 12345]
+  :freee [1000 426 1000 2100 1000 1885 1000 220]
+  :nta57 [1000 60000 800 40000]
+  :xero-rounding [1500 2506 1500 2561 1500 2563]
+  :discount [1000 1000 800 1080 1000 -100]}
 
  :rows
  [;; validate-entry [debit credit] × n → エラービット
@@ -102,4 +115,80 @@
   {:fn "statement-buffer-valid?" :args [[20260101 1 100]] :expect 0}
   {:fn "statement-buffer-valid?" :args [[20260101 15 100 0]] :expect 0}
   {:fn "statement-buffer-valid?" :args [[20260101 1 -100 0]] :expect 0}
-  {:fn "statement-buffer-valid?" :args [[-1 1 100 0]] :expect 0}]}
+  {:fn "statement-buffer-valid?" :args [[-1 1 100 0]] :expect 0}
+
+  ;; rate-base [buf rate] — 税率ごとの対価の合計
+  {:fn "rate-base" :args [:mixed 1000] :expect 83333}
+  {:fn "rate-base" :args [:mixed 800] :expect 12345}
+  {:fn "rate-base" :args [:mixed 0] :expect 0}
+
+  ;; rate-tax [buf rate mode rounding] — 税率ごとに 1 回だけ丸める
+  {:fn "rate-tax" :args [:mixed 1000 0 0] :expect 8333}
+  {:fn "rate-tax" :args [:mixed 1000 0 1] :expect 8333}
+  {:fn "rate-tax" :args [:mixed 1000 0 2] :expect 8334}
+  {:fn "rate-tax" :args [:mixed 800 0 0] :expect 987}
+  {:fn "rate-tax" :args [:mixed 800 0 1] :expect 988}
+  {:fn "rate-tax" :args [:mixed 1000 2 0] :expect 0}
+  {:fn "rate-tax" :args [[1000 1000] 1000 1 0] :expect 90}
+  {:fn "rate-tax" :args [[1000 1000] 1000 1 1] :expect 91}
+  {:fn "rate-tax" :args [:nta57 1000 1 0] :expect 5454}
+  {:fn "rate-tax" :args [:nta57 800 1 0] :expect 2962}
+  {:fn "rate-tax" :args [[1000 3017 800 2524] 1000 0 0] :expect 301}
+  {:fn "rate-tax" :args [[1000 3017 800 2524] 800 0 0] :expect 201}
+  {:fn "rate-tax" :args [:xero-rounding 1500 0 1] :expect 1145}
+  {:fn "rate-tax" :args [[1000 900000000000000] 1000 1 0] :expect 81818181818181}
+  {:fn "rate-tax" :args [[1000 900000000000000] 1000 1 1] :expect 81818181818182}
+
+  ;; invoice-tax [buf mode rounding] — 税率ごとの税額の和
+  {:fn "invoice-tax" :args [:mixed 0 0] :expect 9320}
+  {:fn "invoice-tax" :args [:nta57 1 0] :expect 8416}
+  {:fn "invoice-tax" :args [[1000 105 1000 105 1000 105] 0 0] :expect 31}
+  {:fn "invoice-tax" :args [[0 5000 1000 1000] 0 0] :expect 100}
+  {:fn "invoice-tax" :args [:freee 0 0] :expect 463}
+  {:fn "invoice-tax" :args [[] 0 0] :expect 0}
+
+  ;; invoice-total [buf mode rounding] — 税込の合計
+  {:fn "invoice-total" :args [:mixed 0 0] :expect 104998}
+  {:fn "invoice-total" :args [[1000 110000 800 10800] 1 0] :expect 120800}
+  {:fn "invoice-total" :args [[1000 5000] 2 0] :expect 5000}
+
+  ;; rate-net [buf rate mode rounding] — 税率ごとの税抜の対価
+  {:fn "rate-net" :args [[1000 110000 800 10800] 1000 1 0] :expect 100000}
+  {:fn "rate-net" :args [[1000 1000] 1000 1 1] :expect 909}
+  {:fn "rate-net" :args [:mixed 1000 0 0] :expect 83333}
+
+  ;; tax-share [buf line mode rounding] — 行への割り当て（和は rate-tax）
+  {:fn "tax-share" :args [:freee 0 0 0] :expect 42}
+  {:fn "tax-share" :args [:freee 1 0 0] :expect 211}
+  {:fn "tax-share" :args [:freee 2 0 0] :expect 188}
+  {:fn "tax-share" :args [:freee 3 0 0] :expect 22}
+  {:fn "tax-share" :args [:discount 0 1 0] :expect 90}
+  {:fn "tax-share" :args [:discount 1 1 0] :expect 80}
+  {:fn "tax-share" :args [:discount 2 1 0] :expect -9}
+  {:fn "tax-share" :args [:xero-rounding 0 0 1] :expect 375}
+  {:fn "tax-share" :args [:xero-rounding 2 0 1] :expect 386}
+  {:fn "tax-share" :args [:mixed 0 2 0] :expect 0}
+
+  ;; invoice-buffer-valid?
+  {:fn "invoice-buffer-valid?" :args [:mixed] :expect 1}
+  {:fn "invoice-buffer-valid?" :args [[]] :expect 1}
+  {:fn "invoice-buffer-valid?" :args [[1000]] :expect 0}
+  {:fn "invoice-buffer-valid?" :args [[10001 100]] :expect 0}
+  {:fn "invoice-buffer-valid?" :args [[1000 100 1000 -200]] :expect 0}
+  {:fn "invoice-buffer-valid?" :args [[1000 900000000000001]] :expect 0}
+
+  ;; registration-format? [codes] — 「T」＋数字 13 桁（符号位置の列）
+  {:fn "registration-format?" :args [[84 49 50 51 52 53 54 55 56 57 48 49 50 51]] :expect 1}
+  {:fn "registration-format?" :args [[116 49 50 51 52 53 54 55 56 57 48 49 50 51]] :expect 0}
+  {:fn "registration-format?" :args [[84 49 50 51 52 53 54 55 56 57 48 49 50]] :expect 0}
+  {:fn "registration-format?" :args [[84 49 50 51 52 53 54 55 56 57 48 49 50 65]] :expect 0}
+
+  ;; deduction-percent [date qualified] — 国税庁 Q&A 問 113 の経過措置
+  {:fn "deduction-percent" :args [20261022 1] :expect 100}
+  {:fn "deduction-percent" :args [20230930 0] :expect 100}
+  {:fn "deduction-percent" :args [20231001 0] :expect 80}
+  {:fn "deduction-percent" :args [20260930 0] :expect 80}
+  {:fn "deduction-percent" :args [20261001 0] :expect 70}
+  {:fn "deduction-percent" :args [20281001 0] :expect 50}
+  {:fn "deduction-percent" :args [20301001 0] :expect 30}
+  {:fn "deduction-percent" :args [20311001 0] :expect 0}]}

@@ -1,0 +1,141 @@
+(ns kaikei.invoice-formats-test
+  "請求書の形式（第 3 スライス、JUN-321）: kaikei-json・Xero の Invoices・QBO の
+  Invoice・Bill の取り込みと往復。fixture の形の出所は test/fixtures/README.md。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [kaikei.core :as core]
+            [kaikei.export :as export]
+            [kaikei.ingest :as ingest]
+            [kaikei.invoice :as inv]))
+
+(defn- fixture [name] (str (fs/readFileSync (str "test/fixtures/" name) "utf8")))
+
+(defn- import-text [s & {:as opts}]
+  (ingest/ingest-text s (merge {:format "auto"} opts)))
+
+(def sample-db (:db (core/merge-import core/empty-db core/sample-import)))
+
+(defn- by-number [invoices number] (first (filter #(= number (:number %)) invoices)))
+
+(defn- summary
+  "請求書を比べる形: 種類・番号・日付・状態・取引先・税込/税抜、税率の区分ごとの
+  [区分 対価 税額]、合計。"
+  [i]
+  (let [t (inv/totals i)]
+    [(:kind i) (:number i) (:date i) (:status i) (get-in i [:partner :name]) (:tax-mode i)
+     (mapv (juxt :label :base :used-tax) (:groups t)) (:total t)]))
+
+(defn- round-trip [db fmt]
+  (let [{:keys [text error notes]} (export/export db fmt)
+        parsed (import-text text)]
+    {:error error :notes notes :parsed parsed
+     :db (:db (core/merge-import (assoc core/empty-db :currency (:currency db)) parsed))}))
+
+;; ───────── kaikei-json ─────────
+
+(deftest kaikei-json-keeps-invoices
+  (let [{posted :db} (inv/post-all sample-db)
+        {:keys [db]} (round-trip posted "kaikei-json")]
+    (testing "請求書・自社・計上した仕訳の結び付きが戻る"
+      (is (= (map summary (:invoices posted)) (map summary (:invoices db))))
+      (is (= (:business posted) (:business db)))
+      (is (= 2 (count (filter #(inv/posted-entry db (:id %)) (:invoices db))))))
+    (testing "明細の項目も失わない"
+      (is (= (mapv :lines (:invoices posted)) (mapv :lines (:invoices db)))))))
+
+;; ───────── Xero ─────────
+
+(deftest xero-invoices-import
+  (let [{:keys [format currency invoices invoices-skipped warnings]} (import-text (fixture "xero-invoices.json"))
+        inv1 (by-number invoices "INV-0101")
+        inv2 (by-number invoices "INV-0102")
+        bill (by-number invoices "A-102")]
+    (is (= :xero-invoices-json format))
+    (is (= "JPY" currency))
+    (testing "ACCREC・ACCPAY の 4 件。クレジットノートと違う通貨の 2 件は飛ばす"
+      (is (= ["INV-0101" "INV-0102" "A-102" "INV-0103"] (mapv :number invoices)))
+      (is (= 2 invoices-skipped))
+      (is (some #(re-find #"ACCRECCREDIT" %) warnings))
+      (is (some #(re-find #"USD" %) warnings)))
+    (testing "TaxRates で TaxType を税率に引き、Accounts で科目名に引く"
+      (is (= [[:sales "INV-0101" "2026-10-31" :issued "株式会社みなと" :exclusive
+               [["10%" 50000 5000] ["8%" 4000 320]] 59320]]
+             [(summary inv1)]))
+      (is (= ["売上高" "売上高"] (mapv :account (:lines inv1))))
+      (is (= "10 月分" (:subject inv1)))
+      (is (= :floor (:rounding inv1)) "書かれた税額を再現する向き"))
+    (testing "Xero の行ごとの丸め（11 × 3 = 33）は、税率ごとに 1 回（31・32）と合わない"
+      (is (= 33 (:tax (inv/totals inv2))))
+      (is (= :tax-mismatch (some #{:tax-mismatch} (map :code (inv/problems sample-db inv2))))))
+    (testing "支払済みの受け取った請求書"
+      (is (= [:purchase :paid 3630 0] [(:kind bill) (:status bill) (:amount-paid bill) (:amount-due bill)])))
+    (testing "取消"
+      (is (= :void (:status (by-number invoices "INV-0103")))))))
+
+(deftest xero-invoices-round-trip
+  (let [{:keys [db notes error]} (round-trip sample-db "xero-invoices-json")]
+    (is (nil? error))
+    (testing "kaikei で作った請求書も、仮の TaxType で税率が戻る"
+      (is (= (map summary (:invoices sample-db)) (map summary (:invoices db)))))
+    (is (some #(re-find #"KAIKEI-10" %) notes))
+    (is (some #(re-find #"登録番号" %) notes)))
+  (testing "Xero から取り込んだ請求書は TaxType を保つ（支払済みは AUTHORISED で書くので、発行済みに戻る）"
+    (let [parsed (import-text (fixture "xero-invoices.json"))
+          from-xero (:db (core/merge-import core/empty-db parsed))
+          {:keys [db]} (round-trip from-xero "xero-invoices-json")
+          paid->issued (fn [i] (cond-> i (= :paid (:status i)) (assoc :status :issued)))]
+      (is (= (map (comp summary paid->issued) (remove #(= :void (:status %)) (:invoices from-xero)))
+             (map summary (:invoices db))))
+      (is (= {:scheme :xero :code "TAX001"} (get-in (by-number (:invoices db) "INV-0101") [:lines 1 :tax]))))))
+
+;; ───────── QBO ─────────
+
+(deftest qbo-invoices-import
+  (let [{:keys [format invoices invoices-skipped warnings]} (import-text (fixture "qbo-invoices.json"))
+        inv1 (by-number invoices "1037")
+        bill (by-number invoices "A-102")]
+    (is (= :qbo-invoices-json format))
+    (testing "SubTotalLineDetail は読まず、TaxCodeRef の行の合計と NetAmountTaxable で税率を決める"
+      (is (= [:sales "1037" "2026-10-31" :issued "株式会社みなと" :exclusive
+              [["10%" 50000 5000] ["8%" 4000 320]] 59320]
+             (summary inv1)))
+      (is (= ["売上高" "売上高"] (mapv :account (:lines inv1))))
+      (is (= "10 月分" (:subject inv1))))
+    (testing "取消（金額 0・PrivateNote Voided）"
+      (is (= :void (:status (by-number invoices "1038")))))
+    (testing "米国の税のグループ（1 行に 2 つの税）は飛ばす"
+      (is (nil? (by-number invoices "1039")))
+      (is (= 1 invoices-skipped))
+      (is (some #(re-find #"税のグループ" %) warnings)))
+    (testing "Bill は受け取った請求書。Balance 0 で支払済み"
+      (is (= [:purchase :paid "消耗品費" 330]
+             [(:kind bill) (:status bill) (get-in bill [:lines 0 :account]) (:tax (inv/totals bill))])))))
+
+(deftest qbo-invoices-round-trip
+  (let [{:keys [db error notes]} (round-trip sample-db "qbo-invoices-json")]
+    (is (nil? error))
+    (testing "税込の請求書は Line.Amount を税抜、TaxInclusiveAmt を税込で書き、税込で読み戻す"
+      (is (= (map summary (:invoices sample-db)) (map summary (:invoices db)))))
+    (testing "軽減税率は TaxCodeRef の name で戻る"
+      (is (true? (get-in (by-number (:invoices db) "INV-0001") [:lines 1 :reduced?]))))
+    (is (some #(re-find #"TaxCodeRef" %) notes))))
+
+;; ───────── 計上と日本の仕訳 CSV ─────────
+
+(deftest invoice-entries-in-japanese-csv
+  (let [{db :db} (inv/post-all sample-db)]
+    (doseq [[fmt pattern] [["mf" #"対象外"] ["freee" #"対象外"] ["yayoi" #"対象外"]]]
+      (testing (str fmt " では請求書から起こした仕訳の税区分を 対象外 と書く")
+        (let [{:keys [text notes error]} (export/export db fmt {:encoding "utf-8"})
+              invoice-rows (filter #(re-find #"仮受消費税|仮払消費税" %) (.split text "\n"))]
+          (is (nil? error))
+          (is (seq invoice-rows))
+          (is (every? #(re-find pattern %) invoice-rows))
+          (is (not-any? #(re-find #"課税売上" %) invoice-rows))
+          (is (some #(re-find #"請求書から起こした仕訳 2 件" %) notes)))))
+    (testing "仕訳の形式では請求書が入らないことを注記する"
+      (is (some #(re-find #"請求書 3 件はこの形式に入りません" %) (:notes (export/export db "qbo-json")))))))
+
+(deftest xero-journals-keep-source-id
+  (let [parsed (import-text (fixture "xero-journals.json"))]
+    (is (some #(get-in % [:origin :source-id]) (:entries parsed)))))

@@ -4,6 +4,7 @@
   (:require [cljs.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [kaikei.core :as core]
+            [kaikei.invoice]
             [kaikei.view :as view]))
 
 (defn- nodes [tree]
@@ -66,3 +67,41 @@
         tree (render sample-db view/initial-ui h)
         buttons (filter #(and (vector? %) (= :button (first %)) (map? (second %)) (:on-click (second %))) (nodes tree))]
     (is (seq buttons))))
+
+;; ───────── 請求書（第 3 スライス、JUN-321） ─────────
+
+(deftest invoices-render
+  (let [i1 (:id (first (:invoices sample-db)))
+        base (assoc view/initial-ui :mode :invoices)
+        list-view (render sample-db base view/ssr-handlers)
+        detail (render sample-db (assoc base :invoice i1) view/ssr-handlers)
+        editor (render sample-db (assoc base :invoice-draft (kaikei.invoice/new-draft sample-db :sales "2026-11-20"))
+                       view/ssr-handlers)
+        settings (render sample-db (assoc base :invoice-settings-open? true) view/ssr-handlers)
+        purchases (render sample-db (assoc base :invoice-kind :purchase :invoice (:id (last (:invoices sample-db))))
+                          view/ssr-handlers)]
+    (doseq [[label tree] [["一覧" list-view] ["詳細" detail] ["編集" editor] ["設定" settings] ["仕入" purchases]]]
+      (testing label (is (not-any? fn? (nodes tree)))))
+    (testing "一覧と検査の欄"
+      (is (has-text? list-view "INV-0001"))
+      (is (has-text? list-view "59,320"))
+      (is (has-text? list-view "計上していない請求書が ")))
+    (testing "詳細は適格請求書の記載事項を並べる"
+      (is (has-text? detail "登録番号 T1234567890123"))
+      (is (has-text? detail "株式会社みなと 御中"))
+      (is (has-text? detail "10%対象"))
+      (is (has-text? detail "8%（軽減）対象"))
+      (is (has-text? detail "※ は軽減税率の対象です。"))
+      (is (has-text? detail "切捨て")))
+    (testing "受け取った請求書は経過措置の割合を出す"
+      (is (has-text? purchases "70%")))
+    (testing "編集と設定"
+      (is (has-text? editor "新しい請求書（売上）"))
+      (is (has-text? settings "自社の登録番号")))))
+
+(deftest invoices-without-entries
+  (testing "仕訳が無くても請求書のタブは使える"
+    (let [db (dissoc (:db (core/merge-import core/empty-db (dissoc core/sample-import :entries))) :entries)
+          tree (render (assoc db :entries []) (assoc view/initial-ui :mode :invoices) view/ssr-handlers)]
+      (is (has-text? tree "INV-0001"))
+      (is (not (has-text? tree "まだ仕訳がありません"))))))

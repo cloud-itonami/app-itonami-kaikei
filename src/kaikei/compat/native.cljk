@@ -11,9 +11,19 @@
                               \"partner\", \"partner_type\", \"description\", \"tax\": {\"scheme\", \"code\"},
                               \"tax_amount\", \"invoice\": {\"scheme\", \"code\"},
                               \"tracking\": [[\"名前\", \"選択肢\"]]}],
-                   \"origin\": {…}}]}
+                   \"origin\": {…}}],
+     \"invoices\": [{\"id\", \"kind\", \"number\", \"date\", \"due_date\", \"status\",
+                    \"partner\": {\"name\", \"registration\"}, \"subject\", \"tax_mode\", \"rounding\",
+                    \"lines\": [{\"description\", \"quantity\", \"unit_price\", \"amount\", \"account\",
+                               \"account_code\", \"category\", \"rate\", \"reduced\", \"tax\"}],
+                    \"stated\": {\"tax_by_rate\": [{\"rate\", \"reduced\", \"category\", \"tax\"}], \"tax\", \"total\"},
+                    \"amount_paid\", \"amount_due\", \"withholding\", \"origin\": {…}}],
+     \"business\": {\"name\", \"registration\"},
+     \"invoice_settings\": {\"accounting\", \"rounding\", \"accounts\": {\"receivable\", …}}}
 
-  金額は最小通貨単位の整数。"
+  金額は最小通貨単位の整数、税率は basis points（1000 = 10%）。invoices・
+  business・invoice_settings は第 3 スライス（JUN-321）で足した任意のキーで、
+  版は v1 のまま（無い JSON も読む）。"
   (:require [kotoba.lang.text :as text]
             [kaikei.core :as core]
             [kaikei.json :as json]))
@@ -29,7 +39,7 @@
 
 (defn- read-origin [m]
   (when (map? m)
-    (into {} (for [[k v] m] [(keyword k) (if (and (= k "format") (string? v)) (keyword v) v)]))))
+    (into {} (for [[k v] m] [(keyword k) (if (and (#{"format" "kind"} k) (string? v)) (keyword v) v)]))))
 
 (defn- line-in [m]
   (cond-> {:account (str (get m "account" ""))
@@ -73,6 +83,87 @@
       (map? (get m "qbo")) (assoc :qbo (into {} (for [[k v] (get m "qbo")] [(keyword k) v])))
       (map? (get m "xero")) (assoc :xero (into {} (for [[k v] (get m "xero")] [(keyword k) v]))))))
 
+;; ───────── 請求書 ─────────
+
+(def ^:private invoice-enums
+  {"kind" #{:sales :purchase} "status" #{:draft :issued :paid :void}
+   "tax_mode" #{:exclusive :inclusive :none} "rounding" #{:floor :half-up :ceil}
+   "category" #{:taxable :zero-rated :exempt :out-of-scope}})
+
+(defn- enum [m k default]
+  (let [v (kw (get m k))]
+    (if (contains? (invoice-enums k) v) v default)))
+
+(defn- integer-value? [v] (and (number? v) (integer? v)))
+
+(defn- invoice-line-in [m]
+  (cond-> {:description (str (get m "description" ""))
+           :amount (get m "amount" 0)
+           :category (enum m "category" :taxable)}
+    (get m "quantity") (assoc :quantity (str (get m "quantity")))
+    (get m "unit_price") (assoc :unit-price (str (get m "unit_price")))
+    (get m "account") (assoc :account (get m "account"))
+    (get m "account_code") (assoc :account-code (get m "account_code"))
+    (integer-value? (get m "rate")) (assoc :rate (get m "rate"))
+    (true? (get m "reduced")) (assoc :reduced? true)
+    (scheme-code (get m "tax")) (assoc :tax (scheme-code (get m "tax")))))
+
+(defn- stated-in [m]
+  (when (map? m)
+    (cond-> {}
+      (sequential? (get m "tax_by_rate"))
+      (assoc :tax-by-rate (vec (for [r (get m "tax_by_rate") :when (and (map? r) (integer-value? (get r "tax")))]
+                                 (cond-> {:tax (get r "tax")}
+                                   (integer-value? (get r "rate")) (assoc :rate (get r "rate"))
+                                   (true? (get r "reduced")) (assoc :reduced? true)
+                                   (kw (get r "category")) (assoc :category (kw (get r "category")))))))
+      (integer-value? (get m "tax")) (assoc :tax (get m "tax"))
+      (integer-value? (get m "total")) (assoc :total (get m "total")))))
+
+(defn- read-invoice [i m]
+  (let [lines (get m "lines")
+        where (str "請求書 " (inc i))]
+    (cond
+      (not (map? m)) {:problem (str where ": オブジェクトではありません")}
+      (not (sequential? lines)) {:problem (str where ": lines がありません")}
+      (not (every? #(and (map? %) (integer-value? (get % "amount" 0))) lines))
+      {:problem (str where ": 金額は最小通貨単位の整数で書きます")}
+      (not (contains? #{:sales :purchase} (kw (get m "kind"))))
+      {:problem (str where ": kind は sales か purchase です")}
+      :else
+      {:invoice (cond-> {:kind (enum m "kind" :sales)
+                         :number (str (get m "number" ""))
+                         :date (or (core/parse-date (get m "date")) (str (get m "date" "")))
+                         :status (enum m "status" :draft)
+                         :partner (let [p (get m "partner")]
+                                    (cond-> {:name (str (get p "name" ""))}
+                                      (get p "registration") (assoc :registration (get p "registration"))))
+                         :tax-mode (enum m "tax_mode" :exclusive)
+                         :rounding (enum m "rounding" :floor)
+                         :lines (mapv invoice-line-in lines)}
+                  (get m "id") (assoc :id (get m "id"))
+                  (core/parse-date (get m "due_date")) (assoc :due-date (core/parse-date (get m "due_date")))
+                  (get m "subject") (assoc :subject (get m "subject"))
+                  (seq (stated-in (get m "stated"))) (assoc :stated (stated-in (get m "stated")))
+                  (integer-value? (get m "amount_paid")) (assoc :amount-paid (get m "amount_paid"))
+                  (integer-value? (get m "amount_due")) (assoc :amount-due (get m "amount_due"))
+                  (integer-value? (get m "withholding")) (assoc :withholding (get m "withholding"))
+                  (read-origin (get m "origin")) (assoc :origin (read-origin (get m "origin"))))})))
+
+(defn- business-in [m]
+  (when (map? m)
+    (not-empty (cond-> {}
+                 (string? (get m "name")) (assoc :name (get m "name"))
+                 (string? (get m "registration")) (assoc :registration (get m "registration"))))))
+
+(defn- invoice-settings-in [m]
+  (when (map? m)
+    (not-empty (cond-> {}
+                 (#{:tax-excluded :tax-included} (kw (get m "accounting"))) (assoc :accounting (kw (get m "accounting")))
+                 (#{:floor :half-up :ceil} (kw (get m "rounding"))) (assoc :rounding (kw (get m "rounding")))
+                 (map? (get m "accounts")) (assoc :accounts (into {} (for [[k v] (get m "accounts") :when (string? v)]
+                                                                       [(keyword k) v])))))))
+
 (defn detect? [data] (and (map? data) (= format-id (get data "format"))))
 
 (defn read-data
@@ -82,16 +173,22 @@
     {:format :kaikei-json :entries [] :accounts []
      :warnings [(str "\"format\": \"" format-id "\" の JSON ではありません")] :rejected 0}
     (let [currency (get data "currency" "JPY")
-          candidates (map-indexed read-entry (get data "entries" []))]
+          candidates (map-indexed read-entry (get data "entries" []))
+          invoices (map-indexed read-invoice (get data "invoices" []))]
       (if-not (core/exponent currency)
         {:format :kaikei-json :entries [] :accounts []
          :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")] :rejected 0}
-        {:format :kaikei-json
-         :currency currency
-         :accounts (mapv read-account (filter map? (get data "accounts" [])))
-         :entries (vec (keep :entry candidates))
-         :warnings (vec (keep :problem candidates))
-         :rejected (count (filter :problem candidates))}))))
+        (cond-> {:format :kaikei-json
+                 :currency currency
+                 :accounts (mapv read-account (filter map? (get data "accounts" [])))
+                 :entries (vec (keep :entry candidates))
+                 :warnings (vec (concat (keep :problem candidates) (keep :problem invoices)))
+                 :rejected (count (filter :problem candidates))}
+          (contains? data "invoices") (assoc :invoices (vec (keep :invoice invoices))
+                                             :invoices-rejected (count (filter :problem invoices)))
+          (business-in (get data "business")) (assoc :business (business-in (get data "business")))
+          (invoice-settings-in (get data "invoice_settings"))
+          (assoc :invoice-settings (invoice-settings-in (get data "invoice_settings"))))))))
 
 (defn- line-out [l]
   (json/ordered
@@ -116,6 +213,47 @@
 (defn- vendor-out [m]
   (when (seq m) (json/ordered (for [[k v] (sort-by (comp name key) m)] [(name k) v]))))
 
+(defn- kw-name [v] (when v (name v)))
+
+(defn- invoice-out [inv]
+  (json/ordered
+   [["id" (:id inv)]
+    ["kind" (kw-name (:kind inv))]
+    ["number" (:number inv)]
+    ["date" (:date inv)]
+    ["due_date" (:due-date inv)]
+    ["status" (kw-name (:status inv))]
+    ["partner" (json/ordered [["name" (get-in inv [:partner :name])]
+                              ["registration" (get-in inv [:partner :registration])]])]
+    ["subject" (:subject inv)]
+    ["tax_mode" (kw-name (:tax-mode inv))]
+    ["rounding" (kw-name (:rounding inv))]
+    ["lines" (vec (for [l (:lines inv)]
+                    (json/ordered [["description" (:description l)]
+                                   ["quantity" (:quantity l)]
+                                   ["unit_price" (:unit-price l)]
+                                   ["amount" (:amount l 0)]
+                                   ["account" (:account l)]
+                                   ["account_code" (:account-code l)]
+                                   ["category" (kw-name (:category l :taxable))]
+                                   ["rate" (:rate l)]
+                                   ["reduced" (when (:reduced? l) true)]
+                                   ["tax" (when-let [{:keys [scheme code]} (:tax l)]
+                                            (json/ordered [["scheme" (name scheme)] ["code" code]]))]])))]
+    ["stated" (when-let [st (not-empty (:stated inv))]
+                (json/ordered [["tax_by_rate" (when (seq (:tax-by-rate st))
+                                                (vec (for [r (:tax-by-rate st)]
+                                                       (json/ordered [["rate" (:rate r)]
+                                                                      ["reduced" (when (:reduced? r) true)]
+                                                                      ["category" (kw-name (:category r))]
+                                                                      ["tax" (:tax r)]]))))]
+                               ["tax" (:tax st)]
+                               ["total" (:total st)]]))]
+    ["amount_paid" (:amount-paid inv)]
+    ["amount_due" (:amount-due inv)]
+    ["withholding" (:withholding inv)]
+    ["origin" (origin-out (:origin inv))]]))
+
 (defn data
   "db → kaikei.ledger.v1 の値（json/write に渡す形）。"
   [db]
@@ -138,6 +276,15 @@
                                      ["note" (:note e)]
                                      ["adjustment" (when (:adjustment? e) true)]
                                      ["lines" (mapv line-out (:lines e))]
-                                     ["origin" (origin-out (:origin e))]])))]]))
+                                     ["origin" (origin-out (:origin e))]])))]
+    ["invoices" (mapv invoice-out (:invoices db))]
+    ["business" (when-let [b (not-empty (:business db))]
+                  (json/ordered [["name" (:name b)] ["registration" (:registration b)]]))]
+    ["invoice_settings" (when-let [st (not-empty (:invoice-settings db))]
+                          (json/ordered [["accounting" (kw-name (:accounting st))]
+                                         ["rounding" (kw-name (:rounding st))]
+                                         ["accounts" (when (seq (:accounts st))
+                                                       (json/ordered (for [[k v] (sort-by (comp name key) (:accounts st))]
+                                                                       [(name k) v])))]]))]]))
 
 (defn write [db] (str (json/write (data db)) "\n"))

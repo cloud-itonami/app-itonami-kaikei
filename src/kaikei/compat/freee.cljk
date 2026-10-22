@@ -138,7 +138,7 @@
                                   [(:account l) nil (:sub-account l) (:partner l) nil (:department l) nil nil
                                    nil nil nil
                                    (when l (str (+ (:debit l 0) (:credit l 0))))
-                                   (common/tax-code l :freee) (some-> (:tax-amount l) str)])]
+                                   (common/export-tax-code e l :freee) (some-> (:tax-amount l) str)])]
                        (vec (concat ["[明細行]" (core/slash-date (:date e)) (str (inc i))
                                      (when (:adjustment? e) "1")]
                                     (cols d) (cols c)
@@ -150,7 +150,8 @@
   (if (not= "JPY" (:currency db))
     {:error (str "freee の仕訳 CSV は円の金額です。帳簿の通貨が " (:currency db) " なので書き出しません")}
     {:text (csv/write (rows db))
-     :notes (cond-> ["伝票番号は書き出した仕訳の連番です（freee は同じ日付・同じ伝票番号の仕訳がすでにあると取り込みません）"]
+     :notes (cond-> (vec (remove nil? ["伝票番号は書き出した仕訳の連番です（freee は同じ日付・同じ伝票番号の仕訳がすでにあると取り込みません）"
+                                       (common/invoice-entry-note db)]))
               (common/lossy-note db :freee {:tax "税区分（freee 以外の形式のもの）" :invoice "インボイス区分"
                                             :tracking "Xero の tracking"})
               (conj (common/lossy-note db :freee {:tax "税区分（freee 以外の形式のもの）" :invoice "インボイス区分"

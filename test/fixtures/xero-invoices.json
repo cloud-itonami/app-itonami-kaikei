@@ -1,0 +1,245 @@
+{
+  "Id": "3f1d2b8e-0c4a-4e59-9a77-5b0f1c2d3e4f",
+  "Status": "OK",
+  "ProviderName": "kaikei synthetic fixture",
+  "DateTimeUTC": "/Date(1793404800000)/",
+  "Invoices": [
+    {
+      "Type": "ACCREC",
+      "InvoiceID": "7a1b2c3d-0001-4000-8000-000000000001",
+      "InvoiceNumber": "INV-0101",
+      "Reference": "10 月分",
+      "Contact": {
+        "ContactID": "c0000000-0000-4000-8000-000000000001",
+        "Name": "株式会社みなと"
+      },
+      "Date": "/Date(1793404800000+0000)/",
+      "DueDate": "/Date(1795996800000+0000)/",
+      "Status": "AUTHORISED",
+      "LineAmountTypes": "Exclusive",
+      "CurrencyCode": "JPY",
+      "LineItems": [
+        {
+          "LineItemID": "l1",
+          "Description": "ウェブサイトの保守（10 月分）",
+          "Quantity": 1.0,
+          "UnitAmount": 50000.0,
+          "AccountCode": "400",
+          "TaxType": "OUTPUT",
+          "TaxAmount": 5000.0,
+          "LineAmount": 50000.0,
+          "Tracking": []
+        },
+        {
+          "LineItemID": "l2",
+          "Description": "打ち合わせの弁当",
+          "Quantity": 5.0,
+          "UnitAmount": 800.0,
+          "AccountCode": "400",
+          "TaxType": "TAX001",
+          "TaxAmount": 320.0,
+          "LineAmount": 4000.0,
+          "Tracking": []
+        }
+      ],
+      "SubTotal": 54000.0,
+      "TotalTax": 5320.0,
+      "Total": 59320.0,
+      "AmountDue": 59320.0,
+      "AmountPaid": 0.0,
+      "AmountCredited": 0.0
+    },
+    {
+      "Type": "ACCREC",
+      "InvoiceID": "7a1b2c3d-0002-4000-8000-000000000002",
+      "InvoiceNumber": "INV-0102",
+      "Contact": {
+        "Name": "合同会社かもめ"
+      },
+      "Date": "/Date(1793836800000+0000)/",
+      "DueDate": "/Date(1795996800000+0000)/",
+      "Status": "AUTHORISED",
+      "LineAmountTypes": "Exclusive",
+      "CurrencyCode": "JPY",
+      "LineItems": [
+        {
+          "Description": "部品 A",
+          "Quantity": 1.0,
+          "UnitAmount": 105.0,
+          "AccountCode": "400",
+          "TaxType": "OUTPUT",
+          "TaxAmount": 11.0,
+          "LineAmount": 105.0
+        },
+        {
+          "Description": "部品 B",
+          "Quantity": 1.0,
+          "UnitAmount": 105.0,
+          "AccountCode": "400",
+          "TaxType": "OUTPUT",
+          "TaxAmount": 11.0,
+          "LineAmount": 105.0
+        },
+        {
+          "Description": "部品 C",
+          "Quantity": 1.0,
+          "UnitAmount": 105.0,
+          "AccountCode": "400",
+          "TaxType": "OUTPUT",
+          "TaxAmount": 11.0,
+          "LineAmount": 105.0
+        }
+      ],
+      "SubTotal": 315.0,
+      "TotalTax": 33.0,
+      "Total": 348.0,
+      "AmountDue": 348.0,
+      "AmountPaid": 0.0
+    },
+    {
+      "Type": "ACCPAY",
+      "InvoiceID": "7a1b2c3d-0003-4000-8000-000000000003",
+      "InvoiceNumber": "A-102",
+      "Contact": {
+        "Name": "やまだ文具"
+      },
+      "Date": "/Date(1792454400000+0000)/",
+      "DueDate": "/Date(1795996800000+0000)/",
+      "Status": "PAID",
+      "LineAmountTypes": "Exclusive",
+      "CurrencyCode": "JPY",
+      "LineItems": [
+        {
+          "Description": "コピー用紙",
+          "Quantity": 3.0,
+          "UnitAmount": 1100.0,
+          "AccountCode": "461",
+          "TaxType": "INPUT",
+          "TaxAmount": 330.0,
+          "LineAmount": 3300.0
+        }
+      ],
+      "SubTotal": 3300.0,
+      "TotalTax": 330.0,
+      "Total": 3630.0,
+      "AmountDue": 0.0,
+      "AmountPaid": 3630.0
+    },
+    {
+      "Type": "ACCREC",
+      "InvoiceID": "7a1b2c3d-0004-4000-8000-000000000004",
+      "InvoiceNumber": "INV-0103",
+      "Contact": {
+        "Name": "株式会社みなと"
+      },
+      "Date": "/Date(1794268800000+0000)/",
+      "Status": "VOIDED",
+      "LineAmountTypes": "Inclusive",
+      "CurrencyCode": "JPY",
+      "LineItems": [
+        {
+          "Description": "取り消した作業",
+          "Quantity": 1.0,
+          "UnitAmount": 11000.0,
+          "AccountCode": "400",
+          "TaxType": "OUTPUT",
+          "TaxAmount": 1000.0,
+          "LineAmount": 11000.0
+        }
+      ],
+      "SubTotal": 10000.0,
+      "TotalTax": 1000.0,
+      "Total": 11000.0,
+      "AmountDue": 0.0,
+      "AmountPaid": 0.0
+    },
+    {
+      "Type": "ACCRECCREDIT",
+      "InvoiceID": "7a1b2c3d-0005-4000-8000-000000000005",
+      "InvoiceNumber": "CN-0001",
+      "Contact": {
+        "Name": "株式会社みなと"
+      },
+      "Date": "/Date(1794441600000+0000)/",
+      "Status": "AUTHORISED",
+      "LineAmountTypes": "Exclusive",
+      "CurrencyCode": "JPY",
+      "LineItems": [
+        {
+          "Description": "返品",
+          "Quantity": 1.0,
+          "UnitAmount": 1000.0,
+          "AccountCode": "400",
+          "TaxType": "OUTPUT",
+          "TaxAmount": 100.0,
+          "LineAmount": 1000.0
+        }
+      ]
+    },
+    {
+      "Type": "ACCREC",
+      "InvoiceID": "7a1b2c3d-0006-4000-8000-000000000006",
+      "InvoiceNumber": "INV-0104",
+      "Contact": {
+        "Name": "Example Ltd"
+      },
+      "Date": "/Date(1794700800000+0000)/",
+      "Status": "AUTHORISED",
+      "LineAmountTypes": "Exclusive",
+      "CurrencyCode": "USD",
+      "LineItems": [
+        {
+          "Description": "Consulting",
+          "Quantity": 1.0,
+          "UnitAmount": 100.0,
+          "AccountCode": "400",
+          "TaxType": "NONE",
+          "TaxAmount": 0.0,
+          "LineAmount": 100.0
+        }
+      ]
+    }
+  ],
+  "TaxRates": [
+    {
+      "Name": "消費税 10%（売上）",
+      "TaxType": "OUTPUT",
+      "ReportTaxType": "OUTPUT",
+      "DisplayTaxRate": 10.0,
+      "EffectiveRate": 10.0,
+      "Status": "ACTIVE"
+    },
+    {
+      "Name": "消費税 8%（軽減）",
+      "TaxType": "TAX001",
+      "ReportTaxType": "OUTPUT",
+      "DisplayTaxRate": 8.0,
+      "EffectiveRate": 8.0,
+      "Status": "ACTIVE"
+    },
+    {
+      "Name": "消費税 10%（仕入）",
+      "TaxType": "INPUT",
+      "ReportTaxType": "INPUT",
+      "DisplayTaxRate": 10.0,
+      "EffectiveRate": 10.0,
+      "Status": "ACTIVE"
+    }
+  ],
+  "Accounts": [
+    {
+      "AccountID": "a0000000-0000-4000-8000-000000000400",
+      "Code": "400",
+      "Name": "売上高",
+      "Type": "REVENUE",
+      "Class": "REVENUE"
+    },
+    {
+      "AccountID": "a0000000-0000-4000-8000-000000000461",
+      "Code": "461",
+      "Name": "消耗品費",
+      "Type": "EXPENSE",
+      "Class": "EXPENSE"
+    }
+  ]
+}

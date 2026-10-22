@@ -140,8 +140,8 @@
 
 (defn rows [db]
   (let [filled (atom 0)
-        tax-or-fill (fn [l]
-                      (or (common/tax-code l :yayoi)
+        tax-or-fill (fn [e l]
+                      (or (common/export-tax-code e l :yayoi)
                           (do (when l (swap! filled inc)) "対象外")))
         out (apply concat
                    (for [e (:entries db)
@@ -156,7 +156,7 @@
                         (let [flag (cond (= n 1) single-flag (zero? i) "2110" (= i (dec n)) "2101" :else "2100")
                               first? (zero? i)
                               side (fn [l]
-                                     [(:account l) (:sub-account l) (:department l) (tax-or-fill l)
+                                     [(:account l) (:sub-account l) (:department l) (tax-or-fill e l)
                                       (str (+ (:debit l 0) (:credit l 0))) (some-> (:tax-amount l) str)])]
                           (vec (concat [flag (if first? (:number e) nil) (if first? settle nil)
                                         (core/slash-date (:date e))]
@@ -172,7 +172,7 @@
     {:error (str "弥生インポート形式は円の金額です。帳簿の通貨が " (:currency db) " なので書き出しません")}
     (let [{:keys [rows filled]} (rows db)]
       {:text (csv/write rows)
-       :notes (cond-> []
+       :notes (cond-> (vec (remove nil? [(common/invoice-entry-note db)]))
                 (pos? filled) (conj (str "弥生の税区分が無い " filled " 行は 対象外 と書きました（弥生は税区分が必須です。税区分を推測していません）"))
                 (common/lossy-note db :yayoi {:partner "取引先" :tracking "Xero の tracking"
                                               :invoice "インボイス区分（弥生は税区分の末尾に付けます）"})

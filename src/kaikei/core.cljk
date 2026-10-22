@@ -7,9 +7,12 @@
   `validate-entry` `entry-balanced?` `ledger-balanced?` `account-net`
   `class-valid?` `normal-sign` `period-net` `class-balance` `profit-stage`
   `unclassified-count` `bs-difference` `statement-balanced?`
-  `statement-buffer-valid?` は guest の写し。入力も出力も整数（vector-i64 は
-  Clojure の vector）で、test/fixtures/parity.edn の全行を guest（3 target +
-  wasm）とこちら（kbb）の両方が通す。
+  `statement-buffer-valid?` は guest の写し。請求書の `rate-base` `rate-tax`
+  `invoice-tax` `invoice-total` `rate-net` `tax-share` `invoice-buffer-valid?`
+  `registration-format?` `deduction-percent`（第 3 スライス、JUN-321）も同じ。
+  入力も出力も整数（vector-i64 は Clojure の vector）で、
+  test/fixtures/parity.edn の全行を guest（3 target + wasm）とこちら（kbb）の
+  両方が通す。
 
   ## 値モデル（db）
 
@@ -24,7 +27,10 @@
                          :sub-account … :department … :partner … :description …
                          :tax {:scheme :mf :code \"課税売上 10%\"} :tax-amount 100
                          :invoice {:scheme :mf :code \"適格\"} :tracking [[name option] …]}]
-                :origin {:format :mf :row 12}}]}
+                :origin {:format :mf :row 12}}]
+     :invoices [{:id \"i1\" :kind :sales …}]    ; kaikei.invoice の docstring
+     :business {:name … :registration …}         ; 自社（請求書の発行者）
+     :invoice-settings {…}}
 
   金額は最小通貨単位の整数（JPY は 1 円、USD は 1 セント）。1 帳簿 1 通貨で、
   通貨の桁は ISO 4217 の小数桁（`currency-exponent`）。日付は \"YYYY-MM-DD\" の
@@ -186,6 +192,103 @@
                                 (>= (nth buf (+ i 2)) 0)
                                 (>= (nth buf (+ i 3)) 0))))
                        (range 0 n 4))))))
+
+;; ───────── 請求書の判定（parity。guest と同じ式） ─────────
+;;
+;; buffer は請求書 1 件 = [rate amount] × n（rate は basis points）。mode 0 税抜・
+;; 1 税込・2 税なし、rounding 0 切捨て・1 四捨五入・2 切上げ。掛け算は
+;; base = a·d + b に分けて a·rate + R(b·rate / d) にする —— JS の数（2^53 まで
+;; 正確）でも guest の i64 でも、同じ値になる。
+
+(defn- magnitude [x] (if (neg? x) (- x) x))
+
+(defn- round-div [n d rounding]
+  (let [q (quot n d)
+        r (- n (* q d))]
+    (case rounding
+      0 q
+      1 (if (>= (* 2 r) d) (inc q) q)
+      (if (pos? r) (inc q) q))))
+
+(defn- scaled [base rate d rounding]
+  (let [m (magnitude base)
+        a (quot m d)
+        b (- m (* a d))
+        v (+ (* a rate) (round-div (* b rate) d rounding))]
+    (if (neg? base) (- v) v)))
+
+(defn- denominator [mode rate] (if (= mode 0) 10000 (+ 10000 rate)))
+
+(defn- invoice-pairs [buf] (partition 2 buf))
+
+(defn rate-base [buf rate]
+  (reduce + 0 (for [[r a] (invoice-pairs buf) :when (= r rate)] a)))
+
+(defn rate-tax [buf rate mode rounding]
+  (if (= mode 2)
+    0
+    (scaled (rate-base buf rate) rate (denominator mode rate) rounding)))
+
+(defn invoice-tax [buf mode rounding]
+  (reduce + 0 (map #(rate-tax buf % mode rounding) (distinct (map first (invoice-pairs buf))))))
+
+(defn invoice-total [buf mode rounding]
+  (let [sum (reduce + 0 (map second (invoice-pairs buf)))]
+    (if (= mode 0) (+ sum (invoice-tax buf mode rounding)) sum)))
+
+(defn rate-net [buf rate mode rounding]
+  (if (= mode 1)
+    (- (rate-base buf rate) (rate-tax buf rate mode rounding))
+    (rate-base buf rate)))
+
+(defn- anchor-line
+  "税率 rate の行のうち、金額の絶対値がいちばん大きい行の番号（同じなら上の行）。"
+  [buf rate]
+  (first (reduce (fn [[best best-mag] [i [r a]]]
+                   (if (and (= r rate) (> (magnitude a) best-mag)) [i (magnitude a)] [best best-mag]))
+                 [-1 -1]
+                 (map-indexed vector (invoice-pairs buf)))))
+
+(defn tax-share [buf line mode rounding]
+  (let [pairs (vec (invoice-pairs buf))
+        [rate amount] (nth pairs line)
+        d (denominator mode rate)]
+    (cond
+      (= mode 2) 0
+      (= (anchor-line buf rate) line)
+      (- (rate-tax buf rate mode rounding)
+         (reduce + 0 (for [[i [r a]] (map-indexed vector pairs)
+                           :when (and (= r rate) (not= i line))]
+                       (scaled a rate d 0))))
+      :else (scaled amount rate d 0))))
+
+(defn invoice-buffer-valid? [buf]
+  (flag (and (even? (count buf))
+             (every? (fn [[r a]]
+                       (and (<= 0 r 10000)
+                            (<= (magnitude a) 900000000000000)
+                            (>= (rate-base buf r) 0)))
+                     (invoice-pairs buf)))))
+
+(defn registration-format?
+  "codes は文字の符号位置の列。「T」（84）＋数字 13 桁の 14 文字なら 1。"
+  [codes]
+  (flag (and (= 14 (count codes))
+             (= 84 (first codes))
+             (every? #(<= 48 % 57) (rest codes)))))
+
+(defn deduction-percent
+  "仕入税額控除の割合（%）。date は yyyymmdd、qualified は 1／0。国税庁 Q&A
+  問 113（令和 8 年 5 月改訂）の経過措置。"
+  [date qualified]
+  (cond
+    (= qualified 1) 100
+    (< date 20231001) 100
+    (< date 20261001) 80
+    (< date 20281001) 70
+    (< date 20301001) 50
+    (< date 20311001) 30
+    :else 0))
 
 ;; ───────── 金額 ─────────
 
@@ -401,7 +504,7 @@
 
 ;; ───────── 値モデル ─────────
 
-(def empty-db {:version 1 :currency "JPY" :accounts {} :entries []})
+(def empty-db {:version 1 :currency "JPY" :accounts {} :entries [] :invoices []})
 
 (defn account-class
   "勘定科目の区分。登録が無ければ既定の表、それも無ければ :unclassified。"
@@ -498,26 +601,84 @@
 (defn- sort-entries [entries]
   (vec (sort-by (juxt :date id-number) entries)))
 
+(defn- invoice-number [inv]
+  (or (some->> (:id inv) (text/re-matches #"i(\d+)") second parse-long) 0))
+
+(defn invoice-fingerprint
+  "請求書の重複の判定に使う形。種類・番号・取引先・日付・明細の金額の和。"
+  [inv]
+  [(:kind inv) (:number inv) (get-in inv [:partner :name]) (:date inv)
+   (reduce + 0 (map #(:amount % 0) (:lines inv)))])
+
+(defn- merge-invoices
+  "請求書を合流する。戻りは [db 元の id → 帳簿の id の表 追加した数 重複の数]。
+  取り込み元の id（i1, i2, …）は、帳簿で使われていなければ保つ（MCP の tool の間で
+  帳簿 JSON を受け渡しても id が変わらないように）。使われていれば、used（入れ替える
+  前の請求書も含めて、使ったことのある id）と取り込み元の id のどれよりも大きい
+  番号を振る —— 入れ替えた請求書の id を使い回すと、残った仕訳の :invoice-id が
+  別の請求書を指してしまうため。"
+  [db invoices used]
+  (let [own-id (fn [inv] (when (some->> (:id inv) str (text/re-matches #"i\d+")) (:id inv)))
+        taken (set (concat (keep :id (:invoices db)) (keep :id used)))
+        counter (atom (reduce max 0 (map invoice-number (concat (:invoices db) used invoices))))
+        fresh! (fn [] (str "i" (swap! counter inc)))
+        [d m added dup _ _]
+        (reduce (fn [[d m added dup seen taken] inv]
+                  (let [fp (invoice-fingerprint inv)
+                        remember (fn [m id] (if (:id inv) (assoc m (:id inv) id) m))]
+                    (if-let [id (seen fp)]
+                      [d (remember m id) added (inc dup) seen taken]
+                      (let [id (let [own (own-id inv)] (if (and own (not (taken own))) own (fresh!)))]
+                        [(update d :invoices (fnil conj []) (assoc inv :id id))
+                         (remember m id) (inc added) dup (assoc seen fp id) (conj taken id)]))))
+                [db {} 0 0 (into {} (map (juxt invoice-fingerprint :id) (:invoices db))) taken]
+                invoices)]
+    [d m added dup]))
+
 (defn merge-import
-  "取り込み結果（{:currency :accounts [{:name …}] :entries […]}）を db に合流する。
-  mode は :append（既定。同じ日付・同じ行の仕訳は重複として飛ばす）か
-  :replace（仕訳と勘定科目を入れ替える。ただし画面で付けた区分は残す）。
+  "取り込み結果（{:currency :accounts [{:name …}] :entries […] :invoices […]}）を
+  db に合流する。mode は :append（既定。同じ日付・同じ行の仕訳、同じ請求書は
+  重複として飛ばす）か :replace（取り込み結果が持つものを入れ替える。:entries が
+  あれば仕訳と勘定科目 —— ただし画面で付けた区分は残す。:invoices があれば
+  請求書）。
 
   行の :account-code（Xero の CSV のように勘定科目のコードしか無い形式が付ける）は、
   帳簿の勘定科目のコード（:code・:xero :code）で名前に引き直す。
 
-  通貨が違う帳簿へは合流しない（1 帳簿 1 通貨）。戻りは
-  {:db :added :duplicates :error}。"
+  請求書には帳簿の中の id（i1, i2, …）を振り直し、仕訳の origin の :invoice-id
+  （kaikei.invoice が計上で付けたもの）もそれに合わせる。合わせる先の無い
+  :invoice-id は外す。:business・:invoice-settings は、帳簿に無ければ取り込み
+  結果のものを使う（:replace では取り込み結果のものが勝つ）。
+
+  通貨が違う帳簿へは合流しない（1 帳簿 1 通貨）。:replace で仕訳を入れ替えて
+  通貨が変わるとき、残せなかった請求書の数を :invoices-dropped に返す。戻りは
+  {:db :added :duplicates :invoices-added :invoices-duplicates :invoices-dropped :error}。"
   ([db parsed] (merge-import db parsed :append))
   ([db parsed mode]
    (let [currency (or (:currency parsed) (:currency db))
-         base (if (= mode :replace)
-                (assoc empty-db :accounts (into {} (filter #(= :user (:class-source (val %))) (:accounts db))))
-                db)]
-     (if (and (seq (:entries base)) (not= currency (:currency base)))
-       {:db db :added 0 :duplicates 0
-        :error (str "帳簿の通貨は " (:currency base) " です。" currency " の仕訳は合流しません（1 帳簿 1 通貨）。")}
-       (let [base (assoc base :currency currency)
+         replace? (= mode :replace)
+         ;; :replace は取り込み結果が持つものだけを入れ替える: :entries があれば
+         ;; 仕訳と勘定科目（画面で付けた区分は残す）、:invoices があれば請求書
+         replace-entries? (and replace? (contains? parsed :entries))
+         replace-invoices? (and replace? (contains? parsed :invoices))
+         base (cond-> db
+                replace-entries? (assoc :entries []
+                                        :accounts (into {} (filter #(= :user (:class-source (val %))) (:accounts db))))
+                replace-invoices? (assoc :invoices []))
+         ;; 仕訳を入れ替えて通貨が変わるとき、残る請求書は残せない（1 帳簿 1 通貨）
+         dropped (if (and replace-entries? (not= currency (:currency db)))
+                   (count (:invoices base))
+                   0)
+         base (cond-> base (pos? dropped) (assoc :invoices []))]
+     (if (and (or (seq (:entries base)) (seq (:invoices base))) (not= currency (:currency base)))
+       {:db db :added 0 :duplicates 0 :invoices-added 0 :invoices-duplicates 0
+        :error (str "帳簿の通貨は " (:currency base) " です。" currency " の仕訳・請求書は合流しません（1 帳簿 1 通貨）。")}
+       (let [base (cond-> (assoc base :currency currency)
+                    (and (:business parsed) (or replace? (nil? (:business base))))
+                    (assoc :business (:business parsed))
+                    (and (:invoice-settings parsed) (or replace? (nil? (:invoice-settings base))))
+                    (assoc :invoice-settings (:invoice-settings parsed)))
+             [base invoice-ids inv-added inv-dup] (merge-invoices base (:invoices parsed) (:invoices db))
              with-accounts (reduce (fn [d a] (ensure-account d (:name a) (dissoc a :name)))
                                    base (:accounts parsed))
              by-code (into {} (for [[n a] (:accounts with-accounts)
@@ -530,6 +691,12 @@
                                                         (dissoc (assoc l :account (get by-code c (:account l))) :account-code)
                                                         l))
                                                     ls))))
+             relink (fn [e]
+                      (if-let [iid (get-in e [:origin :invoice-id])]
+                        (if-let [id (get invoice-ids iid)]
+                          (assoc-in e [:origin :invoice-id] id)
+                          (update e :origin dissoc :invoice-id))
+                        e))
              ;; 帳簿にコードの登録が無いコードは、そのコードを名前にした勘定科目として
              ;; コードごと登録する（書き出しで同じコードに戻るように）
              unresolved (distinct (for [e (:entries parsed), l (:lines e)
@@ -537,7 +704,7 @@
                                         :when (and c (not (contains? by-code c)))]
                                     c))
              with-accounts (reduce (fn [d c] (ensure-account d c {:code c :xero {:code c}})) with-accounts unresolved)
-             parsed-entries (map resolve-codes (:entries parsed))
+             parsed-entries (map (comp relink resolve-codes) (:entries parsed))
              seen (set (map fingerprint (:entries with-accounts)))
              first-id (inc (reduce max 0 (map id-number (:entries with-accounts))))
              [db' added dup _]
@@ -550,11 +717,22 @@
                               (inc added) dup (conj seen fp)]))))
                      [with-accounts 0 0 seen]
                      parsed-entries)]
-         {:db (update db' :entries sort-entries)
-          :added added :duplicates dup})))))
+         (cond-> {:db (update db' :entries sort-entries)
+                  :added added :duplicates dup
+                  :invoices-added inv-added :invoices-duplicates inv-dup}
+           (pos? dropped) (assoc :invoices-dropped dropped)))))))
 
 (defn delete-entry [db id]
   (update db :entries #(filterv (fn [e] (not= id (:id e))) %)))
+
+(defn append-entry
+  "仕訳を 1 つ足す（重複の判定はしない —— 請求書の計上のように、呼ぶ側が
+  origin で判定するもの）。id を振り、勘定科目を登録する。戻りは
+  [db 振った id]。"
+  [db entry]
+  (let [id (str "e" (inc (reduce max 0 (map id-number (:entries db)))))
+        db (reduce (fn [d l] (ensure-account d (:account l) {})) db (:lines entry))]
+    [(update db :entries #(sort-entries (conj (vec %) (assoc entry :id id)))) id]))
 
 ;; ───────── 帳票 ─────────
 
@@ -719,8 +897,10 @@
 ;; ───────── サンプル ─────────
 
 (def sample-import
-  "画面の「サンプルを読み込む」とテストが使う帳簿。guest の sample-ledger と
-  同じ数（区分も同じ）。会計年度は 2026-04-01 〜 2027-03-31。"
+  "画面の「サンプルを読み込む」とテストが使う帳簿。仕訳は guest の
+  sample-ledger と同じ数（区分も同じ）。会計年度は 2026-04-01 〜 2027-03-31。
+  請求書は 3 件（未計上）。自社の登録番号 T1234567890123 は国税庁 Q&A 問 54 の
+  記載例の番号で、取引先も含めてすべて合成の値。"
   (let [e (fn [date memo & lines]
             {:date date :memo memo
              :lines (vec (for [[account debit credit] lines]
@@ -738,4 +918,23 @@
                (e "2026-08-01" "備品の売却損" ["固定資産売却損" 10000 0] ["普通預金" 0 10000])
                (e "2026-09-01" "引当金の戻入" ["普通預金" 5000 0] ["貸倒引当金戻入額" 0 5000])
                (e "2027-03-31" "法人税等の計上" ["法人税等" 30000 0] ["未払法人税等" 0 30000])]
+     :business {:name "サンプル商店" :registration "T1234567890123"}
+     :invoices [{:id "s1" :kind :sales :number "INV-0001" :date "2026-10-31" :due-date "2026-11-30"
+                 :status :issued :partner {:name "株式会社みなと"} :subject "10 月分"
+                 :tax-mode :exclusive :rounding :floor
+                 :lines [{:description "ウェブサイトの保守（10 月分）" :quantity "1" :unit-price "50000"
+                          :amount 50000 :account "売上高" :category :taxable :rate 1000}
+                         {:description "打ち合わせの弁当" :quantity "5" :unit-price "800"
+                          :amount 4000 :account "売上高" :category :taxable :rate 800 :reduced? true}]}
+                {:id "s2" :kind :sales :number "INV-0002" :date "2026-11-15" :due-date "2026-12-31"
+                 :status :draft :partner {:name "合同会社かもめ"} :subject "ロゴの制作"
+                 :tax-mode :inclusive :rounding :floor
+                 :lines [{:description "ロゴの制作" :quantity "1" :unit-price "33000"
+                          :amount 33000 :account "売上高" :category :taxable :rate 1000}]}
+                {:id "s3" :kind :purchase :number "A-102" :date "2026-10-20" :due-date "2026-11-30"
+                 :status :issued :partner {:name "やまだ文具"} :subject "事務用品"
+                 :tax-mode :exclusive :rounding :floor
+                 :lines [{:description "コピー用紙" :quantity "3" :unit-price "1100"
+                          :amount 3300 :account "消耗品費" :category :taxable :rate 1000}]
+                 :stated {:tax-by-rate [{:rate 1000 :reduced? false :tax 330}] :tax 330 :total 3630}}]
      :warnings []}))

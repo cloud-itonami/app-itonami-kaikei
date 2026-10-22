@@ -41,7 +41,7 @@
       (let [r (exchange cwd "tools/list" {})]
         (is (= 0 (:status r)) (:stderr r))
         (is (= "kaikei" (get-in (by-id r 1) ["result" "serverInfo" "name"])))
-        (is (= 5 (count (get-in (by-id r 2) ["result" "tools"]))))
+        (is (= 8 (count (get-in (by-id r 2) ["result" "tools"]))))
         (testing "stdout は JSON-RPC の行だけ（通知への応答も無い）"
           (is (= 2 (count (:responses r))))
           (is (every? #(= "2.0" (get % "jsonrpc")) (:responses r))))))))
