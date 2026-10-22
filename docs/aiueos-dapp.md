@@ -417,6 +417,10 @@ db に `:invoices`・`:business`（自社の名称・登録番号）・`:invoice
   形式ごとの取り込み・往復と、kaikei → Xero JSON → QBO JSON → freee JSON → MF JSON → MF の CSV → kaikei の
   連鎖で、番号・日付・取引先・税率ごとの対価と税額・合計が保たれること。
 - **MCP**: `bin/kaikei-mcp` を `/` から起こし、`kaikei_invoice_totals` が Q&A 問 57 の 8,416 を返す。
+- **itonami-agent の MCP クライアント**（`kotoba-lang/itonami-agent` main `0c05574` の `itonami.agent.mcp`、
+  `git archive` で取り出したもの）: `discover` が 8 つの tool を返し（errors は空）、`kaikei_invoice_totals`
+  が 8,416・100,000、MF の Billing の JSON を `kaikei_import` → `kaikei_invoice_post` で 2 件計上して貸借一致。
+  不正な入力は tool の error として返る。
 - **ブラウザ**（built-in browser、ローカルの静的サーバ、`scripts/build-site.cljk` の公開物）:
   - サンプル → 検査の欄に「未計上 2 件」「記載事項の欠け 1 件」→ 請求書の詳細（6 項目）→ 計上 →
     印刷（`window.print` を差し替えて呼び出しを確かめ、印刷用の CSS を画面に当てて請求書だけが
