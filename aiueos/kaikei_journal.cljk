@@ -12,6 +12,8 @@
   - 仕訳 1 件: [debit credit] × n 行
   - 帳簿:      [account debit credit] × n 行
   - 帳票:      [date class debit credit] × n 行（date は yyyymmdd の整数）
+  - 請求書 1 件: [rate amount] × n 行（rate は basis points: 1000 = 10%、
+    800 = 8%。非課税・免税・不課税は 0。値引きの行の amount は負でよい）
 
   validate-entry のエラービット（0 = 正常。条件は重複しうる）:
     1 :empty       行が無い
@@ -35,6 +37,19 @@
     3 経常利益 = 2 + 10 − 11  4 税引前当期純利益 = 3 + 12 − 13
     5 当期純利益 = 4 − 14     （範囲外の stage は 0）
 
+  請求書（第 3 スライス、Linear JUN-321）:
+    mode     0 税抜（amount は税抜） 1 税込（amount は税込） 2 税なし
+    rounding 0 切捨て 1 四捨五入 2 切上げ（絶対値で丸めて符号を戻す）
+    税率ごとの消費税額は、税率ごとに合計した対価に 1 回だけ掛けて丸める
+    （消費税法施行令 70 条の 10、基通 1-8-15。丸めの向きは任意 —— 国税庁
+    Q&A 問 57）。税抜は 合計 × rate / 10000、税込は 合計 × rate / (10000 + rate)。
+    掛け算は base = a·d + b に分けて a·rate + R(b·rate / d) とし、i64 を
+    あふれさせない（JS の数で写す adapter とも同じ値になる）。
+    tax-share は行への割り当て: 他の行は行の税額を切り捨て、差は同じ税率で
+    いちばん大きい行（同額なら上の行）が持つ。和は rate-tax と一致する。
+    deduction-percent は仕入税額控除の割合（適格なら 100、そうでなければ
+    経過措置。国税庁 Q&A 問 113 の 80 → 70 → 50 → 30）。
+
   B/S の照合は「資産 = 負債 + 純資産 + 損益の累計」。期間で切った損益
   （前期までの繰越分と当期分）の和は累計なので、bs-difference は date ≤ to の
   区分つき行の純額の総和になる（0 なら一致）。
@@ -46,7 +61,10 @@
   変える。test/kaikei/parity_test.cljk がこの関数別件数を表と照合する。
   仕訳 1 件の検証と帳簿の照合（test-valid-entry … test-account-net）も同じ表に
   載っている（validate-entry 7 / entry-balanced? 2 / ledger-balanced? 2 /
-  account-net 1）。
+  account-net 1）。請求書の行も同じ表にあり、test-* に写してある
+  （rate-base 3 / rate-tax 15 / invoice-tax 6 / invoice-total 3 / rate-net 3 /
+    tax-share 10 / invoice-buffer-valid? 6 / registration-format? 4 /
+    deduction-percent 8）。
 
   テストは export されたゼロ引数 `test-*`（戻り 1/0。実測で true 返しは
   通らない — and/or/= は整数を返す）。fuel は関数の入口ごとに 1 減る。
@@ -58,13 +76,18 @@
             class-valid? normal-sign period-net class-balance profit-stage
             unclassified-count bs-difference statement-balanced?
             statement-buffer-valid?
+            rate-base rate-tax invoice-tax invoice-total rate-net tax-share
+            invoice-buffer-valid? registration-format? deduction-percent
             test-valid-entry test-empty test-odd-buffer test-negative
             test-zero-line test-both-sides test-unbalanced
             test-entry-balanced test-ledger-balanced test-account-net
             test-class-valid test-normal-sign test-period-net
             test-class-balance test-profit-stage test-unclassified-count
             test-bs-difference test-statement-balanced
-            test-statement-buffer-valid]))
+            test-statement-buffer-valid
+            test-rate-base test-rate-tax test-invoice-tax test-invoice-total
+            test-rate-net test-tax-share test-invoice-buffer-valid
+            test-registration-format test-deduction-percent]))
 
 (defn main [] :i64
   0)
@@ -208,6 +231,137 @@
         0))
     1))
 
+;; --- 請求書: [rate amount] × n ------------------------------------------
+
+(defn- round-div [n :i64 d :i64 rounding :i64] :i64
+  (let [q (quot n d)
+        r (- n (* q d))]
+    (cond
+      (= rounding 0) q
+      (= rounding 1) (if (>= (* 2 r) d) (+ q 1) q)
+      :else (if (> r 0) (+ q 1) q))))
+
+(defn- magnitude [x :i64] :i64
+  (if (< x 0) (- 0 x) x))
+
+(defn- scaled [base :i64 rate :i64 d :i64 rounding :i64] :i64
+  (let [m (magnitude base)
+        a (quot m d)
+        b (- m (* a d))
+        v (+ (* a rate) (round-div (* b rate) d rounding))]
+    (if (< base 0) (- 0 v) v)))
+
+(defn- denominator [mode :i64 rate :i64] :i64
+  (if (= mode 0) 10000 (+ 10000 rate)))
+
+(defn rate-base [buf :vector-i64 rate :i64] :i64
+  (rate-base-at buf (vector-count buf) rate 0 0))
+
+(defn- rate-base-at [buf :vector-i64 n :i64 rate :i64 i :i64 acc :i64] :i64
+  (if (< i n)
+    (rate-base-at buf n rate (+ i 2)
+                  (if (= (vector-at buf i) rate) (+ acc (vector-at buf (+ i 1))) acc))
+    acc))
+
+(defn rate-tax [buf :vector-i64 rate :i64 mode :i64 rounding :i64] :i64
+  (if (= mode 2)
+    0
+    (scaled (rate-base buf rate) rate (denominator mode rate) rounding)))
+
+(defn- first-rate-at [buf :vector-i64 rate :i64 i :i64] :i64
+  (if (= (vector-at buf i) rate) i (first-rate-at buf rate (+ i 2))))
+
+(defn invoice-tax [buf :vector-i64 mode :i64 rounding :i64] :i64
+  (invoice-tax-at buf (vector-count buf) mode rounding 0 0))
+
+(defn- invoice-tax-at [buf :vector-i64 n :i64 mode :i64 rounding :i64 i :i64 acc :i64] :i64
+  (if (< i n)
+    (let [rate (vector-at buf i)]
+      (invoice-tax-at buf n mode rounding (+ i 2)
+                      (if (= (first-rate-at buf rate 0) i)
+                        (+ acc (rate-tax buf rate mode rounding))
+                        acc)))
+    acc))
+
+(defn- amount-sum [buf :vector-i64 n :i64 i :i64 acc :i64] :i64
+  (if (< i n) (amount-sum buf n (+ i 2) (+ acc (vector-at buf (+ i 1)))) acc))
+
+(defn invoice-total [buf :vector-i64 mode :i64 rounding :i64] :i64
+  (let [sum (amount-sum buf (vector-count buf) 0 0)]
+    (if (= mode 0) (+ sum (invoice-tax buf mode rounding)) sum)))
+
+(defn rate-net [buf :vector-i64 rate :i64 mode :i64 rounding :i64] :i64
+  (if (= mode 1)
+    (- (rate-base buf rate) (rate-tax buf rate mode rounding))
+    (rate-base buf rate)))
+
+(defn- anchor-at [buf :vector-i64 n :i64 rate :i64 i :i64 best :i64 best-mag :i64] :i64
+  (if (< i n)
+    (if (and (= (vector-at buf i) rate) (> (magnitude (vector-at buf (+ i 1))) best-mag))
+      (anchor-at buf n rate (+ i 2) (quot i 2) (magnitude (vector-at buf (+ i 1))))
+      (anchor-at buf n rate (+ i 2) best best-mag))
+    best))
+
+(defn- others-share [buf :vector-i64 n :i64 rate :i64 d :i64 skip :i64 i :i64 acc :i64] :i64
+  (if (< i n)
+    (others-share buf n rate d skip (+ i 2)
+                  (if (= (vector-at buf i) rate)
+                    (if (= (quot i 2) skip) acc (+ acc (scaled (vector-at buf (+ i 1)) rate d 0)))
+                    acc))
+    acc))
+
+(defn tax-share [buf :vector-i64 line :i64 mode :i64 rounding :i64] :i64
+  (let [n (vector-count buf)
+        rate (vector-at buf (* 2 line))
+        d (denominator mode rate)]
+    (cond
+      (= mode 2) 0
+      (= (anchor-at buf n rate 0 -1 -1) line)
+      (- (rate-tax buf rate mode rounding) (others-share buf n rate d line 0 0))
+      :else (scaled (vector-at buf (+ (* 2 line) 1)) rate d 0))))
+
+(defn invoice-buffer-valid? [buf :vector-i64] :i64
+  (let [n (vector-count buf)]
+    (if (= n (* 2 (quot n 2)))
+      (invoice-buffer-at buf n 0)
+      0)))
+
+(defn- invoice-buffer-at [buf :vector-i64 n :i64 i :i64] :i64
+  (if (< i n)
+    (let [rate (vector-at buf i)]
+      (if (and (>= rate 0) (<= rate 10000)
+               (<= (magnitude (vector-at buf (+ i 1))) 900000000000000)
+               (>= (rate-base buf rate) 0))
+        (invoice-buffer-at buf n (+ i 2))
+        0))
+    1))
+
+;; 登録番号の形: 「T」（84）＋数字（48..57）13 桁の 14 文字。codes は文字の
+;; 符号位置の列（全角→半角・T の後の「-」の除去は adapter が先に行う）。
+(defn registration-format? [codes :vector-i64] :i64
+  (if (and (= (vector-count codes) 14) (= (vector-at codes 0) 84))
+    (registration-digits-at codes 1)
+    0))
+
+(defn- registration-digits-at [codes :vector-i64 i :i64] :i64
+  (if (< i 14)
+    (if (and (>= (vector-at codes i) 48) (<= (vector-at codes i) 57))
+      (registration-digits-at codes (+ i 1))
+      0)
+    1))
+
+;; 仕入税額控除の割合（%）。date は課税仕入れの日（yyyymmdd）、qualified は
+;; 適格請求書発行事業者からの仕入れなら 1。
+(defn deduction-percent [date :i64 qualified :i64] :i64
+  (cond
+    (= qualified 1) 100
+    (< date 20231001) 100
+    (< date 20261001) 80
+    (< date 20281001) 70
+    (< date 20301001) 50
+    (< date 20311001) 30
+    :else 0))
+
 ;; --- tests（戻り 1 = pass） ----------------------------------------------
 
 (defn test-valid-entry [] :i64
@@ -331,4 +485,101 @@
            (= (statement-buffer-valid? [20260101 15 100 0]) 0)
            (= (statement-buffer-valid? [20260101 1 -100 0]) 0)
            (= (statement-buffer-valid? [-1 1 100 0]) 0))
+    1 0))
+
+;; --- 請求書の tests（test/fixtures/parity.edn の請求書の行） ----------------
+;; :mixed = [10% 50,000 / 10% 33,333 / 8% 12,345]、:freee = freee ヘルプ
+;; 23500770784153 の例（10%: 426・2,100・1,885・220）、:nta57 = 国税庁 Q&A
+;; 問 57 の例（税込 10% 60,000・8% 40,000）、:xero-rounding = Xero の
+;; 「Rounding in Xero」の例（15%: 25.06・25.61・25.63 をセントで）。
+
+(defn- mixed-invoice [] :vector-i64 [1000 50000 1000 33333 800 12345])
+(defn- freee-invoice [] :vector-i64 [1000 426 1000 2100 1000 1885 1000 220])
+(defn- nta57-invoice [] :vector-i64 [1000 60000 800 40000])
+(defn- xero-rounding-invoice [] :vector-i64 [1500 2506 1500 2561 1500 2563])
+(defn- discount-invoice [] :vector-i64 [1000 1000 800 1080 1000 -100])
+
+(defn test-rate-base [] :i64
+  (if (and (= (rate-base (mixed-invoice) 1000) 83333)
+           (= (rate-base (mixed-invoice) 800) 12345)
+           (= (rate-base (mixed-invoice) 0) 0))
+    1 0))
+
+(defn test-rate-tax [] :i64
+  (if (and (= (rate-tax (mixed-invoice) 1000 0 0) 8333)
+           (= (rate-tax (mixed-invoice) 1000 0 1) 8333)
+           (= (rate-tax (mixed-invoice) 1000 0 2) 8334)
+           (= (rate-tax (mixed-invoice) 800 0 0) 987)
+           (= (rate-tax (mixed-invoice) 800 0 1) 988)
+           (= (rate-tax (mixed-invoice) 1000 2 0) 0)
+           (= (rate-tax [1000 1000] 1000 1 0) 90)
+           (= (rate-tax [1000 1000] 1000 1 1) 91)
+           (= (rate-tax (nta57-invoice) 1000 1 0) 5454)
+           (= (rate-tax (nta57-invoice) 800 1 0) 2962)
+           (= (rate-tax [1000 3017 800 2524] 1000 0 0) 301)
+           (= (rate-tax [1000 3017 800 2524] 800 0 0) 201)
+           (= (rate-tax (xero-rounding-invoice) 1500 0 1) 1145)
+           (= (rate-tax [1000 900000000000000] 1000 1 0) 81818181818181)
+           (= (rate-tax [1000 900000000000000] 1000 1 1) 81818181818182))
+    1 0))
+
+(defn test-invoice-tax [] :i64
+  (if (and (= (invoice-tax (mixed-invoice) 0 0) 9320)
+           (= (invoice-tax (nta57-invoice) 1 0) 8416)
+           (= (invoice-tax [1000 105 1000 105 1000 105] 0 0) 31)
+           (= (invoice-tax [0 5000 1000 1000] 0 0) 100)
+           (= (invoice-tax (freee-invoice) 0 0) 463)
+           (= (invoice-tax [] 0 0) 0))
+    1 0))
+
+(defn test-invoice-total [] :i64
+  (if (and (= (invoice-total (mixed-invoice) 0 0) 104998)
+           (= (invoice-total [1000 110000 800 10800] 1 0) 120800)
+           (= (invoice-total [1000 5000] 2 0) 5000))
+    1 0))
+
+(defn test-rate-net [] :i64
+  (if (and (= (rate-net [1000 110000 800 10800] 1000 1 0) 100000)
+           (= (rate-net [1000 1000] 1000 1 1) 909)
+           (= (rate-net (mixed-invoice) 1000 0 0) 83333))
+    1 0))
+
+(defn test-tax-share [] :i64
+  (if (and (= (tax-share (freee-invoice) 0 0 0) 42)
+           (= (tax-share (freee-invoice) 1 0 0) 211)
+           (= (tax-share (freee-invoice) 2 0 0) 188)
+           (= (tax-share (freee-invoice) 3 0 0) 22)
+           (= (tax-share (discount-invoice) 0 1 0) 90)
+           (= (tax-share (discount-invoice) 1 1 0) 80)
+           (= (tax-share (discount-invoice) 2 1 0) -9)
+           (= (tax-share (xero-rounding-invoice) 0 0 1) 375)
+           (= (tax-share (xero-rounding-invoice) 2 0 1) 386)
+           (= (tax-share (mixed-invoice) 0 2 0) 0))
+    1 0))
+
+(defn test-invoice-buffer-valid [] :i64
+  (if (and (= (invoice-buffer-valid? (mixed-invoice)) 1)
+           (= (invoice-buffer-valid? []) 1)
+           (= (invoice-buffer-valid? [1000]) 0)
+           (= (invoice-buffer-valid? [10001 100]) 0)
+           (= (invoice-buffer-valid? [1000 100 1000 -200]) 0)
+           (= (invoice-buffer-valid? [1000 900000000000001]) 0))
+    1 0))
+
+(defn test-registration-format [] :i64
+  (if (and (= (registration-format? [84 49 50 51 52 53 54 55 56 57 48 49 50 51]) 1)
+           (= (registration-format? [116 49 50 51 52 53 54 55 56 57 48 49 50 51]) 0)
+           (= (registration-format? [84 49 50 51 52 53 54 55 56 57 48 49 50]) 0)
+           (= (registration-format? [84 49 50 51 52 53 54 55 56 57 48 49 50 65]) 0))
+    1 0))
+
+(defn test-deduction-percent [] :i64
+  (if (and (= (deduction-percent 20261022 1) 100)
+           (= (deduction-percent 20230930 0) 100)
+           (= (deduction-percent 20231001 0) 80)
+           (= (deduction-percent 20260930 0) 80)
+           (= (deduction-percent 20261001 0) 70)
+           (= (deduction-percent 20281001 0) 50)
+           (= (deduction-percent 20301001 0) 30)
+           (= (deduction-percent 20311001 0) 0))
     1 0))

@@ -1,0 +1,221 @@
+(ns kaikei.invoice-test
+  "請求書（第 3 スライス、JUN-321）: 税率ごとの合計、適格請求書の記載事項の検査、
+  計上した仕訳、単価 × 数量。"
+  (:require [cljs.test :refer [deftest is testing]]
+            [kaikei.core :as core]
+            [kaikei.invoice :as inv]))
+
+(def sample-db (:db (core/merge-import core/empty-db core/sample-import)))
+
+(defn- by-number [db number] (first (filter #(= number (:number %)) (:invoices db))))
+
+(defn- line [description amount rate & {:as more}]
+  (merge {:description description :amount amount :category :taxable :rate rate} more))
+
+(defn- invoice [& {:as m}]
+  (merge {:id "x1" :kind :sales :number "T-1" :date "2026-10-31" :status :issued
+          :partner {:name "株式会社みなと"} :tax-mode :exclusive :rounding :floor}
+         m))
+
+(def business-db (assoc core/empty-db :business {:name "サンプル商店" :registration "T1234567890123"}))
+
+;; ───────── 登録番号 ─────────
+
+(deftest registration-number-format
+  (testing "「T」＋数字 13 桁。全角・T の後の「-」・小文字の t は揃えてから見る（Q&A 問 18）"
+    (is (inv/registration-valid? "T1234567890123"))
+    (is (inv/registration-valid? "Ｔ１２３４５６７８９０１２３"))
+    (is (inv/registration-valid? "T-1234567890123"))
+    (is (inv/registration-valid? " t1234567890123 "))
+    (is (= "T1234567890123" (inv/normalize-registration "Ｔ－１２３４５６７８９０１２３"))))
+  (testing "形の違うもの"
+    (is (not (inv/registration-valid? "1234567890123")))
+    (is (not (inv/registration-valid? "T123456789012")))
+    (is (not (inv/registration-valid? "T12345678901234")))
+    (is (not (inv/registration-valid? "TA234567890123")))
+    (is (not (inv/registration-valid? nil)))
+    (is (not (inv/registration-valid? "")))))
+
+;; ───────── 合計 ─────────
+
+(deftest totals-per-rate
+  (testing "サンプルの売上の請求書: 10% 50,000 → 5,000、8%（軽減）4,000 → 320"
+    (let [t (inv/totals (by-number sample-db "INV-0001"))]
+      (is (= [["10%" 50000 5000] ["8%（軽減）" 4000 320]]
+             (mapv (juxt :label :base :used-tax) (:groups t))))
+      (is (= {:net 54000 :tax 5320 :total 59320}
+             (select-keys t [:net :tax :total])))
+      (is (:valid? t))))
+  (testing "国税庁 Q&A 問 57: 税込 60,000（10%）と 40,000（8%）を切捨て → 5,454 + 2,962"
+    (let [t (inv/totals (invoice :tax-mode :inclusive
+                                 :lines [(line "飲料以外" 60000 1000) (line "食品" 40000 800 :reduced? true)]))]
+      (is (= [5454 2962] (mapv :used-tax (:groups t))))
+      (is (= {:net 91584 :tax 8416 :total 100000} (select-keys t [:net :tax :total])))))
+  (testing "8% の軽減と 8% の標準は、税率の数が同じでも別に丸める"
+    (let [t (inv/totals (invoice :rounding :half-up
+                                 :lines [(line "食品" 81 800 :reduced? true) (line "旧税率の品" 81 800)]))]
+      (is (= [6 6] (mapv :used-tax (:groups t))))
+      (is (= 12 (:tax t)))))
+  (testing "非課税・不課税の行は税率 0 の区分"
+    (let [t (inv/totals (invoice :lines [(line "作業" 10000 1000)
+                                         {:description "印紙代の立替" :amount 200 :category :out-of-scope}]))]
+      (is (= [["10%" 1000] ["不課税" 0]] (mapv (juxt :label :used-tax) (:groups t))))
+      (is (= 11200 (:total t)))))
+  (testing "行への割り当ての和は、使う税額と一致する"
+    (let [t (inv/totals (invoice :lines [(line "a" 426 1000) (line "b" 2100 1000) (line "c" 1885 1000) (line "d" 220 1000)]))]
+      (is (= {0 42 1 211 2 188 3 22} (:line-tax t)))
+      (is (= 463 (:tax t))))))
+
+(deftest stated-tax-is-kept
+  (testing "取り込み元の税額（Xero の行ごとの丸めの和 11.44）は、そのまま使い、差を知らせる"
+    (let [x (invoice :lines [(line "a" 2506 1500) (line "b" 2561 1500) (line "c" 2563 1500)]
+                     :rounding :half-up
+                     :stated {:tax-by-rate [{:rate 1500 :reduced? false :tax 1144}]})
+          t (inv/totals x)]
+      (is (= 1145 (:computed-tax t)))
+      (is (= 1144 (:tax t)))
+      (is (= 1144 (reduce + 0 (vals (:line-tax t)))))
+      (is (= :tax-mismatch (some #{:tax-mismatch} (map :code (inv/problems business-db x))))))))
+
+;; ───────── 適格請求書の検査 ─────────
+
+(deftest qualified-invoice-items
+  (let [ok (invoice :lines [(line "作業" 10000 1000)])
+        codes (fn [db x] (set (map :code (inv/problems db x))))]
+    (testing "記載事項が揃っていれば、問題は無い"
+      (is (= #{} (codes business-db ok))))
+    (testing "一 発行者の名称・登録番号（売上は自社の設定）"
+      (is (contains? (codes core/empty-db ok) :issuer-name))
+      (is (contains? (codes core/empty-db ok) :issuer-registration))
+      (is (contains? (codes (assoc-in business-db [:business :registration] "T123") ok) :registration-format)))
+    (testing "二 取引年月日"
+      (is (contains? (codes business-db (assoc ok :date "2026-13-01")) :invalid-date)))
+    (testing "三 内容"
+      (is (contains? (codes business-db (assoc ok :lines [(line "" 10000 1000)])) :description)))
+    (testing "四 適用税率"
+      (is (contains? (codes business-db (assoc ok :lines [(line "作業" 10000 nil)])) :rate-unknown)))
+    (testing "五 税率ごとの消費税額（取り込み元の額が 1 回の端数処理と違う）"
+      (is (contains? (codes business-db (assoc ok :stated {:tax-by-rate [{:rate 1000 :tax 999}]})) :tax-mismatch)))
+    (testing "六 受け取る事業者の名称"
+      (is (contains? (codes business-db (assoc ok :partner {:name ""})) :recipient-name)))
+    (testing "missing-items? はこの 6 項目だけを数える"
+      (is (not (inv/missing-items? business-db ok)))
+      (is (inv/missing-items? core/empty-db ok)))))
+
+(deftest purchase-without-registration
+  (testing "登録番号の無い仕入の請求書は、経過措置の割合（2026-10-01 から 70%）を出す"
+    (let [s3 (by-number sample-db "A-102")]
+      (is (not (inv/qualified? s3)))
+      (is (= 70 (inv/deduction-percent s3)))
+      (is (= 80 (inv/deduction-percent (assoc s3 :date "2026-09-30"))))
+      (is (= 100 (inv/deduction-percent (assoc-in s3 [:partner :registration] "T1234567890123"))))
+      (is (contains? (set (map :code (inv/problems sample-db s3))) :issuer-registration))
+      (is (re-find #"70%" (inv/problem-label {:code :issuer-registration} s3 0))))))
+
+;; ───────── 計上 ─────────
+
+(defn- entry-lines [db id]
+  (mapv (juxt :account :debit :credit) (:lines (inv/posted-entry db id))))
+
+(deftest post-sales-invoice
+  (let [id (:id (by-number sample-db "INV-0001"))
+        {:keys [db entry-id]} (inv/post sample-db id)
+        e (inv/posted-entry db id)]
+    (testing "借 売掛金 ／ 貸 科目・税率ごとの税抜 ／ 貸 仮受消費税（税率ごと）"
+      (is (= [["売掛金" 59320 0] ["売上高" 0 50000] ["売上高" 0 4000]
+              ["仮受消費税" 0 5000] ["仮受消費税" 0 320]]
+             (entry-lines db id)))
+      (is (= entry-id (:id e)))
+      (is (= #{} (core/entry-problems e)))
+      (is (= {:format :invoice :invoice-id id :kind :sales} (:origin e)))
+      (is (= "株式会社みなと" (:partner (first (:lines e))))))
+    (testing "試算表で売掛金と仮受消費税が増える"
+      (let [closing (fn [d] (into {} (map (juxt :account :closing) (:rows (core/trial-balance d 20260401 20270331)))))
+            before (closing sample-db)
+            after (closing db)]
+        (is (= 59320 (- (after "売掛金") (before "売掛金"))))
+        (is (= -5320 (after "仮受消費税")))
+        (is (= 0 (get-in (core/trial-balance db 20260401 20270331) [:totals :closing])))))
+    (testing "二重には計上しない"
+      (is (= :already-posted (:skipped (inv/post db id)))))))
+
+(deftest post-inclusive-two-accounts
+  (testing "税込の請求書で 1 つの税率に科目が 2 つ: 税額は tax-share で分ける"
+    (let [db (:db (inv/save-invoice business-db
+                                    (invoice :id nil :tax-mode :inclusive
+                                             :lines [(line "作業" 1000 1000 :account "売上高")
+                                                     (line "手数料" 1100 1000 :account "受取手数料")])))
+          id (:id (first (:invoices db)))
+          {db :db} (inv/post db id)]
+      (is (= [["売掛金" 2100 0] ["売上高" 0 910] ["受取手数料" 0 1000] ["仮受消費税" 0 190]]
+             (entry-lines db id))))))
+
+(deftest post-purchase-invoice
+  (let [id (:id (by-number sample-db "A-102"))
+        {db :db} (inv/post sample-db id)
+        e (inv/posted-entry db id)]
+    (is (= [["買掛金" 0 3630] ["消耗品費" 3300 0] ["仮払消費税" 330 0]] (entry-lines db id)))
+    (is (= {:scheme :kaikei :code "70%控除"} (:invoice (second (:lines e)))))
+    (is (= #{} (core/entry-problems e)))))
+
+(deftest tax-included-accounting
+  (testing "税込経理では税の行を起こさない"
+    (let [db (assoc sample-db :invoice-settings {:accounting :tax-included})
+          id (:id (by-number db "INV-0001"))
+          {db :db} (inv/post db id)]
+      (is (= [["売掛金" 59320 0] ["売上高" 0 55000] ["売上高" 0 4320]] (entry-lines db id))))))
+
+(deftest post-blockers
+  (let [draft (by-number sample-db "INV-0002")]
+    (is (= :status (:skipped (inv/post sample-db (:id draft)))))
+    (is (= :withholding (inv/post-blocker sample-db (assoc (by-number sample-db "INV-0001") :withholding 5105))))
+    (testing "Xero の Journals に同じ請求書（SourceID）の仕訳があれば計上しない"
+      (let [x (assoc (by-number sample-db "INV-0001") :origin {:format :xero-invoices-json :id "abc"})
+            db (update sample-db :entries conj {:id "e99" :date "2026-10-31"
+                                                 :lines [{:account "売掛金" :debit 1 :credit 0}
+                                                         {:account "売上高" :debit 0 :credit 1}]
+                                                 :origin {:format :xero-json :source-id "abc" :source-type "ACCREC"}})]
+        (is (= :in-ledger (inv/post-blocker db x)))))))
+
+(deftest post-all-and-void
+  (let [{:keys [db posted skipped]} (inv/post-all sample-db)
+        s1 (by-number db "INV-0001")]
+    (testing "発行済み・受領済みの 2 件を計上し、下書きは数えない"
+      (is (= 2 (count posted)))
+      (is (= [] skipped))
+      (is (= 12 (count (:entries db)))))
+    (testing "取消にすると、起こした仕訳が消える"
+      (let [db (:db (inv/save-invoice db (assoc s1 :status :void)))]
+        (is (nil? (inv/posted-entry db (:id s1))))
+        (is (= 11 (count (:entries db))))))
+    (testing "計上済みの請求書を直すと、計上し直す"
+      (let [db (:db (inv/save-invoice db (assoc-in s1 [:lines 0 :amount] 60000)))]
+        (is (= 70320 (:debit (first (:lines (inv/posted-entry db (:id s1)))))))))
+    (testing "消すと仕訳も消える"
+      (let [db (inv/delete-invoice db (:id s1))]
+        (is (nil? (inv/invoice-by-id db (:id s1))))
+        (is (nil? (inv/posted-entry db (:id s1))))))))
+
+;; ───────── 作成 ─────────
+
+(deftest numbering-and-merge
+  (is (= ["i1" "i2" "i3"] (mapv :id (:invoices sample-db))))
+  (is (= "INV-0003" (inv/next-number sample-db :sales)))
+  (is (= "A-103" (inv/next-number sample-db :purchase)))
+  (is (= "INV-0001" (inv/next-number core/empty-db :sales)))
+  (testing "同じ請求書は重複として飛ばす"
+    (let [{:keys [invoices-added invoices-duplicates]} (core/merge-import sample-db core/sample-import)]
+      (is (= [0 3] [invoices-added invoices-duplicates])))))
+
+(deftest line-amounts
+  (testing "単価 × 数量を通貨の桁で丸める（MF の明細行の端数処理の例: 100.3 × 2）"
+    (is (= {:amount 200} (inv/line-amount "2" "100.3" 0 :floor)))
+    (is (= {:amount 201} (inv/line-amount "2" "100.3" 0 :ceil)))
+    (is (= {:amount 201} (inv/line-amount "2" "100.3" 0 :half-up)))
+    (is (= {:amount 5997} (inv/line-amount "3" "19.99" 2 :floor)))
+    (is (= {:amount 1250} (inv/line-amount "0.5" "2500" 0 :floor)))
+    (is (= {:amount -500} (inv/line-amount "-1" "500" 0 :floor)))
+    (is (= {:amount 800} (inv/line-amount "" "800" 0 :floor))))
+  (testing "読めない値・桁のあふれ"
+    (is (= {:error :format} (inv/line-amount "2" "abc" 0 :floor)))
+    (is (= {:error :range} (inv/line-amount "99999999.999" "9999999999999.999" 0 :floor)))))

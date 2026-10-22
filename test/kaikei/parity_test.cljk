@@ -28,7 +28,16 @@
    "unclassified-count" core/unclassified-count
    "bs-difference" core/bs-difference
    "statement-balanced?" core/statement-balanced?
-   "statement-buffer-valid?" core/statement-buffer-valid?})
+   "statement-buffer-valid?" core/statement-buffer-valid?
+   "rate-base" core/rate-base
+   "rate-tax" core/rate-tax
+   "invoice-tax" core/invoice-tax
+   "invoice-total" core/invoice-total
+   "rate-net" core/rate-net
+   "tax-share" core/tax-share
+   "invoice-buffer-valid?" core/invoice-buffer-valid?
+   "registration-format?" core/registration-format?
+   "deduction-percent" core/deduction-percent})
 
 (deftest every-row-matches
   (doseq [{f :fn args :args expect :expect} (:rows fixture)]
@@ -40,9 +49,12 @@
     (is (= {"validate-entry" 7 "entry-balanced?" 2 "ledger-balanced?" 2 "account-net" 1
             "class-valid?" 4 "normal-sign" 4 "period-net" 5 "class-balance" 4
             "profit-stage" 8 "unclassified-count" 3 "bs-difference" 3
-            "statement-balanced?" 3 "statement-buffer-valid?" 6}
+            "statement-balanced?" 3 "statement-buffer-valid?" 6
+            "rate-base" 3 "rate-tax" 15 "invoice-tax" 6 "invoice-total" 3 "rate-net" 3
+            "tax-share" 10 "invoice-buffer-valid?" 6 "registration-format?" 4
+            "deduction-percent" 8}
            (frequencies (map :fn (:rows fixture)))))
-    (is (= 52 (count (:rows fixture))))))
+    (is (= 110 (count (:rows fixture))))))
 
 (deftest every-function-is-exported-by-the-guest
   (let [src (str (fs/readFileSync "aiueos/kaikei_journal.cljk" "utf8"))
