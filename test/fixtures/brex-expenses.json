@@ -1,0 +1,56 @@
+{
+  "next_cursor": null,
+  "items": [
+    {
+      "id": "exp_r1",
+      "expense_type": "REIMBURSEMENT",
+      "status": "APPROVED",
+      "payment_status": "NOT_STARTED",
+      "memo": "Team lunch",
+      "category": "RESTAURANTS",
+      "purchased_at": "2026-11-06T12:30:00Z",
+      "original_amount": {
+        "amount": 3200,
+        "currency": "USD"
+      },
+      "billing_amount": {
+        "amount": 3200,
+        "currency": "USD"
+      },
+      "merchant": {
+        "raw_descriptor": "BLUE BOTTLE",
+        "mcc": "5814",
+        "country": "USA"
+      },
+      "user": {
+        "first_name": "Kai"
+      },
+      "receipts": [
+        {
+          "id": "rc1"
+        }
+      ]
+    },
+    {
+      "id": "exp_1",
+      "expense_type": "CARD",
+      "status": "SETTLED",
+      "memo": "AWS",
+      "purchased_at": "2026-11-02T00:00:00Z",
+      "billing_amount": {
+        "amount": 4599,
+        "currency": "USD"
+      }
+    },
+    {
+      "id": "exp_r2",
+      "expense_type": "REIMBURSEMENT",
+      "status": "DRAFT",
+      "purchased_at": "2026-11-20T00:00:00Z",
+      "billing_amount": {
+        "amount": 999,
+        "currency": "USD"
+      }
+    }
+  ]
+}

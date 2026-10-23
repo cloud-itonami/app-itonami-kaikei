@@ -24,7 +24,11 @@
 （2026-10-23 から。Linear JUN-327）。明細は次の形式を読む（OFX は読むだけ）:
 
 - OFX 1.x（SGML）・2.x（XML）、QFX・QBO（Web Connect）
+- 全銀協の入出金取引明細・振込入金通知（固定長・全銀 CSV）
 - freee 会計・マネーフォワード クラウド会計・Xero・QuickBooks Online の明細の取り込み CSV
+- 銀行・カードの CSV（列の割り当てと型。一次資料で確かめていない型は警告する）
+- 経費・買掛: Ramp・Brex の API の JSON、Expensify（kaikei の template で書き出した CSV）、
+  BILL v3 の請求書（どれも読むだけ）
 
 銀行・カード会社には接続せず（口座連携をしない）、支払もしない。データは送信されない。
 保存はこの端末の IndexedDB だけ。

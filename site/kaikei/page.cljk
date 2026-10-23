@@ -63,6 +63,8 @@
 @media (min-width:64rem){.kk-bs{grid-template-columns:minmax(0,1fr) minmax(0,1fr);}}
 .kk-row--warn{background:var(--color-primitive-yellow-50,#fffbe6);}
 .kk-row--selected{background:var(--color-primitive-blue-50,#eef4ff);}
+.kk-details{margin-top:1rem;}
+.kk-code{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.75rem;background:var(--color-neutral-solid-gray-50,#f8f8fb);padding:.5rem;border-radius:.25rem;max-height:16rem;overflow:auto;}
 .kk-candidates{list-style:none;margin:0;padding:0;display:grid;gap:.5rem;}
 .kk-candidate{border:1px solid var(--color-neutral-solid-gray-200,#ddd);border-radius:.5rem;padding:.5rem .75rem;}
 .kk-candidate p{margin:.25rem 0;overflow-wrap:anywhere;}

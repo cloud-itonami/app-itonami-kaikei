@@ -141,3 +141,9 @@
           tree (render db (assoc view/initial-ui :mode :statements) view/ssr-handlers)]
       (is (has-text? tree "サンプル銀行"))
       (is (not (has-text? tree "まだ仕訳がありません"))))))
+
+(deftest import-panel-shows-the-expensify-template
+  (let [tree (render sample-db (assoc view/initial-ui :import-open? true) view/ssr-handlers)]
+    (is (not-any? fn? (nodes tree)))
+    (is (has-text? tree "経費・買掛のファイル"))
+    (is (has-text? tree "transactionID,reportID,date,merchant,amount_cents"))))

@@ -1,0 +1,103 @@
+(ns kaikei.expense-formats-test
+  "経費・買掛の形式（第 4 スライス、JUN-327。読むだけ）: Ramp・Brex・Expensify（kaikei の
+  template）・BILL。fixture の形の出所は test/fixtures/README.md。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [kaikei.core :as core]
+            [kaikei.ingest :as ingest]
+            [kaikei.invoice :as inv]
+            [kaikei.statement :as st]
+            [kaikei.compat.expensify :as expensify]))
+
+(defn- fixture [name] (str (fs/readFileSync (str "test/fixtures/" name) "utf8")))
+
+(defn- rows [p] (mapv (juxt :account-id :date :amount :description) (:statement-lines p)))
+
+(deftest ramp
+  (let [p (ingest/ingest-text (fixture "ramp-list.json") {:currency "USD"})]
+    (is (= :ramp-json (:format p)))
+    (testing "カードの取引: 利用は負、返金（original_transaction_id）は正。DECLINED は記帳しない"
+      (is (= [["s1" "2026-11-03" -2599 "Office Depot toner"]
+              ["s1" "2026-11-10" 1000 "Office Depot"]
+              ["s2" "2026-11-05" -4250 "Yellow Cab client visit"]
+              ["s2" "2026-11-12" 1000 "Personal charge"]]
+             (rows p)))
+      (is (re-find #"記帳しない項目 1 件（状態 DECLINED）" (first (:warnings p)))))
+    (testing "口座: カード（未払金）と立替経費"
+      (is (= [[:card "ramp:card"] [:expense "ramp:reimbursement"]] (map (juxt :kind :key) (:statement-accounts p)))))
+    (testing "科目・税コードのヒント（accounting_field_selections）"
+      (is (= {:account "Office Supplies" :tax-code "Non-Taxable" :category "Office Supplies" :receipt? true}
+             (:hints (first (:statement-lines p)))))
+      (is (true? (get-in (nth (:statement-lines p) 2) [:hints :reimbursable?]))))
+    (testing "請求書（Bill）は仕入の請求書。税の項目は無いので税なし"
+      (let [i (first (:invoices p))
+            t (inv/totals i)]
+        (is (= [:purchase "AH-1007" "2026-11-01" "2026-11-30" :issued "Acme Hosting" :none]
+               ((juxt :kind :number :date :due-date :status #(get-in % [:partner :name]) :tax-mode) i)))
+        (is (= [150000 0] [(:total t) (:tax t)]))
+        (is (= "Hosting" (:account (first (:lines i)))))))
+    (testing "帳簿の通貨と違う項目は読まない"
+      (is (empty? (:statement-lines (ingest/ingest-text (fixture "ramp-list.json") {:currency "JPY"})))))))
+
+(deftest brex
+  (testing "カードの取引: 向きは type で決める（COLLECTION の額が負でも、カードの支払は正）"
+    (let [p (ingest/ingest-text (fixture "brex-transactions.json") {:currency "USD"})]
+      (is (= :brex-json (:format p)))
+      (is (= [["s1" "2026-11-03" -4599 "AWS"] ["s1" "2026-11-09" 1500 "AWS credit"] ["s1" "2026-11-25" 50000 "Payment"]]
+             (rows p)))))
+  (testing "経費: 承認済みの立替だけ。カードの経費はカードの取引で読む"
+    (let [p (ingest/ingest-text (fixture "brex-expenses.json") {:currency "USD"})]
+      (is (= [["s2" "2026-11-06" -3200 "BLUE BOTTLE Team lunch"]] (rows p)))
+      (is (= {:reimbursable? true :category "RESTAURANTS" :receipt? true} (:hints (first (:statement-lines p)))))
+      (is (re-find #"経費の種類 CARD" (first (:warnings p)))))))
+
+(deftest expensify-template-csv
+  (let [p (ingest/ingest-text (fixture "expensify.csv") {:currency "USD"})]
+    (is (= :expensify-csv (:format p)))
+    (testing "立替は立替経費、そうでないものは会社のカード。Open のレポートは読まない"
+      (is (= [["s2" "2026-11-05" -4250 "Yellow Cab client visit"] ["s1" "2026-11-07" -1890 "Corner Deli"]] (rows p)))
+      (is (some #(re-find #"レポートの状態 Open" %) (:warnings p)))
+      (is (some #(re-find #"カードの明細と同じもの" %) (:warnings p)))))
+  (testing "template は見出しと同じ項目を出す"
+    (is (re-find #"transactionID,reportID,date,merchant,amount_cents" expensify/template)))
+  (testing "セントを帳簿の通貨の桁に直す（JPY は 100 で割る）。税額はヒントにして、計算と違えば知らせる"
+    (let [p (ingest/ingest-text (fixture "expensify-jpy.csv") {:currency "JPY"})
+          l (first (:statement-lines p))]
+      (is (= [-3300 {:reimbursable? true :account "交通費" :tax-code "課税 10%" :tax-amount 300}] [(:amount l) (:hints l)]))
+      (let [{db :db} (core/merge-import core/empty-db p)
+            line (first (:statement-lines db))
+            c (first (:candidates (st/candidates db line)))
+            {db' :db :keys [entry-id warnings]} (st/post-line db (:id line) (assoc c :tax {:category :taxable :kind 0}))]
+        (testing "取り込み元の科目は中の強さの候補（最初からは選ばない）"
+          (is (= [:account :hint 2 "交通費"] ((juxt :type :source :level :account) c))))
+        (is (= [["交通費" 3000 0] ["仮払消費税" 300 0] ["未払金" 0 3300]]
+               (mapv (juxt :account :debit :credit) (:lines (first (filter #(= entry-id (:id %)) (:entries db')))))))
+        (is (= [] warnings))
+        (let [{:keys [warnings]} (st/post-line (assoc-in db [:statement-lines 0 :hints :tax-amount] 290) (:id line)
+                                                (assoc c :tax {:category :taxable :kind 0}))]
+          (is (= [:tax-amount-differs] warnings)))))))
+
+(deftest bill
+  (let [p (ingest/ingest-text (fixture "bill-bills.json") {:currency "USD"})
+        [i d] (:invoices p)]
+    (is (= :bill-json (:format p)))
+    (testing "10 進の主単位、行は billLineItems、通貨は帳簿の通貨とみなして警告する"
+      (is (= [[149 "USB audio interface"] [79.99 "Drum foot pedal"]]
+             (mapv (juxt #(/ (:amount %) 100) :description) (:lines i))))
+      (is (= [22899 22899 :issued "Music Supplies" "MS-228"]
+             [(:total (inv/totals i)) (:amount-due i) (:status i) (get-in i [:partner :name]) (:number i)]))
+      (is (re-find #"通貨の項目が無い" (last (:warnings p)))))
+    (testing "下書き"
+      (is (= :draft (:status d))))
+    (testing "支払の消込: BILL の請求書を明細の出金で消込む（請求書は先に計上）"
+      (let [db (:db (core/merge-import (assoc core/empty-db :currency "USD") p))
+            db (:db (core/merge-import db {:currency "USD"
+                                           :statement-accounts [{:id "b1" :key "x" :kind :bank :name "Bank" :ledger-account "普通預金"}]
+                                           :statement-lines [{:account-id "b1" :date "2026-11-20" :amount -22899
+                                                              :description "MUSIC SUPPLIES MS-228"}]}))
+            line (first (:statement-lines db))
+            c (:preselected (st/candidates db line))
+            {db' :db :keys [invoices-posted]} (st/post-line db (:id line) c)]
+        (is (= [:invoice 3] ((juxt :type :level) c)))
+        (is (= 1 (count invoices-posted)))
+        (is (= 0 (st/open-amount db' (first (:invoices db')))))))))

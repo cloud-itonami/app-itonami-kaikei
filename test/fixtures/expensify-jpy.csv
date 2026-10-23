@@ -1,0 +1,2 @@
+transactionID,reportID,date,merchant,amount_cents,currency,category,categoryGlCode,tag,comment,reimbursable,billable,taxAmount_cents,taxRateName,reportStatus
+"t-2001","R-90","2026-11-05","ﾀｸｼｰ",330000,"JPY","交通費","","","","true","false",30000,"課税 10%","Approved"

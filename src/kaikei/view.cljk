@@ -19,7 +19,8 @@
             [kaikei.ingest :as ingest]
             [kaikei.invoice :as invoice]
             [kaikei.statement :as statement]
-            [kaikei.compat.statement-csv :as statement-csv]))
+            [kaikei.compat.statement-csv :as statement-csv]
+            [kaikei.compat.expensify :as expensify]))
 
 ;; ───────── 小部品（dandori.view と同じ形） ─────────
 
@@ -260,7 +261,14 @@
                       :placeholder "取引No,取引日,借方勘定科目,…\n1,2026/04/01,普通預金,…"}))
    [:div {:class "kk-actions"}
     (btn h [:run-import-text] "貼り付けたテキストを取り込む"
-         {:type "solid-fill" :disabled (text/blank? (or (:import-text ui) ""))})]])
+         {:type "solid-fill" :disabled (text/blank? (or (:import-text ui) ""))})]
+   [:details {:class "kk-details"}
+    [:summary "経費・買掛のファイル（Ramp・Brex・Expensify・BILL、読むだけ）"]
+    [:p {:class "kk-help"}
+     "Ramp・Brex・BILL は、各社の API の一覧の応答（JSON）を読みます。Expensify は既定の書き出しの列が公開されていないので、"
+     "下の template を Integration Server の Report Exporter（CSV）に渡して書き出したものを読みます（template は Expensify で動かして確かめていません）。"
+     "どれもカードの取引はカード、立替は立替経費の口座の明細として、請求書は受け取った請求書として取り込みます。"]
+    [:pre {:class "kk-code"} expensify/template]]])
 
 (defn mapping-panel
   "汎用の明細 CSV の列の割り当て（判断 3）。形式を判定できなかった CSV に出す。"
@@ -1008,7 +1016,7 @@
                 (str "振替: " (:name (statement/account-by-id data (:account-id o))) " " (:date o)))
     :account (str "科目 " (:account c)
                   (when-let [t (:tax c)] (str "（" (second (first (filter #(= (tax->choice t) (first %)) tax-choices))) "）"))
-                  (if (= :user (:source c)) "（規則）" "（過去の仕訳）"))
+                  (case (:source c) :user "（規則）" :hint "（取り込み元の科目）" "（過去の仕訳）"))
     ""))
 
 (defn- level-chip [level]

@@ -36,6 +36,13 @@
     zengin               全銀協の入出金取引明細・振込入金通知（固定長 200 バイト・全銀 CSV。読むだけ）
     statement-csv        汎用の明細 CSV（列の割り当てか型。読むだけ。判断 3）
 
+  経費・買掛の形式（第 4 スライス、読むだけ。判断 6）:
+
+    ramp-json            Ramp Developer API の一覧（カードの取引・立替・請求書）
+    brex-json            Brex の Transactions API・Expenses API の一覧（カードの取引・立替）
+    expensify-csv        Expensify の Report Exporter に kaikei の template で出した CSV
+    bill-json            BILL v3 API の請求書（仕入の請求書として）
+
   :content は :journal（仕訳と勘定科目）・:invoices（請求書）・:statements（明細）・
   :all（kaikei-json）。明細の形式の書き出しは口座ごと（opts の :statement-account）。
   :read-only の形式は書き出さない。Xero の bills の CSV は見出しが customer invoices
@@ -61,6 +68,10 @@
             [kaikei.compat.freee :as freee]
             [kaikei.compat.ofx :as ofx]
             [kaikei.compat.zengin :as zengin]
+            [kaikei.compat.ramp :as ramp]
+            [kaikei.compat.brex :as brex]
+            [kaikei.compat.expensify :as expensify]
+            [kaikei.compat.bill :as bill]
             [kaikei.compat.statement-csv :as statement-csv]))
 
 (def formats
@@ -115,7 +126,15 @@
    {:id "zengin" :content :statements :read-only true
     :label "全銀協 入出金取引明細・振込入金通知（固定長・全銀 CSV、読むだけ）" :kind :zengin :encoding "shift_jis"}
    {:id "statement-csv" :content :statements :read-only true
-    :label "汎用の明細 CSV（列を割り当てる・銀行とカードの型、読むだけ）" :kind :csv :encoding "utf-8"}])
+    :label "汎用の明細 CSV（列を割り当てる・銀行とカードの型、読むだけ）" :kind :csv :encoding "utf-8"}
+   {:id "ramp-json" :content :statements :read-only true
+    :label "Ramp API JSON（カードの取引・立替・請求書、読むだけ）" :kind :json :encoding "utf-8"}
+   {:id "brex-json" :content :statements :read-only true
+    :label "Brex API JSON（カードの取引・立替の経費、読むだけ）" :kind :json :encoding "utf-8"}
+   {:id "expensify-csv" :content :statements :read-only true
+    :label "Expensify CSV（kaikei の template で書き出したもの、読むだけ）" :kind :csv :encoding "utf-8"}
+   {:id "bill-json" :content :invoices :read-only true
+    :label "BILL v3 API JSON（請求書、読むだけ）" :kind :json :encoding "utf-8"}])
 
 (def format-ids (mapv :id formats))
 
@@ -156,6 +175,9 @@
     (mf-invoices/detect? data) "mf-invoice-json"
     (zoho-invoices/detect? data) "zoho-invoice-json"
     (freshbooks-invoices/detect? data) "freshbooks-invoice-json"
+    (ramp/detect? data) "ramp-json"
+    (brex/detect? data) "brex-json"
+    (bill/detect? data) "bill-json"
     (xero/detect? data) "xero-json"
     (qbo/detect? data) "qbo-json"
     :else nil))
@@ -164,6 +186,7 @@
   (cond
     ;; 明細の CSV は見出しが短いので、仕訳・請求書の形（見出しに勘定科目や請求書番号が
     ;; ある）と重ならない条件だけで見る
+    (expensify/csv-detect? rows) "expensify-csv"
     (statement-csv/freee-kind rows) "freee-statement-csv"
     (statement-csv/mf-detect? rows) "mf-statement-csv"
     (statement-csv/qbo-detect? rows) "qbo-bank-csv"
@@ -220,6 +243,9 @@
             "mf-invoice-json" (mf-invoices/read-data data)
             "zoho-invoice-json" (zoho-invoices/read-data data opts)
             "freshbooks-invoice-json" (freshbooks-invoices/read-data data opts)
+            "ramp-json" (ramp/read-data data opts)
+            "brex-json" (brex/read-data data opts)
+            "bill-json" (bill/read-data data opts)
             (empty-result fmt (if (nil? fmt)
                                 "JSON の形を判定できません（kaikei の帳簿 JSON、Xero の Accounts・Journals・ManualJournals・Invoices、QBO の query の応答のどれでもありません）"
                                 (str (:label (format-by-id fmt)) " は JSON ではありません"))))))
@@ -244,6 +270,7 @@
           "xero-statement-csv" (statement-csv/read-xero rows opts)
           "qbo-bank-csv" (statement-csv/read-qbo rows opts)
           "zengin" (zengin/read-csv rows)
+          "expensify-csv" (expensify/read-csv rows opts)
           "statement-csv" (if-let [m (or mapping (:mapping (statement-csv/detect-preset rows)))]
                             (statement-csv/read-mapped rows
                                                        (if mapping m (assoc m :preset (:id (statement-csv/detect-preset rows))))
