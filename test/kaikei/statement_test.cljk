@@ -1,0 +1,386 @@
+(ns kaikei.statement-test
+  "明細（第 4 スライス、JUN-327）: 名前の正規化、消込・照合・振替・規則の候補、
+  承認した行の計上、残高の照合、年齢表、取り込みの重複と訂正。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [kaikei.core :as core]
+            [kaikei.ingest :as ingest]
+            [kaikei.invoice :as inv]
+            [kaikei.statement :as st]
+            [kaikei.compat.native :as native]))
+
+(defn- fixture [name] (str (fs/readFileSync (str "test/fixtures/" name) "utf8")))
+
+(def sample-db (:db (core/merge-import core/empty-db core/sample-import)))
+
+(defn- line [db id] (st/line-by-id db id))
+
+(defn- cands [db id] (st/candidates db (line db id)))
+
+(defn- entry-of [db id] (first (filter #(= id (:id %)) (:entries db))))
+
+(defn- lines-summary [e]
+  (mapv (juxt :account :debit :credit #(get-in % [:tax :code]) #(get-in % [:invoice :code])) (:lines e)))
+
+(defn- balanced? [e] (= 0 (core/validate-entry (core/entry-buffer e))))
+
+(defn- add-line
+  "口座 a1 に行を足す（取り込みと同じ合流）。"
+  [db m]
+  (:db (core/merge-import db {:currency (:currency db)
+                              :statement-accounts [{:id "a1" :key "sample:bank" :kind :bank :name "x" :ledger-account "普通預金"}]
+                              :statement-lines [(merge {:account-id "a1"} m)]})))
+
+(defn- add-invoice [db m]
+  (:db (core/merge-import db {:currency (:currency db)
+                              :invoices [(merge {:kind :sales :status :issued :tax-mode :exclusive :rounding :floor} m)]})))
+
+;; ───────── 名前の正規化 ─────────
+
+(deftest name-normalization
+  (testing "法人略語は 3 つの位置（先頭 カ)・途中 (カ)・末尾 (カ）で除き、種類として持つ（三井住友銀行の表）"
+    (is (= {:key "ミナト" :form "カ" :number nil} (st/name-key "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ")))
+    (is (= "ミナト" (:key (st/name-key "ﾐﾅﾄ(ｶ"))))
+    (is (= "ミナトシテン" (:key (st/name-key "ﾐﾅﾄ(ｶ)ｼﾃﾝ"))))
+    (is (= "サンプル" (:key (st/name-key "ｼﾔ)ｻﾝﾌﾟﾙ")))))
+  (testing "漢字の会社の種類を除き、ひらがなはカタカナにする（銀行の名義はカナ）"
+    (is (= "ミナト" (:key (st/name-key "株式会社みなと"))))
+    (is (= "カモメ" (:key (st/name-key "合同会社かもめ")))))
+  (testing "小さいカナ・ヲ・長音とハイフン・中黒と空白をまとめる（銀行ごとに違う全銀の文字）"
+    (is (= (:key (st/name-key "ｷｬﾉﾝ")) (:key (st/name-key "キヤノン"))))
+    (is (= (:key (st/name-key "ｺｰﾋｰ ﾄﾞｳ")) (:key (st/name-key "コ-ヒ-・ドウ"))))
+    (is (= (:key (st/name-key "ｦﾀﾞ")) (:key (st/name-key "オダ")))))
+  (testing "先頭の数字（振込依頼人番号）は別に持つ"
+    (is (= {:key "ミナト" :form nil :number "1234567890"} (st/name-key "1234567890ﾐﾅﾄ")))))
+
+(deftest name-level-and-reference
+  (let [l {:description "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ" :counterparty "ｶ)ﾐﾅﾄ"}]
+    (is (= 2 (st/name-level sample-db l "株式会社みなと")))
+    (is (= 0 (st/name-level sample-db l "やまだ文具")))
+    (testing "部分一致は 0（別の会社を拾うため）"
+      (is (= 0 (st/name-level sample-db {:description "ﾐﾅﾄｼﾖｳｼﾞ"} "みなと")))))
+  (testing "名義が 30 文字ちょうどなら切り詰めとみなして前方一致を 1 にする"
+    (let [partner "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモ"
+          l {:description (subs partner 0 30)}]
+      (is (= 30 (count (:description l))))
+      (is (= 1 (st/name-level sample-db l partner)))))
+  (testing "請求書番号は英数字だけにして 3 文字以上で見る"
+    (is (= 1 (st/ref-hit {:description "ﾌﾘｺﾐ ﾔﾏﾀﾞ A-102"} "A-102")))
+    (is (= 1 (st/ref-hit {:description "INV0001"} "INV-0001")))
+    (is (= 0 (st/ref-hit {:description "ﾌﾘｺﾐ 12"} "12")))))
+
+;; ───────── 候補（サンプル） ─────────
+
+(deftest sample-candidates
+  (testing "INV-0001 の入金: 金額が一致し、振込名義が取引先と一致 → 有力で最初から選ぶ"
+    (let [{:keys [candidates preselected]} (cands sample-db "l1")
+          c (first candidates)]
+      (is (= :invoice (:type c)))
+      (is (= 3 (:level c)))
+      (is (= [{:invoice-id "i1" :amount 59320}] (:allocations c)))
+      (is (= c preselected))))
+  (testing "A-102 の支払: 摘要に請求書番号 → 有力"
+    (is (= [:invoice 3 ["i3"]] ((juxt :type :level :invoices) (:preselected (cands sample-db "l2"))))))
+  (testing "振込手数料: 利用者の規則"
+    (is (= [:account :user "支払手数料"] ((juxt :type :source :account) (:preselected (cands sample-db "l3"))))))
+  (testing "候補の無い行"
+    (is (= [] (:candidates (cands sample-db "l4")))))
+  (testing "家賃: 過去の仕訳 1 件から学んだ規則は弱い（最初から選ばない）"
+    (let [{:keys [candidates preselected]} (cands sample-db "l5")]
+      (is (= [:account :learned 1 "地代家賃"] ((juxt :type :source :level :account) (first candidates))))
+      (is (nil? preselected)))))
+
+;; ───────── 計上 ─────────
+
+(deftest post-invoice-exact
+  (let [{:keys [db entry-id]} (st/post-line sample-db "l1" (:preselected (cands sample-db "l1")))
+        e (entry-of db entry-id)]
+    (is (= [["普通預金" 59320 0 nil nil] ["売掛金" 0 59320 nil nil]] (lines-summary e)))
+    (is (= {:format :statement :line-id "l1" :account-id "a1" :allocations [{:invoice-id "i1" :amount 59320}] :fee 0}
+           (:origin e)))
+    (is (= 0 (st/open-amount db (inv/invoice-by-id db "i1"))))
+    (is (= :posted (st/line-status db (line db "l1"))))
+    (testing "確かめた振込名義を取引先の別名として覚える"
+      (is (= ["ミナト"] (st/aliases db "株式会社みなと"))))
+    (testing "計上の後は候補を出さず、同じ行をもう 1 度計上しない"
+      (is (= :already-posted (:skipped (st/post-line db "l1" {:type :account :account "雑収入"})))))
+    (testing "計上を取り消すと残額が戻る"
+      (let [db (st/unpost-line db "l1")]
+        (is (= 59320 (st/open-amount db (inv/invoice-by-id db "i1"))))
+        (is (= :open (st/line-status db (line db "l1"))))))))
+
+(defn- fee-db []
+  (add-line sample-db {:date "2026-11-29" :amount 58880 :description "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ"}))
+
+(deftest post-invoice-with-fee
+  (let [db (fee-db)
+        id (:id (last (:statement-lines db)))
+        c (:preselected (cands db id))]
+    (is (= [:invoice 3 2 440] ((juxt :type :level :kind :fee) c)))
+    (testing "8% と 10% の混ざった請求書は、差額の税率を選ぶまで計上しない（Q&A に割り当ての定めが無い）"
+      (is (= :fee-rate-needed (:skipped (st/post-line db id c)))))
+    (testing "既定（判断 2）: 支払手数料・売上の対価の返還（10%、税込から 1 回の端数処理）"
+      (let [{db' :db :keys [entry-id warnings]} (st/post-line db id (assoc c :fee-rate 1000))
+            e (entry-of db' entry-id)]
+        (is (= [["普通預金" 58880 0 nil nil]
+                ["支払手数料" 400 0 "売上の対価の返還 10%" nil]
+                ["仮受消費税" 40 0 "売上の対価の返還 10%" nil]
+                ["売掛金" 0 59320 nil nil]]
+               (lines-summary e)))
+        (is (balanced? e))
+        (is (= [] warnings))
+        (is (= 0 (st/open-amount db' (inv/invoice-by-id db' "i1"))))))
+    (testing "取引先ごとに課税仕入へ: 適格請求書は「未確認」"
+      (let [db (assoc-in db [:statement-settings :fee-by-partner "株式会社みなと"] :purchase)
+            {db' :db :keys [entry-id]} (st/post-line db id c)]
+        (is (= [["普通預金" 58880 0 nil nil]
+                ["支払手数料" 400 0 "課税仕入 10%" "未確認"]
+                ["仮払消費税" 40 0 "課税仕入 10%" "未確認"]
+                ["売掛金" 0 59320 nil nil]]
+               (lines-summary (entry-of db' entry-id))))))
+    (testing "売上値引高の科目にする"
+      (let [db (assoc-in db [:statement-settings :fee-treatment] :discount)
+            {db' :db :keys [entry-id]} (st/post-line db id (assoc c :fee-rate 800))]
+        (is (= "売上値引高" (:account (second (:lines (entry-of db' entry-id))))))
+        (is (= "売上の対価の返還 8%（軽減）" (get-in (second (:lines (entry-of db' entry-id))) [:tax :code])))))))
+
+(deftest fee-over-ten-thousand-warns
+  (let [db (-> sample-db
+               (add-invoice {:id "i9" :number "INV-0099" :date "2026-10-01" :due-date "2026-10-31"
+                             :partner {:name "株式会社おおきな"}
+                             :lines [{:description "x" :amount 100000 :category :taxable :rate 1000}]})
+               (assoc-in [:statement-settings :max-fee] 20000)
+               (add-line {:date "2026-10-31" :amount 98000 :description "ｵｵｷﾅ INV-0099"}))
+        id (:id (last (:statement-lines db)))
+        c (:preselected (cands db id))]
+    (is (= 12000 (:fee c)))
+    (is (= [:return-invoice] (:warnings (st/post-line db id c))))))
+
+(deftest purchase-payment-deducting-fee-warns
+  (let [db (add-line sample-db {:date "2026-11-30" :amount -3190 :description "ﾔﾏﾀﾞﾌﾞﾝｸﾞ A-102"})
+        id (:id (last (:statement-lines db)))
+        c (:preselected (cands db id))
+        {db' :db :keys [entry-id warnings]} (st/post-line db id c)]
+    (is (= [:invoice 2 440] ((juxt :type :kind :fee) c)))
+    (is (= [["買掛金" 3630 0 nil nil] ["普通預金" 0 3190 nil nil]
+            ["支払手数料" 0 400 "仕入の対価の返還 10%" nil] ["仮払消費税" 0 40 "仕入の対価の返還 10%" nil]]
+           (lines-summary (entry-of db' entry-id))))
+    (is (= [:deducted-fee] warnings))))
+
+(deftest partial-and-multiple-invoices
+  (testing "一部入金: 名前が合えば弱い候補、割り当ては入金の額だけ、残りは残額"
+    (let [db (add-line sample-db {:date "2026-11-20" :amount 30000 :description "ｶ)ﾐﾅﾄ"})
+          id (:id (last (:statement-lines db)))
+          c (first (:candidates (cands db id)))]
+      (is (= [:invoice 1 3] ((juxt :type :level :kind) c)))
+      (let [{db' :db} (st/post-line db id c)]
+        (is (= 29320 (st/open-amount db' (inv/invoice-by-id db' "i1")))))))
+  (testing "1 件の入金で同じ取引先の請求書 2 件（期日の順の先頭から）"
+    (let [db (-> sample-db
+                 (add-invoice {:id "i7" :number "K-1" :date "2026-10-01" :due-date "2026-10-31" :partner {:name "合同会社かもめ"}
+                               :lines [{:description "a" :amount 30000 :category :taxable :rate 1000}]})
+                 (add-invoice {:id "i8" :number "K-2" :date "2026-10-05" :due-date "2026-11-30" :partner {:name "合同会社かもめ"}
+                               :lines [{:description "b" :amount 20000 :category :taxable :rate 1000}]})
+                 (add-line {:date "2026-11-30" :amount 55000 :description "ﾌﾘｺﾐ ﾄﾞ)ｶﾓﾒ"}))
+          id (:id (last (:statement-lines db)))
+          c (:preselected (cands db id))]
+      (is (= [:invoice 3 ["i7" "i8"] [{:invoice-id "i7" :amount 33000} {:invoice-id "i8" :amount 22000}]]
+             ((juxt :type :level :invoices :allocations) c)))))
+  (testing "発行日より前の入金は請求書の候補にしない（前受は扱わない）"
+    (let [db (add-line sample-db {:date "2026-10-01" :amount 59320 :description "ｶ)ﾐﾅﾄ"})
+          id (:id (last (:statement-lines db)))]
+      (is (empty? (filter #(= :invoice (:type %)) (:candidates (cands db id))))))))
+
+(deftest match-existing-entry
+  (let [db (add-line sample-db {:date "2026-06-30" :amount 500 :description "ﾘｿｸ"})
+        id (:id (last (:statement-lines db)))
+        c (:preselected (cands db id))]
+    (testing "帳簿にもうある仕訳（預金利息）と同じ額・同じ日 → 照合の候補"
+      (is (= [:entry "e6" 3] ((juxt :type :entry-id :level) c))))
+    (let [{db' :db :keys [entry-id]} (st/post-line db id c)]
+      (testing "照合は仕訳を起こさない"
+        (is (nil? entry-id))
+        (is (= (count (:entries db)) (count (:entries db'))))
+        (is (= :matched (st/line-status db' (line db' id)))))
+      (testing "照合した仕訳は別の行の候補にしない（二重の照合を防ぐ）"
+        (let [db2 (add-line db' {:date "2026-06-30" :amount 500 :description "ﾘｿｸ ﾍﾞﾂ"})
+              id2 (:id (last (:statement-lines db2)))]
+          (is (empty? (filter #(= :entry (:type %)) (:candidates (cands db2 id2))))))))))
+
+(deftest transfer-between-accounts
+  (let [db (:db (core/merge-import sample-db
+                                   {:currency "JPY"
+                                    :statement-accounts [{:id "c1" :key "test:card" :kind :card :name "カード" :ledger-account "未払金"}
+                                                         {:id "b1" :key "sample:bank" :kind :bank :name "x" :ledger-account "普通預金"}]
+                                    :statement-lines [{:account-id "c1" :date "2026-12-27" :amount 33000 :description "ｺﾞｼﾞﾂｾｲｻﾝ"}
+                                                      {:account-id "b1" :date "2026-12-27" :amount -33000 :description "ｶｰﾄﾞ ﾋｷｵﾄｼ"}]}))
+        bank-line (last (filter #(= "a1" (:account-id %)) (:statement-lines db)))
+        c (:preselected (st/candidates db bank-line))
+        {db' :db :keys [entry-id]} (st/post-line db (:id bank-line) c)]
+    (is (= :transfer (:type c)))
+    (is (= [["未払金" 33000 0 nil nil] ["普通預金" 0 33000 nil nil]] (lines-summary (entry-of db' entry-id))))
+    (testing "振替は 2 行で 1 つの仕訳: 両方の行が計上済み"
+      (is (= #{:posted} (set (map #(st/line-status db' %) (filter #(contains? #{33000 -33000} (:amount %)) (:statement-lines db')))))))))
+
+;; ───────── 規則 ─────────
+
+(defn- rent-db [entries]
+  (:db (core/merge-import sample-db {:currency "JPY" :entries entries})))
+
+(defn- e [date memo account amount & [tax]]
+  {:date date :memo memo
+   :lines [(cond-> {:account account :debit amount :credit 0} tax (assoc :tax {:scheme :mf :code tax}))
+           {:account "普通預金" :debit 0 :credit amount}]})
+
+(deftest learned-rules
+  (testing "同じ摘要で 2 回同じ科目 → 強い（最初から選ぶ）"
+    (let [db (rent-db [(e "2026-06-25" "事務所の家賃" "地代家賃" 80000)])
+          c (:preselected (cands db "l5"))]
+      (is (= [:learned 3 "地代家賃"] ((juxt :source :level :account) c)))))
+  (testing "同じ鍵が 2 つの科目に分かれる（割合 70% 未満）→ 弱い"
+    (let [db (rent-db [(e "2026-06-25" "事務所の家賃" "支払手数料" 80000)])]
+      (is (= 1 (:level (first (:candidates (cands db "l5"))))))))
+  (testing "金額が過去の幅（最小の半分〜最大の 2 倍）の外 → 弱い"
+    (let [db (-> (rent-db [(e "2026-06-25" "事務所の家賃" "地代家賃" 80000)])
+                 (add-line {:date "2026-12-26" :amount -200000 :description "事務所の家賃"}))
+          id (:id (last (:statement-lines db)))]
+      (is (= 1 (:level (first (:candidates (cands db id))))))))
+  (testing "税率は学ばない: 2019 年 9 月の「課税仕入 8%」から学んでも、2026 年の行は 10%"
+    (let [db (-> (rent-db [(e "2019-09-10" "ｺｳｷﾞﾖｳ ﾃﾞﾝｷ" "水道光熱費" 2200 "課税仕入 8%")
+                           (e "2019-09-30" "ｺｳｷﾞﾖｳ ﾃﾞﾝｷ" "水道光熱費" 2160 "課税仕入 8%")])
+                 (add-line {:date "2026-12-01" :amount -2200 :description "ｺｳｷﾞﾖｳ ﾃﾞﾝｷ"}))
+          id (:id (last (:statement-lines db)))
+          c (:preselected (cands db id))
+          {db' :db :keys [entry-id]} (st/post-line db id c)]
+      (is (= {:category :taxable :kind 0} (:tax c)))
+      (is (= [["水道光熱費" 2000 0 "課税仕入 10%" "未確認"] ["仮払消費税" 200 0 "課税仕入 10%" "未確認"]
+              ["普通預金" 0 2200 nil nil]]
+             (lines-summary (entry-of db' entry-id))))))
+  (testing "2027-04-01 からの飲食料品は税率を出さない（法案の段階）"
+    (let [db (add-line sample-db {:date "2027-04-02" :amount -1080 :description "ﾍﾞﾝﾄｳ"})
+          id (:id (last (:statement-lines db)))]
+      (is (= :rate-unknown (:skipped (st/post-line db id {:type :account :account "会議費" :tax {:category :taxable :kind 1}}))))
+      (is (some? (:entry-id (st/post-line db id {:type :account :account "会議費" :tax {:category :taxable :kind 1 :rate 100}}))))))
+  (testing "利用者の規則は学んだ規則に勝つ"
+    (let [db (-> (rent-db [(e "2026-06-25" "事務所の家賃" "地代家賃" 80000)])
+                 (st/add-rule {:when {:direction :out :text "家賃" :op :contains} :then {:account "賃借料"}}))]
+      (is (= [:user "賃借料"] ((juxt :source :account) (:preselected (cands db "l5"))))))))
+
+(deftest user-rules
+  (let [db (st/add-rule sample-db {:when {:text "ｱﾏｿﾞﾝ" :op :prefix :direction :out}
+                                   :then {:account "消耗品費" :tax {:category :taxable :kind 0}}})
+        r (last (:rules db))]
+    (testing "前方一致・向き"
+      (is (st/rule-matches? r {:description "ｱﾏｿﾞﾝ ﾏｰｹｯﾄ" :amount -1}))
+      (is (not (st/rule-matches? r {:description "ｱﾏｿﾞﾝ ﾏｰｹｯﾄ" :amount 1})))
+      (is (not (st/rule-matches? r {:description "ﾍﾝﾋﾟﾝ ｱﾏｿﾞﾝ" :amount -1}))))
+    (testing "並べ替えと消去"
+      (let [db (st/move-rule db (:id r) -1)]
+        (is (= [(:id r) "r1"] (map :id (:rules db))))
+        (is (= ["r1"] (map :id (:rules (st/delete-rule db (:id r))))))))
+    (testing "提案した回数と、そのまま承認された回数"
+      (let [c (:preselected (cands db "l4"))
+            {db' :db} (st/post-line db "l4" (assoc c :as-suggested? true))]
+        (is (= {:suggested 1 :accepted 1} (:stats (last (:rules db')))))))
+    (testing "「規則にする」で摘要の完全一致の規則を足す"
+      (let [{db' :db} (st/post-line sample-db "l4" {:type :account :account "消耗品費" :make-rule? true})]
+        (is (= {:direction :out :text "アマゾンマケツトプレイス" :op :exact :account-id "a1"} (:when (last (:rules db')))))))
+    (testing "部分一致の規則が、過去に別の科目へ記帳した摘要にも当たるなら知らせる"
+      (is (= [{:key "事務所ノ家賃" :account "地代家賃"}]
+             (st/rule-conflicts sample-db {:when {:text "家賃" :op :contains} :then {:account "支払手数料"}}))))))
+
+(deftest post-preselected-only
+  (let [{:keys [db posted skipped]} (st/post-preselected sample-db ["l1" "l2" "l3" "l4" "l5"])]
+    (is (= ["l1" "l2" "l3"] posted))
+    (is (= [{:id "l4" :reason :no-preselected} {:id "l5" :reason :no-preselected}] skipped))
+    (is (every? balanced? (filter st/statement-entry? (:entries db))))))
+
+;; ───────── 照合・年齢表 ─────────
+
+(deftest reconcile-balances
+  (let [s0 (st/account-summary sample-db (first (:statement-accounts sample-db)))]
+    (testing "計上の前: 明細の残高 977,650、帳簿の普通預金 1,003,500"
+      (is (= [{:amount 977650 :date "2026-12-25"} 1003500 -25850 nil]
+             ((juxt :closing :ledger :difference :break) s0)))))
+  (let [{db :db} (st/post-preselected sample-db ["l1" "l2" "l3"])
+        db (:db (st/post-line db "l4" {:type :account :account "消耗品費" :tax {:category :taxable :kind 0}}))
+        db (:db (st/post-line db "l5" {:type :account :account "地代家賃" :tax {:category :exempt}}))
+        s (st/account-summary db (first (:statement-accounts db)))]
+    (testing "すべて計上すると差は 0"
+      (is (= [0 {:posted 5}] ((juxt :difference :counts) s))))
+    (is (= {:open 0 :unbalanced 0 :unconfirmed 2} (st/counts db))))
+  (testing "残高の切れ目（行の抜け）を見つける"
+    (let [db (update sample-db :statement-lines (fn [ls] (vec (remove #(= "l3" (:id %)) ls))))]
+      (is (= "l4" (:break (st/account-summary db (first (:statement-accounts db))))))))
+  (testing "同じ日の中が新しい順でも切れ目にしない"
+    (let [db (update sample-db :statement-lines
+                     (fn [ls] (mapv #(case (:id %) "l2" (assoc % :seq 3) "l3" (assoc % :seq 2) %) ls)))]
+      (is (nil? (:break (st/account-summary db (first (:statement-accounts db)))))))))
+
+(deftest aging-buckets
+  (let [{:keys [rows totals total]} (st/aging sample-db :sales "2027-01-31")]
+    (testing "INV-0001（期日 2026-11-30）は 62 日後で 61〜90 日の区分。下書きは数えない"
+      (is (= [{:partner "株式会社みなと" :buckets [0 0 0 59320 0] :total 59320}] rows))
+      (is (= [0 0 0 59320 0] totals))
+      (is (= 59320 total))))
+  (is (= [0 3630 0 0 0] (:totals (st/aging sample-db :purchase "2026-12-15")))))
+
+;; ───────── 取り込み: 重複・訂正・往復 ─────────
+
+(deftest import-dedup-and-corrections
+  (let [ofx (ingest/ingest-text (fixture "ofx-bank.ofx") {})
+        {db :db :keys [lines-added]} (core/merge-import core/empty-db ofx)]
+    (is (= 3 lines-added))
+    (testing "同じ OFX をもう 1 度: FITID で重複"
+      (is (= [0 3] ((juxt :lines-added :lines-duplicates) (core/merge-import db ofx))))))
+  (testing "一意な id の無い CSV: 内容と、同じ内容の何番目かで判定（同じ行が 2 つあれば両方残る）"
+    (let [csv "取引日,出金額,入金額,残高,取引内容\r\n2026/11/30,440,,,ﾃｽｳﾘﾖｳ\r\n2026/11/30,440,,,ﾃｽｳﾘﾖｳ\r\n"
+          parsed (ingest/ingest-text csv {})
+          {db :db :keys [lines-added]} (core/merge-import core/empty-db parsed)]
+      (is (= 2 lines-added))
+      (is (= [0 2] ((juxt :lines-added :lines-duplicates) (core/merge-import db parsed))))))
+  (testing "OFX の CORRECTACTION DELETE は同じファイルの中の行も消す。別の通貨の行は取り込まない"
+    (let [card (ingest/ingest-text (fixture "ofx-card.qfx") {})
+          {db :db :keys [lines-added lines-corrected]} (core/merge-import core/empty-db card)]
+      (is (= 1 (:rejected card)))
+      (is (= [3 1] [lines-added lines-corrected]))
+      (is (= ["C-0001" "C-0005"] (map :uid (:statement-lines db))))))
+  (testing "口座を選んで取り込む（opts の :statement-account）"
+    (let [csv (ingest/ingest-text (fixture "freee-statement-bank.csv") {})
+          {db :db} (core/merge-import sample-db csv :append {:statement-account "a1"})]
+      (is (= ["a1"] (distinct (map :account-id (:statement-lines db)))))
+      (is (= 1 (count (:statement-accounts db)))))))
+
+(deftest ledger-json-round-trip
+  (let [{db :db} (st/post-preselected sample-db ["l1" "l2" "l3"])
+        db (:db (st/post-line db "l4" {:type :exclude}))
+        db (assoc-in db [:statement-settings :fee-by-partner "株式会社みなと"] :purchase)
+        back (:db (core/merge-import core/empty-db (ingest/ingest-text (native/write db) {})))]
+    (is (= (:statement-accounts db) (:statement-accounts back)))
+    (is (= (:statement-lines db) (:statement-lines back)))
+    (is (= (:rules db) (:rules back)))
+    (is (= (st/settings db) (st/settings back)))
+    (is (= (:entries db) (:entries back)))
+    (testing "消込の割り当てと計上の状態が戻る"
+      (is (= 0 (st/open-amount back (inv/invoice-by-id back "i1"))))
+      (is (= [:posted :posted :posted :excluded :open] (map #(st/line-status back %) (:statement-lines back)))))))
+
+(deftest settling-posts-the-invoice-first
+  (testing "未計上の請求書を消込むときは、先に請求書を計上する（売掛金が逆の残高にならない）"
+    (let [{:keys [db invoices-posted]} (st/post-line sample-db "l1" (:preselected (cands sample-db "l1")))
+          receivable (reduce + 0 (for [e (:entries db) l (:lines e) :when (= "売掛金" (:account l))]
+                                   (- (:debit l 0) (:credit l 0))))]
+      (is (= ["i1"] invoices-posted))
+      (is (some? (inv/posted-entry db "i1")))
+      (testing "サンプルの 4 月分の売掛金 330,000 だけが残る"
+        (is (= 330000 receivable)))))
+  (testing "計上済みの請求書はもう 1 度計上しない"
+    (let [{db :db} (inv/post sample-db "i1")
+          {:keys [invoices-posted]} (st/post-line db "l1" (:preselected (cands db "l1")))]
+      (is (nil? invoices-posted))))
+  (testing "計上できない請求書（下書き）を消込もうとすると止める"
+    (is (= :invoice-blocked (:skipped (st/post-line sample-db "l1" {:type :invoice :allocations [{:invoice-id "i2" :amount 33000}]}))))))
+
+(deftest settlements-are-not-learned
+  (let [{db :db} (st/post-preselected sample-db ["l1" "l2"])]
+    (is (empty? (filter (fn [[[_ _ k] _]] (re-find #"消込" k)) (st/learn db))))))

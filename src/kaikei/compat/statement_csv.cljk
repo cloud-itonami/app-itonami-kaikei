@@ -1,0 +1,250 @@
+(ns kaikei.compat.statement-csv
+  "各社の明細の取り込み CSV（第 4 スライス、JUN-327）。読みと書き。
+
+    freee-statement-csv  freee 会計の明細のテンプレート（freee ヘルプ 202847120・
+                         202847810 と添付のテンプレート。UTF-8、BOM なし）。
+                         銀行 取引日,出金額,入金額,残高,取引内容
+                         カード 取引日,取引金額,取引内容,カードラベル（利用が正、返金が負）
+    mf-statement-csv     マネーフォワード クラウド会計の明細の取り込み（MF サポート
+                         im01・im02）。日付,内容,出金額,入金額（または 日付,内容,金額 で
+                         出金が負）。日付は西暦だけ。
+    xero-statement-csv   Xero の明細の CSV（Xero Central「Import a CSV bank statement」）。
+                         Date,Amount,Payee,Description,Reference,Cheque Number。収入が正・
+                         支出が負（-30.00 か (30.00)）。カードは返済が正・利用が負。
+    qbo-bank-csv         QuickBooks Online の明細の CSV（QuickBooks Help L4BjLWckq）。
+                         3 列 Date,Description,Amount（入金が正）か、4 列
+                         Date,Description,Credit,Debit。
+
+  未確認: Xero の見出しの正確な文字列（`*` の有無、地域の綴り Cheque／Check）、
+  MF の見出しのバイト列（画面写しから読んだ）、freee・MF が受ける文字コード。
+  読みは見出しの `*`・空白・大文字小文字を揃えてから見る。QBO の 4 列の例は
+  支払が Credit・入金が Debit で、口座の持ち主から見て逆に読める（Intuit の表の
+  とおりに読む。書き出しは 3 列だけ）。
+
+  明細の行の金額は口座の持ち主から見た向き（入金が正、出金が負。カードは利用が負）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]
+            [kaikei.compat.common :as common]))
+
+(defn- norm [h] (text/lower (text/replace (str h) #"[\s*＊﻿]" "")))
+
+(defn- header [rows] (mapv norm (first rows)))
+
+(defn- has? [h & names] (every? (set h) (map norm names)))
+
+;; ───────── 判定 ─────────
+
+(defn freee-kind [rows]
+  (let [h (header rows)]
+    (cond
+      (has? h "取引日" "出金額" "入金額" "取引内容") :bank
+      (has? h "取引日" "取引金額" "取引内容") :card
+      :else nil)))
+
+(defn mf-detect? [rows]
+  (let [h (header rows)]
+    (and (has? h "日付" "内容")
+         (or (has? h "出金額" "入金額") (has? h "金額"))
+         (not (some #{"取引no" "借方勘定科目"} h)))))
+
+(defn xero-detect? [rows]
+  (let [h (header rows)]
+    (and (has? h "date" "amount")
+         (some #{"payee" "description" "reference"} h)
+         (not (some #{"narration" "accountcode" "invoicenumber" "contactname"} h)))))
+
+(defn qbo-detect? [rows]
+  (let [h (header rows)]
+    (or (= h ["date" "description" "amount"])
+        (= h ["date" "description" "credit" "debit"]))))
+
+;; ───────── 読み ─────────
+
+(defn- normalized-records [rows]
+  (csv/records (cons (header rows) (rest rows))))
+
+(defn- account [fmt kind label currency]
+  {:id "s1" :key (str fmt ":" (name kind)) :kind kind
+   :name label :ledger-account (if (= kind :card) "未払金" "普通預金")
+   :currency currency :origin {:format (keyword fmt)}})
+
+(defn- amount-of [v exp where field]
+  (if (text/blank? (str v))
+    {:amount 0}
+    (common/read-amount v exp (str where " の " field))))
+
+(defn- finish [fmt acct candidates currency]
+  {:format (keyword fmt)
+   :currency currency
+   :accounts []
+   :statement-accounts [acct]
+   :statement-lines (vec (for [{:keys [line]} candidates :when line] (assoc line :account-id (:id acct))))
+   :warnings (vec (keep :problem candidates))
+   :rejected (count (filter :problem candidates))})
+
+(defn- line-or-problem [where date parts f]
+  (let [p (common/first-problem parts)]
+    (cond
+      p {:problem (:problem p)}
+      (nil? date) {:problem (str where ": 日付が読めません")}
+      :else {:line (f)})))
+
+(defn read-freee [rows]
+  (let [kind (freee-kind rows)
+        recs (normalized-records rows)
+        exp 0]
+    (finish "freee-statement-csv"
+            (account "freee-statement-csv" kind (str "freee 明細 CSV（" (if (= kind :card) "カード" "銀行") "）") "JPY")
+            (for [r recs
+                  :let [where (str "行 " (::csv/row r))
+                        date (core/parse-date (get r "取引日"))
+                        out (amount-of (get r "出金額") exp where "出金額")
+                        in (amount-of (get r "入金額") exp where "入金額")
+                        card (amount-of (get r "取引金額") exp where "取引金額")
+                        bal (when-not (text/blank? (str (get r "残高"))) (amount-of (get r "残高") exp where "残高"))]]
+              (line-or-problem where date (if (= kind :card) [card] [out in bal])
+                               (fn []
+                                 (cond-> {:date date
+                                          :amount (if (= kind :card) (- (:amount card)) (- (:amount in) (:amount out)))
+                                          :description (text/trim (str (get r "取引内容")))
+                                          :origin {:format :freee-statement-csv :row (::csv/row r)}}
+                                   bal (assoc :balance (:amount bal))
+                                   (not (text/blank? (str (get r "カードラベル"))))
+                                   (assoc :hints {:card-label (text/trim (get r "カードラベル"))})))))
+            "JPY")))
+
+(defn read-mf [rows]
+  (let [recs (normalized-records rows)
+        exp 0]
+    (finish "mf-statement-csv"
+            (account "mf-statement-csv" :bank "MF 明細 CSV" "JPY")
+            (for [r recs
+                  :let [where (str "行 " (::csv/row r))
+                        date (core/parse-date (get r "日付"))
+                        signed? (contains? r "金額")
+                        out (amount-of (get r "出金額") exp where "出金額")
+                        in (amount-of (get r "入金額") exp where "入金額")
+                        amt (amount-of (get r "金額") exp where "金額")]]
+              (line-or-problem where date (if signed? [amt] [out in])
+                               (fn []
+                                 {:date date
+                                  :amount (if signed? (:amount amt) (- (:amount in) (:amount out)))
+                                  :description (text/trim (str (get r "内容")))
+                                  :origin {:format :mf-statement-csv :row (::csv/row r)}})))
+            "JPY")))
+
+(defn- date-order [recs field opts default]
+  (or (:date-order opts) (common/detect-date-order (map #(get % field) recs)) default))
+
+(defn read-xero [rows {:keys [currency] :as opts}]
+  (let [recs (normalized-records rows)
+        exp (core/exponent currency)
+        order (date-order recs "date" opts "dmy")]
+    (finish "xero-statement-csv"
+            (account "xero-statement-csv" :bank "Xero 明細 CSV" currency)
+            (for [r recs
+                  :let [where (str "行 " (::csv/row r))
+                        date (common/parse-ordered-date (get r "date") order)
+                        amt (common/read-amount (get r "amount") exp (str where " の Amount"))
+                        payee (common/blank->nil (get r "payee"))
+                        desc (common/blank->nil (get r "description"))
+                        ref (or (common/blank->nil (get r "reference"))
+                                (common/blank->nil (get r "chequenumber"))
+                                (common/blank->nil (get r "checknumber")))]]
+              (line-or-problem where date [amt]
+                               (fn []
+                                 (cond-> {:date date :amount (:amount amt)
+                                          ;; 摘要が取引先を含むとき（kaikei の書き出し）は重ねない
+                                          :description (if (and payee desc (text/includes? desc payee))
+                                                         desc
+                                                         (text/join " " (remove nil? [payee desc])))
+                                          :origin {:format :xero-statement-csv :row (::csv/row r)}}
+                                   payee (assoc :counterparty payee)
+                                   ref (assoc :reference ref)))))
+            currency)))
+
+(defn read-qbo [rows {:keys [currency] :as opts}]
+  (let [recs (normalized-records rows)
+        exp (core/exponent currency)
+        order (date-order recs "date" opts "mdy")
+        four? (contains? (first recs) "credit")]
+    (finish "qbo-bank-csv"
+            (account "qbo-bank-csv" :bank "QuickBooks 明細 CSV" currency)
+            (for [r recs
+                  :let [where (str "行 " (::csv/row r))
+                        date (common/parse-ordered-date (get r "date") order)
+                        amt (amount-of (get r "amount") exp where "Amount")
+                        credit (amount-of (get r "credit") exp where "Credit")
+                        debit (amount-of (get r "debit") exp where "Debit")]]
+              (line-or-problem where date (if four? [credit debit] [amt])
+                               (fn []
+                                 {:date date
+                                  ;; Intuit の 4 列の例: 支払が Credit、入金が Debit
+                                  :amount (if four? (- (:amount debit) (:amount credit)) (:amount amt))
+                                  :description (text/trim (str (get r "description")))
+                                  :origin {:format :qbo-bank-csv :row (::csv/row r)}})))
+            currency)))
+
+;; ───────── 書き ─────────
+
+(defn- account-lines [db account-id]
+  (vec (sort-by (juxt :date #(:seq % 0)) (filter #(= account-id (:account-id %)) (:statement-lines db)))))
+
+(defn- plain-amount [n exp] (core/format-amount n exp))
+
+(defn- blank-if-zero [n exp] (if (zero? n) "" (plain-amount n exp)))
+
+(def ^:private lossy
+  "書き出しで失うもの（どの明細の CSV も持てない）。"
+  "照合・消込・規則・計上しない の印はこの形式に入りません（kaikei 帳簿 JSON は持てます）")
+
+(defn write-freee [db acct]
+  (let [exp (core/exponent (:currency db))
+        ls (account-lines db (:id acct))
+        card? (= :card (:kind acct))]
+    {:text (csv/write
+            (cons (if card? ["取引日" "取引金額" "取引内容" "カードラベル"] ["取引日" "出金額" "入金額" "残高" "取引内容"])
+                  (for [l ls]
+                    (if card?
+                      [(core/slash-date (:date l)) (plain-amount (- (:amount l)) exp) (:description l "")
+                       (get-in l [:hints :card-label] "")]
+                      [(core/slash-date (:date l))
+                       (blank-if-zero (if (neg? (:amount l)) (- (:amount l)) 0) exp)
+                       (blank-if-zero (if (pos? (:amount l)) (:amount l) 0) exp)
+                       (if (some? (:balance l)) (plain-amount (:balance l) exp) "")
+                       (:description l "")]))))
+     :notes [lossy]}))
+
+(defn write-mf [db acct]
+  (let [exp (core/exponent (:currency db))
+        ls (account-lines db (:id acct))]
+    {:text (csv/write
+            (cons ["日付" "内容" "出金額" "入金額"]
+                  (for [l ls]
+                    [(core/slash-date (:date l)) (:description l "")
+                     (blank-if-zero (if (neg? (:amount l)) (- (:amount l)) 0) exp)
+                     (blank-if-zero (if (pos? (:amount l)) (:amount l) 0) exp)])))
+     :notes (cond-> [lossy] (some :balance ls) (conj "残高は MF の明細の取り込みに入りません"))}))
+
+(defn write-xero [db acct]
+  (let [exp (core/exponent (:currency db))
+        ls (account-lines db (:id acct))]
+    {:text (csv/write
+            (cons ["Date" "Amount" "Payee" "Description" "Reference" "Cheque Number"]
+                  (for [l ls]
+                    [(core/slash-date (:date l)) (plain-amount (:amount l) exp)
+                     (or (:counterparty l) "") (:description l "") (or (:reference l) "") ""])))
+     :notes (cond-> [lossy "日付は YYYY/MM/DD で書きます（Xero の取り込みが受ける形の 1 つ）"]
+              (some :balance ls) (conj "残高は Xero の明細の CSV に入れません（Xero は残高の列を外すよう求めています）"))}))
+
+(defn write-qbo [db acct {:keys [date-order]}]
+  (let [exp (core/exponent (:currency db))
+        ls (account-lines db (:id acct))
+        order (or date-order "mdy")]
+    {:text (csv/write
+            (cons ["Date" "Description" "Amount"]
+                  (for [l ls]
+                    [(common/format-ordered-date (:date l) order) (:description l "") (plain-amount (:amount l) exp)])))
+     :notes (cond-> [lossy "QuickBooks の 3 列の形（入金が正、支払が負）で書きます"]
+              (some :balance ls) (conj "残高は QuickBooks の明細の CSV に入りません"))}))

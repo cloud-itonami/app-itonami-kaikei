@@ -10,6 +10,8 @@
 ;;
 ;; :buffers の名前（keyword）は :args の中でその buffer に置き換わる。
 ;; :sample は guest の sample-ledger と同じ帳簿（[date class debit credit] × 20 行）。
+;; 明細の buffer は [amount balance] × n、未消込の請求書の buffer は [open] × n
+;; （第 4 スライス、JUN-327。行は guest の test-* から写した）。
 ;; 区分: 1 流動資産 … 6 純資産、7 売上高 … 14 法人税等（guest の docstring）。
 ;;
 ;; 請求書の buffer は [rate amount] × n（rate は basis points）。mode 0 税抜・
@@ -191,4 +193,110 @@
   {:fn "deduction-percent" :args [20261001 0] :expect 70}
   {:fn "deduction-percent" :args [20281001 0] :expect 50}
   {:fn "deduction-percent" :args [20301001 0] :expect 30}
-  {:fn "deduction-percent" :args [20311001 0] :expect 0}]}
+  {:fn "deduction-percent" :args [20311001 0] :expect 0}
+
+  ;; days-between [from to] — 日数の差（うるう年: 2024・2000 は数え、2100 は数えない）
+  {:fn "days-between" :args [19700101 20261023] :expect 20749}
+  {:fn "days-between" :args [20260101 20261231] :expect 364}
+  {:fn "days-between" :args [20240228 20240301] :expect 2}
+  {:fn "days-between" :args [20230228 20230301] :expect 1}
+  {:fn "days-between" :args [20000228 20000301] :expect 2}
+  {:fn "days-between" :args [21000228 21000301] :expect 1}
+  {:fn "days-between" :args [19700101 16000301] :expect -135080}
+  {:fn "days-between" :args [19700101 99991231] :expect 2932896}
+  {:fn "days-between" :args [20261023 20261023] :expect 0}
+
+  ;; consumption-rate [date kind] — 0 標準・1 飲食料品・2 新聞。表の外と 2027-04-01 からの飲食料品は -1
+  {:fn "consumption-rate" :args [20140331 0] :expect -1}
+  {:fn "consumption-rate" :args [20140401 0] :expect 800}
+  {:fn "consumption-rate" :args [20190930 0] :expect 800}
+  {:fn "consumption-rate" :args [20190930 1] :expect 800}
+  {:fn "consumption-rate" :args [20191001 0] :expect 1000}
+  {:fn "consumption-rate" :args [20191001 1] :expect 800}
+  {:fn "consumption-rate" :args [20191001 2] :expect 800}
+  {:fn "consumption-rate" :args [20270331 1] :expect 800}
+  {:fn "consumption-rate" :args [20270401 1] :expect -1}
+  {:fn "consumption-rate" :args [20270401 2] :expect 800}
+  {:fn "consumption-rate" :args [20270401 0] :expect 1000}
+
+  ;; aging-bucket [due as-of] — 0 期日前、1 1〜30 日、2 31〜60 日、3 61〜90 日、4 91 日〜
+  {:fn "aging-bucket" :args [20261031 20261031] :expect 0}
+  {:fn "aging-bucket" :args [20261031 20261001] :expect 0}
+  {:fn "aging-bucket" :args [20261031 20261101] :expect 1}
+  {:fn "aging-bucket" :args [20261031 20261130] :expect 1}
+  {:fn "aging-bucket" :args [20261031 20261201] :expect 2}
+  {:fn "aging-bucket" :args [20261031 20261230] :expect 2}
+  {:fn "aging-bucket" :args [20261031 20261231] :expect 3}
+  {:fn "aging-bucket" :args [20261031 20270129] :expect 3}
+  {:fn "aging-bucket" :args [20261031 20270130] :expect 4}
+
+  ;; running-break [buf opening] — 明細の [amount balance] × n。食い違う最初の行、合えば -1
+  {:fn "running-break" :args [[-1000 99000 5000 104000 -300 103700] 100000] :expect -1}
+  {:fn "running-break" :args [[-1000 99000 5000 104100 -300 103800] 100000] :expect 1}
+  {:fn "running-break" :args [[-1000 99000] 100001] :expect 0}
+  {:fn "running-break" :args [[] 100000] :expect -1}
+
+  ;; closing-gap [buf opening closing] — 期首 + 明細の和 − 期末
+  {:fn "closing-gap" :args [[-1000 0 5000 0] 100000 104000] :expect 0}
+  {:fn "closing-gap" :args [[-1000 0 5000 0] 100000 104500] :expect -500}
+  {:fn "closing-gap" :args [[] 100000 100000] :expect 0}
+
+  ;; line-buffer-valid? [buf] — 明細の buffer の形
+  {:fn "line-buffer-valid?" :args [[-1000 99000]] :expect 1}
+  {:fn "line-buffer-valid?" :args [[]] :expect 1}
+  {:fn "line-buffer-valid?" :args [[100]] :expect 0}
+  {:fn "line-buffer-valid?" :args [[900000000000001 0]] :expect 0}
+  {:fn "line-buffer-valid?" :args [[-900000000000000 0]] :expect 1}
+
+  ;; payment-kind [due received max-fee] — 0 なし 1 一致 2 手数料の分だけ少ない 3 一部 4 多い
+  {:fn "payment-kind" :args [55000 55000 880] :expect 1}
+  {:fn "payment-kind" :args [55000 54560 880] :expect 2}
+  {:fn "payment-kind" :args [55000 54120 880] :expect 2}
+  {:fn "payment-kind" :args [55000 54119 880] :expect 3}
+  {:fn "payment-kind" :args [55000 56000 880] :expect 4}
+  {:fn "payment-kind" :args [55000 0 880] :expect 0}
+  {:fn "payment-kind" :args [0 1000 880] :expect 0}
+  {:fn "payment-kind" :args [55000 54560 0] :expect 3}
+
+  ;; cover-count [buf received max-fee] — 期日の順の先頭 k 件で入金と合う最小の k
+  {:fn "cover-count" :args [[33000 22000 11000] 55000 0] :expect 2}
+  {:fn "cover-count" :args [[33000 22000 11000] 54560 880] :expect 2}
+  {:fn "cover-count" :args [[33000 22000 11000] 66000 0] :expect 3}
+  {:fn "cover-count" :args [[33000 22000 11000] 33000 0] :expect 1}
+  {:fn "cover-count" :args [[33000 22000 11000] 40000 0] :expect 0}
+  {:fn "cover-count" :args [[33000 22000 11000] 0 0] :expect 0}
+  {:fn "cover-count" :args [[] 1000 0] :expect 0}
+
+  ;; allocate [buf received i] — 期日の順に割り当てた i 件目への額
+  {:fn "allocate" :args [[33000 22000 11000] 40000 0] :expect 33000}
+  {:fn "allocate" :args [[33000 22000 11000] 40000 1] :expect 7000}
+  {:fn "allocate" :args [[33000 22000 11000] 40000 2] :expect 0}
+  {:fn "allocate" :args [[33000 22000 11000] 70000 2] :expect 11000}
+  {:fn "allocate" :args [[33000 22000 11000] 20000 0] :expect 20000}
+
+  ;; date-fit [issue due paid window] — 0 発行日より前、1 期日 + window まで、2 それより後
+  {:fn "date-fit" :args [20261031 20261130 20261128 90] :expect 1}
+  {:fn "date-fit" :args [20261031 20261130 20261030 90] :expect 0}
+  {:fn "date-fit" :args [20261031 20261130 20261031 90] :expect 1}
+  {:fn "date-fit" :args [20261031 20261130 20270228 90] :expect 1}
+  {:fn "date-fit" :args [20261031 20261130 20270301 90] :expect 2}
+
+  ;; match-level [kind ref name] — 3 有力 2 中 1 弱い 0 出さない
+  {:fn "match-level" :args [1 1 0] :expect 3}
+  {:fn "match-level" :args [2 0 2] :expect 3}
+  {:fn "match-level" :args [1 0 3] :expect 3}
+  {:fn "match-level" :args [1 0 1] :expect 2}
+  {:fn "match-level" :args [1 0 0] :expect 1}
+  {:fn "match-level" :args [3 1 0] :expect 1}
+  {:fn "match-level" :args [3 0 0] :expect 0}
+  {:fn "match-level" :args [4 0 2] :expect 1}
+  {:fn "match-level" :args [0 1 3] :expect 0}
+
+  ;; suggestion-level [hits total min-hits min-share in-range] — 2 強い 1 弱い 0 なし
+  {:fn "suggestion-level" :args [3 3 2 7000 1] :expect 2}
+  {:fn "suggestion-level" :args [1 1 2 7000 1] :expect 1}
+  {:fn "suggestion-level" :args [3 5 2 7000 1] :expect 1}
+  {:fn "suggestion-level" :args [7 10 2 7000 1] :expect 2}
+  {:fn "suggestion-level" :args [3 3 2 7000 0] :expect 1}
+  {:fn "suggestion-level" :args [0 4 2 7000 1] :expect 0}
+  {:fn "suggestion-level" :args [5 4 2 7000 1] :expect 0}]}

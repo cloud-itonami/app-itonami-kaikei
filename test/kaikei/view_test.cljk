@@ -105,3 +105,39 @@
           tree (render (assoc db :entries []) (assoc view/initial-ui :mode :invoices) view/ssr-handlers)]
       (is (has-text? tree "INV-0001"))
       (is (not (has-text? tree "まだ仕訳がありません"))))))
+
+;; ───────── 明細（第 4 スライス、JUN-327） ─────────
+
+(deftest statements-render
+  (let [ui (assoc view/initial-ui :mode :statements)
+        tree (render sample-db ui view/ssr-handlers)]
+    (is (not-any? fn? (nodes tree)))
+    (testing "口座の照合（明細の残高・帳簿の残高・差）と行の候補"
+      (is (has-text? tree "サンプル銀行 普通 ****1234"))
+      (is (has-text? tree "977,650"))
+      (is (has-text? tree "1,003,500"))
+      (is (has-text? tree "請求書 INV-0001（株式会社みなと）"))
+      (is (has-text? tree "科目 支払手数料（課税 10%（標準））（規則）"))
+      (is (has-text? tree "有力")))
+    (testing "行の詳細: 候補の理由と、承認するまで帳簿は変わらないこと"
+      (let [tree (render sample-db (assoc ui :statement-line "l1") view/ssr-handlers)]
+        (is (has-text? tree "振込名義が取引先と一致"))
+        (is (has-text? tree "承認するまで帳簿は変わりません"))))
+    (testing "規則と設定の欄"
+      (let [tree (render sample-db (assoc ui :rules-open? true :statement-settings-open? true) view/ssr-handlers)]
+        (is (has-text? tree "「ﾌﾘｺﾐﾃｽｳﾘﾖｳ」に部分一致"))
+        (is (has-text? tree "事務所ノ家賃"))
+        (is (has-text? tree "売上の対価の返還（科目は支払手数料。国税庁 Q&A 問 30）")))))
+  (testing "検査の欄に未処理の明細、請求書タブに残額と年齢表"
+    (let [tree (render sample-db view/initial-ui view/ssr-handlers)]
+      (is (has-text? tree "計上も照合もしていない明細の行が ")))
+    (let [tree (render sample-db (assoc view/initial-ui :mode :invoices) view/ssr-handlers)]
+      (is (has-text? tree "売掛金の年齢表"))
+      (is (has-text? tree "59,320")))))
+
+(deftest statements-only-book
+  (testing "明細だけの帳簿でも明細のタブが開く"
+    (let [db (:db (core/merge-import core/empty-db (select-keys core/sample-import [:currency :statement-accounts :statement-lines])))
+          tree (render db (assoc view/initial-ui :mode :statements) view/ssr-handlers)]
+      (is (has-text? tree "サンプル銀行"))
+      (is (not (has-text? tree "まだ仕訳がありません"))))))

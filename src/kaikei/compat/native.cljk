@@ -19,11 +19,23 @@
                     \"stated\": {\"tax_by_rate\": [{\"rate\", \"reduced\", \"category\", \"tax\"}], \"tax\", \"total\"},
                     \"amount_paid\", \"amount_due\", \"withholding\", \"origin\": {…}}],
      \"business\": {\"name\", \"registration\"},
-     \"invoice_settings\": {\"accounting\", \"rounding\", \"accounts\": {\"receivable\", …}}}
+     \"invoice_settings\": {\"accounting\", \"rounding\", \"accounts\": {\"receivable\", …}},
+     \"statement_accounts\": [{\"id\", \"kind\", \"name\", \"ledger_account\", \"key\", \"currency\",
+                              \"statement_balance\": {\"amount\", \"date\"}, \"origin\": {…}}],
+     \"statement_lines\": [{\"id\", \"account_id\", \"seq\", \"date\", \"amount\", \"balance\",
+                           \"description\", \"counterparty\", \"reference\", \"uid\", \"hints\": {…},
+                           \"excluded\", \"match\": {\"entry_id\"}, \"origin\": {…}}],
+     \"rules\": [{\"id\", \"when\": {\"direction\", \"text\", \"op\", \"min\", \"max\", \"account_id\"},
+                \"then\": {\"account\", \"tax\": {\"category\", \"kind\", \"rate\"}, \"partner\", \"qualified\"},
+                \"stats\": {\"suggested\", \"accepted\"}}],
+     \"statement_settings\": {\"max_fee\", \"fee_treatment\", \"fee_by_partner\": {…}, \"match_window\",
+                            \"entry_window\", \"transfer_window\", \"min_hits\", \"min_share\",
+                            \"accounts\": {\"fee\", \"discount\"}, \"aliases\": {\"取引先\": […]}}}
 
   金額は最小通貨単位の整数、税率は basis points（1000 = 10%）。invoices・
-  business・invoice_settings は第 3 スライス（JUN-321）で足した任意のキーで、
-  版は v1 のまま（無い JSON も読む）。"
+  business・invoice_settings は第 3 スライス（JUN-321）、statement_accounts・
+  statement_lines・rules・statement_settings は第 4 スライス（JUN-327）で足した
+  任意のキーで、版は v1 のまま（無い JSON も読む）。"
   (:require [kotoba.lang.text :as text]
             [kaikei.core :as core]
             [kaikei.json :as json]))
@@ -39,7 +51,13 @@
 
 (defn- read-origin [m]
   (when (map? m)
-    (into {} (for [[k v] m] [(keyword k) (if (and (#{"format" "kind"} k) (string? v)) (keyword v) v)]))))
+    (into {} (for [[k v] m]
+               [(keyword k)
+                (cond
+                  (and (#{"format" "kind"} k) (string? v)) (keyword v)
+                  (= "allocations" k) (vec (for [a v :when (map? a)]
+                                             {:invoice-id (get a "invoice-id") :amount (get a "amount" 0)}))
+                  :else v)]))))
 
 (defn- line-in [m]
   (cond-> {:account (str (get m "account" ""))
@@ -164,6 +182,93 @@
                  (map? (get m "accounts")) (assoc :accounts (into {} (for [[k v] (get m "accounts") :when (string? v)]
                                                                        [(keyword k) v])))))))
 
+;; ───────── 明細（第 4 スライス、JUN-327） ─────────
+
+(defn- str-or-nil [v] (when (and (string? v) (not (text/blank? v))) v))
+
+(defn- statement-account-in [m]
+  (when (and (map? m) (str-or-nil (get m "id")))
+    (cond-> {:id (get m "id")
+             :kind (or (#{:bank :card :expense} (kw (get m "kind"))) :bank)
+             :name (str (get m "name" ""))
+             :ledger-account (or (str-or-nil (get m "ledger_account")) "普通預金")}
+      (str-or-nil (get m "key")) (assoc :key (get m "key"))
+      (str-or-nil (get m "currency")) (assoc :currency (get m "currency"))
+      (and (map? (get m "statement_balance")) (integer-value? (get-in m ["statement_balance" "amount"])))
+      (assoc :statement-balance {:amount (get-in m ["statement_balance" "amount"])
+                                 :date (str (get-in m ["statement_balance" "date"]))})
+      (read-origin (get m "origin")) (assoc :origin (read-origin (get m "origin"))))))
+
+(defn- hints-in [m]
+  (when (map? m)
+    (not-empty (into {} (for [[k v] m :when (some? v)]
+                          [(keyword (text/replace (str k) "_" "-")) v])))))
+
+(defn- read-statement-line [i m]
+  (let [date (core/parse-date (get m "date"))]
+    (cond
+      (not (map? m)) {:problem (str "明細の行 " (inc i) ": オブジェクトではありません")}
+      (not (str-or-nil (get m "account_id"))) {:problem (str "明細の行 " (inc i) ": account_id がありません")}
+      (nil? date) {:problem (str "明細の行 " (inc i) ": 日付が読めません")}
+      (not (integer-value? (get m "amount"))) {:problem (str "明細の行 " (inc i) ": 金額は最小通貨単位の整数で書きます")}
+      :else
+      {:line (cond-> {:account-id (get m "account_id") :date date :amount (get m "amount")}
+               (str-or-nil (get m "id")) (assoc :id (get m "id"))
+               (integer-value? (get m "seq")) (assoc :seq (get m "seq"))
+               (integer-value? (get m "balance")) (assoc :balance (get m "balance"))
+               (string? (get m "description")) (assoc :description (get m "description"))
+               (str-or-nil (get m "counterparty")) (assoc :counterparty (get m "counterparty"))
+               (str-or-nil (get m "reference")) (assoc :reference (get m "reference"))
+               (str-or-nil (get m "uid")) (assoc :uid (get m "uid"))
+               (hints-in (get m "hints")) (assoc :hints (hints-in (get m "hints")))
+               (true? (get m "excluded")) (assoc :excluded? true)
+               (str-or-nil (get-in m ["match" "entry_id"])) (assoc :match {:entry-id (get-in m ["match" "entry_id"])})
+               (str-or-nil (get m "file_id")) (assoc :file-id (get m "file_id"))
+               (read-origin (get m "origin")) (assoc :origin (read-origin (get m "origin"))))})))
+
+(defn- tax-in [m]
+  (when (map? m)
+    (let [category (kw (get m "category"))]
+      (when (#{:taxable :zero-rated :exempt :out-of-scope} category)
+        (cond-> {:category category}
+          (integer-value? (get m "kind")) (assoc :kind (get m "kind"))
+          (integer-value? (get m "rate")) (assoc :rate (get m "rate")))))))
+
+(defn- rule-in [m]
+  (let [w (get m "when") t (get m "then")]
+    (when (and (map? m) (map? w) (map? t) (str-or-nil (get w "text")) (str-or-nil (get t "account")))
+      (cond-> {:when (cond-> {:text (get w "text")
+                              :op (or (#{:exact :prefix :suffix :contains} (kw (get w "op"))) :contains)}
+                       (#{:in :out} (kw (get w "direction"))) (assoc :direction (kw (get w "direction")))
+                       (integer-value? (get w "min")) (assoc :min (get w "min"))
+                       (integer-value? (get w "max")) (assoc :max (get w "max"))
+                       (str-or-nil (get w "account_id")) (assoc :account-id (get w "account_id")))
+               :then (cond-> {:account (get t "account")}
+                       (tax-in (get t "tax")) (assoc :tax (tax-in (get t "tax")))
+                       (str-or-nil (get t "partner")) (assoc :partner (get t "partner"))
+                       (true? (get t "qualified")) (assoc :qualified? true))
+               :stats {:suggested (if (integer-value? (get-in m ["stats" "suggested"])) (get-in m ["stats" "suggested"]) 0)
+                       :accepted (if (integer-value? (get-in m ["stats" "accepted"])) (get-in m ["stats" "accepted"]) 0)}}
+        (str-or-nil (get m "id")) (assoc :id (get m "id"))))))
+
+(defn- statement-settings-in [m]
+  (when (map? m)
+    (not-empty
+     (cond-> {}
+       (integer-value? (get m "max_fee")) (assoc :max-fee (get m "max_fee"))
+       (#{:return :purchase :discount} (kw (get m "fee_treatment"))) (assoc :fee-treatment (kw (get m "fee_treatment")))
+       (map? (get m "fee_by_partner")) (assoc :fee-by-partner (into {} (for [[k v] (get m "fee_by_partner")
+                                                                            :when (#{:return :purchase :discount} (kw v))]
+                                                                        [k (kw v)])))
+       (integer-value? (get m "match_window")) (assoc :match-window (get m "match_window"))
+       (integer-value? (get m "entry_window")) (assoc :entry-window (get m "entry_window"))
+       (integer-value? (get m "transfer_window")) (assoc :transfer-window (get m "transfer_window"))
+       (integer-value? (get m "min_hits")) (assoc :min-hits (get m "min_hits"))
+       (integer-value? (get m "min_share")) (assoc :min-share (get m "min_share"))
+       (map? (get m "accounts")) (assoc :accounts (into {} (for [[k v] (get m "accounts") :when (string? v)] [(keyword k) v])))
+       (map? (get m "aliases")) (assoc :aliases (into {} (for [[k v] (get m "aliases") :when (sequential? v)]
+                                                           [k (vec (filter string? v))])))))))
+
 (defn detect? [data] (and (map? data) (= format-id (get data "format"))))
 
 (defn read-data
@@ -188,7 +293,17 @@
                                              :invoices-rejected (count (filter :problem invoices)))
           (business-in (get data "business")) (assoc :business (business-in (get data "business")))
           (invoice-settings-in (get data "invoice_settings"))
-          (assoc :invoice-settings (invoice-settings-in (get data "invoice_settings"))))))))
+          (assoc :invoice-settings (invoice-settings-in (get data "invoice_settings")))
+          (or (contains? data "statement_lines") (contains? data "statement_accounts"))
+          (as-> r (let [ls (map-indexed read-statement-line (get data "statement_lines" []))]
+                    (-> r
+                        (assoc :statement-accounts (vec (keep statement-account-in (get data "statement_accounts" [])))
+                               :statement-lines (vec (keep :line ls)))
+                        (update :warnings into (keep :problem ls))
+                        (update :rejected + (count (filter :problem ls))))))
+          (contains? data "rules") (assoc :rules (vec (keep rule-in (get data "rules" []))))
+          (statement-settings-in (get data "statement_settings"))
+          (assoc :statement-settings (statement-settings-in (get data "statement_settings"))))))))
 
 (defn- line-out [l]
   (json/ordered
@@ -254,6 +369,50 @@
     ["withholding" (:withholding inv)]
     ["origin" (origin-out (:origin inv))]]))
 
+(defn- statement-account-out [a]
+  (json/ordered [["id" (:id a)] ["kind" (kw-name (:kind a))] ["name" (:name a)]
+                 ["ledger_account" (:ledger-account a)] ["key" (:key a)] ["currency" (:currency a)]
+                 ["statement_balance" (when-let [b (:statement-balance a)]
+                                        (json/ordered [["amount" (:amount b)] ["date" (:date b)]]))]
+                 ["origin" (origin-out (:origin a))]]))
+
+(defn- statement-line-out [l]
+  (json/ordered [["id" (:id l)] ["account_id" (:account-id l)] ["seq" (:seq l)] ["date" (:date l)]
+                 ["amount" (:amount l)] ["balance" (:balance l)] ["description" (:description l)]
+                 ["counterparty" (:counterparty l)] ["reference" (:reference l)] ["uid" (:uid l)]
+                 ["hints" (when (seq (:hints l))
+                            (json/ordered (for [[k v] (sort-by (comp name key) (:hints l))]
+                                            [(text/replace (name k) "-" "_") (if (keyword? v) (name v) v)])))]
+                 ["excluded" (when (:excluded? l) true)]
+                 ["match" (when-let [id (get-in l [:match :entry-id])] (json/ordered [["entry_id" id]]))]
+                 ["file_id" (:file-id l)]
+                 ["origin" (origin-out (:origin l))]]))
+
+(defn- tax-out [t]
+  (when t (json/ordered [["category" (kw-name (:category t))] ["kind" (:kind t)] ["rate" (:rate t)]])))
+
+(defn- rule-out [r]
+  (json/ordered [["id" (:id r)]
+                 ["when" (let [w (:when r)]
+                           (json/ordered [["direction" (kw-name (:direction w))] ["text" (:text w)] ["op" (kw-name (:op w))]
+                                          ["min" (:min w)] ["max" (:max w)] ["account_id" (:account-id w)]]))]
+                 ["then" (let [t (:then r)]
+                           (json/ordered [["account" (:account t)] ["tax" (tax-out (:tax t))] ["partner" (:partner t)]
+                                          ["qualified" (when (:qualified? t) true)]]))]
+                 ["stats" (json/ordered [["suggested" (get-in r [:stats :suggested] 0)]
+                                         ["accepted" (get-in r [:stats :accepted] 0)]])]]))
+
+(defn- statement-settings-out [st]
+  (json/ordered [["max_fee" (:max-fee st)] ["fee_treatment" (kw-name (:fee-treatment st))]
+                 ["fee_by_partner" (when (seq (:fee-by-partner st))
+                                     (json/ordered (for [[k v] (sort-by key (:fee-by-partner st))] [k (kw-name v)])))]
+                 ["match_window" (:match-window st)] ["entry_window" (:entry-window st)]
+                 ["transfer_window" (:transfer-window st)] ["min_hits" (:min-hits st)] ["min_share" (:min-share st)]
+                 ["accounts" (when (seq (:accounts st))
+                               (json/ordered (for [[k v] (sort-by (comp name key) (:accounts st))] [(name k) v])))]
+                 ["aliases" (when (seq (:aliases st))
+                              (json/ordered (for [[k v] (sort-by key (:aliases st))] [k (vec v)])))]]))
+
 (defn data
   "db → kaikei.ledger.v1 の値（json/write に渡す形）。"
   [db]
@@ -285,6 +444,12 @@
                                          ["rounding" (kw-name (:rounding st))]
                                          ["accounts" (when (seq (:accounts st))
                                                        (json/ordered (for [[k v] (sort-by (comp name key) (:accounts st))]
-                                                                       [(name k) v])))]]))]]))
+                                                                       [(name k) v])))]]))]
+    ["statement_accounts" (when (or (seq (:statement-accounts db)) (seq (:statement-lines db)))
+                            (mapv statement-account-out (:statement-accounts db)))]
+    ["statement_lines" (when (or (seq (:statement-accounts db)) (seq (:statement-lines db)))
+                         (mapv statement-line-out (:statement-lines db)))]
+    ["rules" (when (seq (:rules db)) (mapv rule-out (:rules db)))]
+    ["statement_settings" (when-let [st (not-empty (:statement-settings db))] (statement-settings-out st))]]))
 
 (defn write [db] (str (json/write (data db)) "\n"))

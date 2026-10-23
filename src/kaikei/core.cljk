@@ -10,6 +10,10 @@
   `statement-buffer-valid?` は guest の写し。請求書の `rate-base` `rate-tax`
   `invoice-tax` `invoice-total` `rate-net` `tax-share` `invoice-buffer-valid?`
   `registration-format?` `deduction-percent`（第 3 スライス、JUN-321）も同じ。
+  明細・消込・仕訳の候補の `days-between` `consumption-rate` `aging-bucket`
+  `running-break` `closing-gap` `line-buffer-valid?` `payment-kind`
+  `cover-count` `allocate` `date-fit` `match-level` `suggestion-level`
+  （第 4 スライス、JUN-327）も同じ。
   入力も出力も整数（vector-i64 は Clojure の vector）で、
   test/fixtures/parity.edn の全行を guest（3 target + wasm）とこちら（kbb）の
   両方が通す。
@@ -289,6 +293,124 @@
     (< date 20301001) 50
     (< date 20311001) 30
     :else 0))
+
+;; ───────── 明細・消込・仕訳の候補の判定（parity。guest と同じ式、JUN-327） ─────────
+;;
+;; 明細の buffer は [amount balance] × n（入金が正）、未消込の請求書の buffer は
+;; [open] × n（同じ取引先の残額を期日の順に）。日付は yyyymmdd の整数。
+
+(defn- days-from-civil
+  "1970-01-01 からの日数（H. Hinnant の days_from_civil。年は 1 以上）。"
+  [date]
+  (let [y0 (quot date 10000)
+        m (- (quot date 100) (* 100 y0))
+        d (- date (* 100 (quot date 100)))
+        y (if (<= m 2) (dec y0) y0)
+        era (quot y 400)
+        yoe (- y (* era 400))
+        mp (if (> m 2) (- m 3) (+ m 9))
+        doy (+ (quot (+ (* 153 mp) 2) 5) (dec d))
+        doe (+ (* yoe 365) (quot yoe 4) (- (quot yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+
+(defn days-between [from to] (- (days-from-civil to) (days-from-civil from)))
+
+(defn consumption-rate
+  "消費税と地方消費税を合わせた税率（basis points）。kind 0 標準、1 飲食料品
+  （軽減）、2 定期購読の新聞（軽減）。確かめた表の外（2014-04-01 より前）と、
+  2027-04-01 からの飲食料品（1% にする法案の段階）は -1。"
+  [date kind]
+  (cond
+    (< date 20140401) -1
+    (< date 20191001) 800
+    (= kind 0) 1000
+    (= kind 2) 800
+    (< date 20270401) 800
+    :else -1))
+
+(defn aging-bucket
+  "0 期日前、1 期日から 1〜30 日、2 31〜60 日、3 61〜90 日、4 91 日〜。"
+  [due as-of]
+  (let [late (days-between due as-of)]
+    (cond (<= late 0) 0 (<= late 30) 1 (<= late 60) 2 (<= late 90) 3 :else 4)))
+
+(defn running-break
+  "opening から amount を足していき、balance と食い違う最初の行の番号（合えば -1）。"
+  [buf opening]
+  (loop [i 0 balance opening pairs (partition 2 buf)]
+    (if-let [[amount b] (first pairs)]
+      (let [next (+ balance amount)]
+        (if (= next b) (recur (inc i) next (rest pairs)) i))
+      -1)))
+
+(defn closing-gap [buf opening closing]
+  (- (reduce + opening (map first (partition 2 buf))) closing))
+
+(defn line-buffer-valid? [buf]
+  (flag (and (even? (count buf))
+             (every? #(<= (magnitude %) 900000000000000) buf))))
+
+(defn payment-kind
+  "0 なし、1 一致、2 手数料の分だけ少ない（0 < due − received ≤ max-fee）、3 一部、4 多い。"
+  [due received max-fee]
+  (cond
+    (or (<= due 0) (<= received 0)) 0
+    (= due received) 1
+    (> received due) 4
+    (<= (- due received) max-fee) 2
+    :else 3))
+
+(defn cover-count
+  "期日の順の残額 buf の先頭 k 件の和が、received と一致するか手数料の分だけ
+  多い最小の k（無ければ 0）。"
+  [buf received max-fee]
+  (if (<= received 0)
+    0
+    (loop [i 0 sum 0]
+      (if (< i (count buf))
+        (let [s (+ sum (nth buf i))
+              gap (- s received)]
+          (cond
+            (<= 0 gap max-fee) (inc i)
+            (> gap max-fee) 0
+            :else (recur (inc i) s)))
+        0))))
+
+(defn allocate
+  "期日の順に入金を割り当てたときの、i 件目への額。"
+  [buf received i]
+  (let [left (- received (reduce + 0 (take i buf)))
+        due (nth buf i)]
+    (cond (<= left 0) 0 (< left due) left :else due)))
+
+(defn date-fit
+  "0 発行日より前（前受）、1 発行日から 期日 + window 日まで、2 それより後。"
+  [issue due paid window]
+  (cond
+    (neg? (days-between issue paid)) 0
+    (<= (days-between due paid) window) 1
+    :else 2))
+
+(defn match-level
+  "候補の強さ（段の順）。kind は payment-kind、ref は摘要に請求書番号があれば 1、
+  name は 3 確かめた別名・2 正規化して一致・1 前方一致・0 なし。3 有力、2 中、
+  1 弱い、0 出さない。"
+  [kind ref name]
+  (cond
+    (= kind 0) 0
+    (#{3 4} kind) (if (or (= ref 1) (>= name 2)) 1 0)
+    (or (= ref 1) (>= name 2)) 3
+    (= name 1) 2
+    :else 1))
+
+(defn suggestion-level
+  "学んだ規則の強さ。0 なし、1 弱い（1 回だけ・割合が min-share（basis points）
+  未満・金額が幅の外）、2 強い。"
+  [hits total min-hits min-share in-range]
+  (cond
+    (or (<= hits 0) (<= total 0) (> hits total)) 0
+    (and (>= hits min-hits) (>= (* hits 10000) (* min-share total)) (= in-range 1)) 2
+    :else 1))
 
 ;; ───────── 金額 ─────────
 
@@ -635,44 +757,186 @@
                 invoices)]
     [d m added dup]))
 
+;; ───────── 明細の合流（第 4 スライス、JUN-327） ─────────
+
+(defn- prefixed-number [prefix id]
+  (or (some->> id str (text/re-matches (re-pattern (str prefix "(\\d+)"))) second parse-long) 0))
+
+(defn- line-content-key
+  "一意な id の無い行の重複の判定に使う形（口座・日付・金額・摘要・残高）。"
+  [l]
+  [(:account-id l) (:date l) (:amount l) (:description l) (:balance l)])
+
+(defn- newer-balance [a b]
+  (cond (nil? a) b (nil? b) a (neg? (compare (:date a) (:date b))) b :else a))
+
+(defn- merge-statements
+  "取り込み結果の明細（:statement-accounts :statement-lines）を db に合流する。
+  戻りは [db 元の行 id → 帳簿の行 id の表 {:lines-added :lines-duplicates
+  :lines-corrected} 警告]。
+
+  口座: opts の :statement-account が帳簿の口座の id なら、すべての行をその口座へ。
+  \"new\" なら新しい口座を作る。それ以外（\"auto\"）は :key（OFX は金融機関・口座の
+  下 4 桁・種類、CSV は形式と種類）が同じ口座へ、無ければ新しい口座を作る。
+  取り込み元の id（a1…）は帳簿で使われていなければ保つ（MCP の tool の間で帳簿 JSON を
+  受け渡しても id が変わらないように）。
+
+  重複: :uid（OFX の FITID など）があれば口座と :uid で、無ければ
+  line-content-key と、同じ内容の何番目かで判定する（同じファイルを 2 回取り込んでも
+  増えない。同じ日に同じ額・同じ摘要の行が 2 つあっても両方残る）。
+
+  訂正: OFX の CORRECTFITID（:correct {:uid :action}）は、訂正される行を消す
+  （計上・照合した行は消さずに警告する）。:replace なら新しい行を足す。"
+  [db parsed {:keys [statement-account]}]
+  (let [existing (vec (:statement-accounts db))
+        target (first (filter #(= statement-account (:id %)) existing))
+        counter (atom (reduce max 0 (map #(prefixed-number "a" (:id %)) (concat existing (:statement-accounts parsed)))))
+        fresh! (fn [] (str "a" (swap! counter inc)))
+        taken (atom (set (map :id existing)))
+        [accounts amap]
+        (reduce (fn [[accs m] a]
+                  (let [same (when-not (= "new" statement-account)
+                               (or target
+                                   (when (:key a) (first (filter #(= (:key a) (:key %)) accs)))))]
+                    (if same
+                      [(mapv #(if (= (:id same) (:id %))
+                                (update % :statement-balance newer-balance (:statement-balance a))
+                                %)
+                             accs)
+                       (assoc m (:id a) (:id same))]
+                      (let [own (:id a)
+                            id (if (and own (re-matches #"a\d+" (str own)) (not (@taken own))) own (fresh!))]
+                        (swap! taken conj id)
+                        [(conj accs (-> a (assoc :id id) (cond-> (= "new" statement-account) (dissoc :key))))
+                         (assoc m (:id a) id)]))))
+                [existing {}]
+                (:statement-accounts parsed))
+        lines (vec (:statement-lines db))
+        status-of (let [posted (set (for [e (:entries db)
+                                          :when (= :statement (get-in e [:origin :format]))
+                                          id (remove nil? (cons (get-in e [:origin :line-id]) (get-in e [:origin :line-ids])))]
+                                      id))]
+                    (fn [l] (or (posted (:id l)) (get-in l [:match :entry-id]))))
+        incoming (for [l (:statement-lines parsed)
+                       :when (not= :delete (get-in l [:correct :action]))]
+                   (assoc (dissoc l :correct) :account-id (get amap (:account-id l))))
+        uids (set (for [l lines :when (:uid l)] [(:account-id l) (:uid l)]))
+        existing-counts (frequencies (map line-content-key (remove :uid lines)))
+        id-counter (atom (reduce max 0 (map #(prefixed-number "l" (:id %)) (concat lines (:statement-lines parsed)))))
+        seq-counter (atom (reduce max 0 (map #(:seq % 0) lines)))
+        line-taken (atom (set (map :id lines)))
+        [lines lmap added dup _ _]
+        (reduce (fn [[ls m added dup seen-uids seen] l]
+                  (let [uid-key (when (:uid l) [(:account-id l) (:uid l)])
+                        ck (line-content-key l)
+                        n (get seen ck 0)]
+                    (if (if uid-key (seen-uids uid-key) (< n (get existing-counts ck 0)))
+                      [ls m added (inc dup) seen-uids (if uid-key seen (assoc seen ck (inc n)))]
+                      (let [own (:id l)
+                            id (if (and own (re-matches #"l\d+" (str own)) (not (@line-taken own)))
+                                 own
+                                 (str "l" (swap! id-counter inc)))]
+                        (swap! line-taken conj id)
+                        [(conj ls (assoc l :id id :seq (swap! seq-counter inc)))
+                         (cond-> m (:id l) (assoc (:id l) id))
+                         (inc added) dup
+                         (cond-> seen-uids uid-key (conj uid-key))
+                         (if uid-key seen (assoc seen ck (inc n)))]))))
+                [lines {} 0 0 uids {}]
+                incoming)
+        ;; 訂正（同じファイルの中の行にも当てる）。訂正される行を消す。計上・照合した行は
+        ;; 消さずに警告する。REPLACE の新しい行はもう足してある
+        corrections (for [l (:statement-lines parsed) :when (:correct l)]
+                      [(get amap (:account-id l)) (:correct l) (:uid l)])
+        [lines corrected warnings]
+        (reduce (fn [[ls n ws] [acc {:keys [uid]} own-uid]]
+                  (let [victim (first (filter #(and (= acc (:account-id %)) (= uid (:uid %)) (not= own-uid (:uid %))) ls))]
+                    (cond
+                      (nil? victim) [ls n ws]
+                      (status-of victim) [ls n (conj ws (str "訂正された明細の行 " (:date victim) " " (:description victim "")
+                                                            " は計上・照合済みなので消していません"))]
+                      :else [(filterv #(not= (:id victim) (:id %)) ls) (inc n) ws])))
+                [lines 0 []]
+                corrections)]
+    [(assoc db :statement-accounts accounts :statement-lines lines)
+     lmap
+     {:lines-added added :lines-duplicates dup :lines-corrected corrected}
+     warnings]))
+
+(defn- merge-rules
+  "利用者の規則と明細の設定を合流する（同じ条件と同じ結果の規則は足さない）。"
+  [db parsed replace?]
+  (let [db (cond-> db
+             (and (:statement-settings parsed) (or replace? (nil? (:statement-settings db))))
+             (assoc :statement-settings (:statement-settings parsed)))
+        existing (set (map (juxt :when :then) (:rules db)))
+        counter (atom (reduce max 0 (map #(prefixed-number "r" (:id %)) (concat (:rules db) (:rules parsed)))))
+        taken (atom (set (map :id (:rules db))))]
+    (reduce (fn [d r]
+              (if (existing [(:when r) (:then r)])
+                d
+                (let [own (:id r)
+                      id (if (and own (not (@taken own))) own (str "r" (swap! counter inc)))]
+                  (swap! taken conj id)
+                  (update d :rules (fnil conj []) (assoc r :id id)))))
+            db
+            (:rules parsed))))
+
 (defn merge-import
-  "取り込み結果（{:currency :accounts [{:name …}] :entries […] :invoices […]}）を
-  db に合流する。mode は :append（既定。同じ日付・同じ行の仕訳、同じ請求書は
-  重複として飛ばす）か :replace（取り込み結果が持つものを入れ替える。:entries が
-  あれば仕訳と勘定科目 —— ただし画面で付けた区分は残す。:invoices があれば
-  請求書）。
+  "取り込み結果（{:currency :accounts [{:name …}] :entries […] :invoices […]
+  :statement-accounts […] :statement-lines […] :rules […]}）を db に合流する。mode は
+  :append（既定。同じ日付・同じ行の仕訳、同じ請求書、同じ明細の行は重複として
+  飛ばす）か :replace（取り込み結果が持つものを入れ替える。:entries があれば
+  仕訳と勘定科目 —— ただし画面で付けた区分は残す。:invoices があれば請求書。
+  :statement-lines があれば明細の口座と行。:rules があれば利用者の規則）。
 
   行の :account-code（Xero の CSV のように勘定科目のコードしか無い形式が付ける）は、
   帳簿の勘定科目のコード（:code・:xero :code）で名前に引き直す。
 
-  請求書には帳簿の中の id（i1, i2, …）を振り直し、仕訳の origin の :invoice-id
-  （kaikei.invoice が計上で付けたもの）もそれに合わせる。合わせる先の無い
-  :invoice-id は外す。:business・:invoice-settings は、帳簿に無ければ取り込み
-  結果のものを使う（:replace では取り込み結果のものが勝つ）。
+  請求書・仕訳・明細の口座と行には、取り込み元の id（i1・e1・a1・l1…）が帳簿で
+  使われていなければそれを保ち、使われていれば新しい番号を振る（MCP の tool の間で
+  帳簿 JSON を受け渡しても id が変わらないように）。振り直したときは、仕訳の origin の
+  :invoice-id・:allocations・:line-id・:line-ids と、明細の行の :match も合わせる。
+  合わせる先の無い :invoice-id は外す。:business・:invoice-settings・
+  :statement-settings は、帳簿に無ければ取り込み結果のものを使う（:replace では
+  取り込み結果のものが勝つ）。
+
+  opts の :statement-account は明細を入れる口座（帳簿の口座の id、\"new\"、
+  \"auto\"。merge-statements）。
 
   通貨が違う帳簿へは合流しない（1 帳簿 1 通貨）。:replace で仕訳を入れ替えて
-  通貨が変わるとき、残せなかった請求書の数を :invoices-dropped に返す。戻りは
-  {:db :added :duplicates :invoices-added :invoices-duplicates :invoices-dropped :error}。"
+  通貨が変わるとき、残せなかった請求書と明細の行の数を :invoices-dropped・
+  :lines-dropped に返す。戻りは {:db :added :duplicates :invoices-added
+  :invoices-duplicates :invoices-dropped :lines-added :lines-duplicates
+  :lines-corrected :lines-dropped :warnings :error}。"
   ([db parsed] (merge-import db parsed :append))
-  ([db parsed mode]
+  ([db parsed mode] (merge-import db parsed mode {}))
+  ([db parsed mode opts]
    (let [currency (or (:currency parsed) (:currency db))
          replace? (= mode :replace)
          ;; :replace は取り込み結果が持つものだけを入れ替える: :entries があれば
-         ;; 仕訳と勘定科目（画面で付けた区分は残す）、:invoices があれば請求書
+         ;; 仕訳と勘定科目（画面で付けた区分は残す）、:invoices があれば請求書、
+         ;; :statement-lines があれば明細、:rules があれば利用者の規則
          replace-entries? (and replace? (contains? parsed :entries))
          replace-invoices? (and replace? (contains? parsed :invoices))
+         replace-statements? (and replace? (contains? parsed :statement-lines))
          base (cond-> db
                 replace-entries? (assoc :entries []
                                         :accounts (into {} (filter #(= :user (:class-source (val %))) (:accounts db))))
-                replace-invoices? (assoc :invoices []))
-         ;; 仕訳を入れ替えて通貨が変わるとき、残る請求書は残せない（1 帳簿 1 通貨）
-         dropped (if (and replace-entries? (not= currency (:currency db)))
-                   (count (:invoices base))
-                   0)
-         base (cond-> base (pos? dropped) (assoc :invoices []))]
-     (if (and (or (seq (:entries base)) (seq (:invoices base))) (not= currency (:currency base)))
+                replace-invoices? (assoc :invoices [])
+                replace-statements? (assoc :statement-accounts [] :statement-lines [])
+                (and replace? (contains? parsed :rules)) (assoc :rules []))
+         ;; 仕訳を入れ替えて通貨が変わるとき、残る請求書と明細は残せない（1 帳簿 1 通貨）
+         currency-change? (and replace-entries? (not= currency (:currency db)))
+         dropped (if currency-change? (count (:invoices base)) 0)
+         lines-dropped (if currency-change? (count (:statement-lines base)) 0)
+         base (cond-> base
+                (pos? dropped) (assoc :invoices [])
+                (pos? lines-dropped) (assoc :statement-accounts [] :statement-lines []))]
+     (if (and (or (seq (:entries base)) (seq (:invoices base)) (seq (:statement-lines base)))
+              (not= currency (:currency base)))
        {:db db :added 0 :duplicates 0 :invoices-added 0 :invoices-duplicates 0
-        :error (str "帳簿の通貨は " (:currency base) " です。" currency " の仕訳・請求書は合流しません（1 帳簿 1 通貨）。")}
+        :error (str "帳簿の通貨は " (:currency base) " です。" currency " の仕訳・請求書・明細は合流しません（1 帳簿 1 通貨）。")}
        (let [base (cond-> (assoc base :currency currency)
                     (and (:business parsed) (or replace? (nil? (:business base))))
                     (assoc :business (:business parsed))
@@ -694,6 +958,9 @@
                                                       ls))))
              [with-accounts invoice-ids inv-added inv-dup]
              (merge-invoices with-accounts (map resolve-invoice (:invoices parsed)) (:invoices db))
+             [with-accounts line-ids statement-counts statement-warnings]
+             (merge-statements with-accounts parsed opts)
+             with-accounts (merge-rules with-accounts parsed replace?)
              resolve-codes (fn [e]
                              (update e :lines
                                      (fn [ls] (mapv (fn [l]
@@ -702,11 +969,21 @@
                                                         l))
                                                     ls))))
              relink (fn [e]
-                      (if-let [iid (get-in e [:origin :invoice-id])]
-                        (if-let [id (get invoice-ids iid)]
-                          (assoc-in e [:origin :invoice-id] id)
-                          (update e :origin dissoc :invoice-id))
-                        e))
+                      (let [e (if-let [iid (get-in e [:origin :invoice-id])]
+                                (if-let [id (get invoice-ids iid)]
+                                  (assoc-in e [:origin :invoice-id] id)
+                                  (update e :origin dissoc :invoice-id))
+                                e)
+                            e (if (seq (get-in e [:origin :allocations]))
+                                (update-in e [:origin :allocations]
+                                           (fn [as] (mapv #(update % :invoice-id (fn [i] (get invoice-ids i i))) as)))
+                                e)
+                            e (if-let [lid (get-in e [:origin :line-id])]
+                                (assoc-in e [:origin :line-id] (get line-ids lid lid))
+                                e)]
+                        (if (seq (get-in e [:origin :line-ids]))
+                          (update-in e [:origin :line-ids] (fn [ls] (mapv #(get line-ids % %) ls)))
+                          e)))
              ;; 帳簿にコードの登録が無いコードは、そのコードを名前にした勘定科目として
              ;; コードごと登録する（書き出しで同じコードに戻るように）
              unresolved (distinct (for [e (:entries parsed), l (:lines e)
@@ -715,22 +992,42 @@
                                     c))
              with-accounts (reduce (fn [d c] (ensure-account d c {:code c :xero {:code c}})) with-accounts unresolved)
              parsed-entries (map (comp relink resolve-codes) (:entries parsed))
-             seen (set (map fingerprint (:entries with-accounts)))
-             first-id (inc (reduce max 0 (map id-number (:entries with-accounts))))
-             [db' added dup _]
-             (reduce (fn [[d added dup seen] e]
-                       (let [fp (fingerprint e)]
-                         (if (contains? seen fp)
-                           [d added (inc dup) seen]
-                           (let [d (reduce (fn [d l] (ensure-account d (:account l) {})) d (:lines e))]
-                             [(update d :entries conj (assoc e :id (str "e" (+ first-id added))))
-                              (inc added) dup (conj seen fp)]))))
-                     [with-accounts 0 0 seen]
-                     parsed-entries)]
-         (cond-> {:db (update db' :entries sort-entries)
-                  :added added :duplicates dup
-                  :invoices-added inv-added :invoices-duplicates inv-dup}
-           (pos? dropped) (assoc :invoices-dropped dropped)))))))
+             seen (into {} (map (juxt fingerprint :id) (:entries with-accounts)))
+             counter (atom (reduce max 0 (map id-number (concat (:entries with-accounts) (:entries parsed)))))
+             taken (atom (set (map :id (:entries with-accounts))))
+             [db' added dup _ entry-ids]
+             (reduce (fn [[d added dup seen emap] e]
+                       (let [fp (fingerprint e)
+                             remember (fn [m id] (if (:id e) (assoc m (:id e) id) m))]
+                         (if-let [same (get seen fp)]
+                           [d added (inc dup) seen (remember emap same)]
+                           (let [own (:id e)
+                                 id (if (and own (re-matches #"e\d+" (str own)) (not (@taken own)))
+                                      own
+                                      (str "e" (swap! counter inc)))
+                                 d (reduce (fn [d l] (ensure-account d (:account l) {})) d (:lines e))]
+                             (swap! taken conj id)
+                             [(update d :entries conj (assoc e :id id))
+                              (inc added) dup (assoc seen fp id) (remember emap id)]))))
+                     [with-accounts 0 0 seen {}]
+                     parsed-entries)
+             ;; 取り込んだ明細の行の照合（:match）を、振り直した仕訳の id に合わせる
+             new-lines (set (vals line-ids))
+             db' (update db' :statement-lines
+                         (fn [ls] (mapv (fn [l]
+                                          (if-let [m (and (new-lines (:id l)) (get-in l [:match :entry-id]))]
+                                            (if-let [id (get entry-ids m)]
+                                              (assoc-in l [:match :entry-id] id)
+                                              (dissoc l :match))
+                                            l))
+                                        ls)))]
+         (cond-> (merge {:db (update db' :entries sort-entries)
+                         :added added :duplicates dup
+                         :invoices-added inv-added :invoices-duplicates inv-dup}
+                        statement-counts)
+           (seq statement-warnings) (assoc :warnings statement-warnings)
+           (pos? dropped) (assoc :invoices-dropped dropped)
+           (pos? lines-dropped) (assoc :lines-dropped lines-dropped)))))))
 
 (defn delete-entry [db id]
   (update db :entries #(filterv (fn [e] (not= id (:id e))) %)))
@@ -910,7 +1207,8 @@
   "画面の「サンプルを読み込む」とテストが使う帳簿。仕訳は guest の
   sample-ledger と同じ数（区分も同じ）。会計年度は 2026-04-01 〜 2027-03-31。
   請求書は 3 件（未計上）。自社の登録番号 T1234567890123 は国税庁 Q&A 問 54 の
-  記載例の番号で、取引先も含めてすべて合成の値。"
+  記載例の番号で、取引先も含めてすべて合成の値。明細は 1 口座 5 行と利用者の規則
+  1 つ（第 4 スライス）。"
   (let [e (fn [date memo & lines]
             {:date date :memo memo
              :lines (vec (for [[account debit credit] lines]
@@ -947,4 +1245,21 @@
                  :lines [{:description "コピー用紙" :quantity "3" :unit-price "1100"
                           :amount 3300 :account "消耗品費" :category :taxable :rate 1000}]
                  :stated {:tax-by-rate [{:rate 1000 :reduced? false :tax 330}] :tax 330 :total 3630}}]
+     ;; 明細（第 4 スライス、JUN-327）: 2026-09-30 の普通預金の残高 1,003,500 から続く口座。
+     ;; INV-0001 の入金（振込名義が取引先と一致）、A-102 の支払（摘要に請求書番号）、
+     ;; 振込手数料（利用者の規則）、家賃（過去の仕訳から学んだ弱い候補）、候補の無い行。
+     :statement-accounts [{:id "a1" :kind :bank :key "sample:bank" :name "サンプル銀行 普通 ****1234"
+                           :ledger-account "普通預金" :currency "JPY" :origin {:format :sample}}]
+     :statement-lines (let [l (fn [id date amount balance description & [counterparty]]
+                                (cond-> {:id id :account-id "a1" :date date :amount amount :balance balance
+                                         :description description :origin {:format :sample}}
+                                  counterparty (assoc :counterparty counterparty)))]
+                        [(l "l1" "2026-11-28" 59320 1062820 "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ" "ｶ)ﾐﾅﾄ")
+                         (l "l2" "2026-11-30" -3630 1059190 "ﾌﾘｺﾐ ﾔﾏﾀﾞﾌﾞﾝｸﾞ A-102")
+                         (l "l3" "2026-11-30" -440 1058750 "ﾌﾘｺﾐﾃｽｳﾘﾖｳ")
+                         (l "l4" "2026-12-10" -1100 1057650 "ｱﾏｿﾞﾝ ﾏｰｹｯﾄﾌﾟﾚｲｽ")
+                         (l "l5" "2026-12-25" -80000 977650 "事務所の家賃")])
+     :rules [{:id "r1" :when {:direction :out :text "ﾌﾘｺﾐﾃｽｳﾘﾖｳ" :op :contains}
+              :then {:account "支払手数料" :tax {:category :taxable :kind 0}}
+              :stats {:suggested 0 :accepted 0}}]
      :warnings []}))

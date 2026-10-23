@@ -1,0 +1,937 @@
+(ns kaikei.statement
+  "明細（第 4 スライス、Linear JUN-327）—— 銀行・カード・経費の明細の値モデル、
+  名前の正規化、消込・照合・振替の候補、過去の仕訳から学ぶ規則と利用者の規則に
+  よる仕訳の候補、承認した行の計上、残高の照合と年齢表。I/O は持たない。
+
+  ## 値モデル（db に足すキー）
+
+    :statement-accounts [{:id \"a1\" :kind :bank           ; :bank :card :expense
+                          :name \"○○銀行 普通 ****1234\"
+                          :ledger-account \"普通預金\"       ; 帳簿の科目
+                          :key \"ofx:0005:1234:CHECKING\"    ; 同じ口座を見分ける鍵（無ければ nil）
+                          :statement-balance {:amount 1054560 :date \"2026-11-30\"}
+                          :origin {:format :ofx}}]
+    :statement-lines [{:id \"l1\" :account-id \"a1\" :seq 1
+                       :date \"2026-11-28\" :amount 54560 :balance 1054560
+                       :description \"ﾌﾘｺﾐ ｶ)ﾐﾅﾄ\" :counterparty \"ｶ)ﾐﾅﾄ\" :reference \"…\"
+                       :uid \"…\" :hints {…} :excluded? false :match {:entry-id \"e7\"}
+                       :origin {:format :ofx :fitid \"…\"}}]
+    :rules [{:id \"r1\" :when {:direction :out :text \"ｱﾏｿﾞﾝ\" :op :contains :min nil :max nil :account-id nil}
+             :then {:account \"消耗品費\" :tax {:category :taxable :kind 0} :partner \"…\" :qualified? false}
+             :stats {:suggested 3 :accepted 2}}]
+    :statement-settings {:max-fee 990 :fee-treatment :return :fee-by-partner {\"取引先\" :purchase}
+                         :match-window 90 :entry-window 7 :transfer-window 3
+                         :min-hits 2 :min-share 7000
+                         :accounts {:fee \"支払手数料\" :discount \"売上値引高\"}
+                         :aliases {\"取引先\" [\"正規化した振込名義\" …]}}
+
+  - 金額は最小通貨単位の整数。行の :amount は口座の持ち主から見た向き（入金が正、
+    出金が負。カードは利用が負、返金が正）。:seq は取り込んだ順（同じ日の並び）。
+  - 計上したかどうかは、帳簿の仕訳の origin（{:format :statement :line-id …}）で
+    決める。行の側には持たない（第 3 スライスの請求書と同じ）。
+  - 学んだ規則は保存しない。`learn` が帳簿から毎回作り直す。保存するのは利用者が
+    作った規則（:rules）だけ。
+
+  ## 数の規則
+
+  消込の強さ（match-level）・日付の絞り込み（date-fit）・1 件の入金で払う請求書の
+  数（cover-count）・割り当て（allocate）・学んだ規則の強さ（suggestion-level）・
+  税率（consumption-rate）・残高の続き具合（running-break）は guest
+  （aiueos/kaikei_journal.cljk）と同じ判定（kaikei.core の写し、parity 表で照合）。
+  ここはその判定に渡す値を作り、結果を候補と仕訳にする。
+
+  ## 主張しないこと
+
+  候補は提案で、正しいことを主張しない。計上は利用者の承認（post-line）を待つ。
+  適格請求書があるかは知らないので、明細から起こした課税仕入の行は「未確認」に
+  する。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.invoice :as invoice]))
+
+;; ───────── 設定 ─────────
+
+(def kinds [:bank :card :expense])
+(def kind-label {:bank "預金" :card "カード" :expense "経費"})
+
+(def default-ledger-account {:bank "普通預金" :card "未払金" :expense "未払金"})
+
+(def default-settings
+  {:max-fee 990 :fee-treatment :return :fee-by-partner {}
+   :match-window 90 :entry-window 7 :transfer-window 3
+   :min-hits 2 :min-share 7000
+   :accounts {:fee "支払手数料" :discount "売上値引高"}
+   :aliases {}})
+
+(def fee-treatments [:return :purchase :discount])
+
+(def fee-treatment-label
+  {:return "売上の対価の返還（科目は支払手数料。国税庁 Q&A 問 30）"
+   :purchase "課税仕入 10%（買手か銀行の適格請求書が要る）"
+   :discount "売上の対価の返還（科目は売上値引高）"})
+
+(defn settings [db]
+  (let [s (:statement-settings db)]
+    (-> (merge default-settings (dissoc s :accounts))
+        (assoc :accounts (merge (:accounts default-settings)
+                                (into {} (remove (comp text/blank? str val)) (:accounts s)))))))
+
+;; ───────── 値の出し入れ ─────────
+
+(defn- abs* [x] (if (neg? x) (- x) x))
+
+(defn accounts [db] (vec (:statement-accounts db)))
+
+(defn account-by-id [db id] (first (filter #(= id (:id %)) (:statement-accounts db))))
+
+(defn line-by-id [db id] (first (filter #(= id (:id %)) (:statement-lines db))))
+
+(defn- line-order [l] [(:date l) (:seq l 0)])
+
+(defn lines-of
+  "口座の行（日付・取り込んだ順）。"
+  [db account-id]
+  (vec (sort-by line-order (filter #(= account-id (:account-id %)) (:statement-lines db)))))
+
+(defn- id-number [prefix id]
+  (or (some->> id str (text/re-matches (re-pattern (str prefix "(\\d+)"))) second parse-long) 0))
+
+(defn- next-id [prefix items]
+  (str prefix (inc (reduce max 0 (map #(id-number prefix (:id %)) items)))))
+
+(defn- update-line [db id f & args]
+  (update db :statement-lines (fn [ls] (mapv #(if (= id (:id %)) (apply f % args) %) ls))))
+
+(defn- update-account [db id f & args]
+  (update db :statement-accounts (fn [as] (mapv #(if (= id (:id %)) (apply f % args) %) as))))
+
+(defn set-account-field
+  "口座の名前・帳簿の科目・種類を直す。"
+  [db id field v]
+  (case field
+    :name (update-account db id assoc :name (str v))
+    :ledger-account (if (text/blank? (str v)) db (update-account db id assoc :ledger-account (text/trim (str v))))
+    :kind (if (some #{v} kinds) (update-account db id assoc :kind v) db)
+    db))
+
+;; ───────── 名前の正規化 ─────────
+
+(defn- nfkc [s] #?(:cljs (.normalize (str s) "NFKC") :clj (str s)))
+
+(def ^:private small->large
+  (into {} (map (fn [[a b]] [a b])
+                (partition 2 ["ァ" "ア" "ィ" "イ" "ゥ" "ウ" "ェ" "エ" "ォ" "オ" "ッ" "ツ" "ャ" "ヤ" "ュ" "ユ"
+                              "ョ" "ヨ" "ヮ" "ワ" "ヵ" "カ" "ヶ" "ケ" "ヲ" "オ"
+                              "ぁ" "あ" "ぃ" "い" "ぅ" "う" "ぇ" "え" "ぉ" "お" "っ" "つ" "ゃ" "や" "ゅ" "ゆ"
+                              "ょ" "よ" "ゎ" "わ"]))))
+
+(defn- katakana
+  "小さいカナを大きく、ひらがなをカタカナに（銀行の名義はカナなので、ひらがなの
+  取引先名とも比べられるように）。"
+  [s]
+  (apply str (map (fn [c]
+                    (let [c (get small->large (str c) (str c))
+                          n (first (text/codepoints c))]
+                      (if (and n (<= 0x3041 n 0x3096)) (text/from-codepoints [(+ n 0x60)]) c)))
+                  s)))
+
+(defn normalize-text
+  "比べるための文字列。NFKC で全角・半角を揃え（半角カナは全角に）、小さいカナを
+  大きく、ひらがなをカタカナに、ヲをオに、長音・ハイフンの類を - に、英字を大文字にし、空白と
+  中黒・ピリオド・読点を除く。銀行ごとに違う全銀の文字（全銀ネットの ZEDI
+  ガイダンス表 2-4、三井住友・三菱 UFJ・77 銀行の表）の違いをまとめる。"
+  [s]
+  (-> (nfkc (or s ""))
+      katakana
+      text/upper
+      (text/replace #"[ー‐‑‒–—―−－ｰ-]" "-")
+      (text/replace #"[\s・･.,、。，．]" "")))
+
+(def ^:private corporate-abbr
+  "法人略語（三井住友銀行・77 銀行の表。長いものを先に）。"
+  ["シユウ" "トクヒ" "シホウ" "カンリ" "ロウム" "シユツ" "ザイ" "シヤ" "ガク" "フク" "ホゴ" "ドク"
+   "ベン" "ギヨ" "ゼイ" "チユウ" "ダイ" "ノウ" "モク" "ケン" "シツ" "エイ" "カ" "ユ" "メ" "シ" "ド" "ソ" "イ"])
+
+(def ^:private abbr-alt (text/join "|" corporate-abbr))
+(def ^:private abbr-prefix (re-pattern (str "^(" abbr-alt ")\\)")))
+(def ^:private abbr-middle (re-pattern (str "\\((" abbr-alt ")\\)")))
+(def ^:private abbr-suffix (re-pattern (str "\\((" abbr-alt ")$")))
+(def ^:private kanji-forms #"株式会社|有限会社|合同会社|合名会社|合資会社|一般社団法人|一般財団法人|医療法人|\((株|有|同|合)\)")
+(def ^:private transfer-words #"^(振込入金|振込|フリコミニユウキン|フリコミ|ニユウキン|入金)-?")
+
+(defn name-key
+  "取引先・振込依頼人の名前 → {:key 比べる形 :form 法人略語 :number 先頭の数字}。
+  法人略語（カ) (カ) (カ）と漢字の会社の種類（株式会社…）は除いて :form に、
+  先頭の数字（振込依頼人番号）は :number に分ける。"
+  [s]
+  (let [t (normalize-text s)
+        t (text/replace t transfer-words "")
+        form (or (second (text/re-find abbr-prefix t)) (second (text/re-find abbr-middle t))
+                 (second (text/re-find abbr-suffix t)))
+        t (-> t
+              (text/replace abbr-prefix "")
+              (text/replace abbr-middle "")
+              (text/replace abbr-suffix "")
+              (text/replace kanji-forms ""))
+        [_ number rest-key] (text/re-matches #"(\d*)(.*)" t)]
+    {:key rest-key :form form :number (not-empty number)}))
+
+(defn text-key
+  "学んだ規則の鍵: 正規化した摘要から数字（日付・番号）と振込の語を除いたもの。"
+  [s]
+  (-> (normalize-text s)
+      (text/replace transfer-words "")
+      (text/replace #"[0-9/:\-]" "")))
+
+(defn- remitter [line] (or (not-empty (str (:counterparty line ""))) (:description line) ""))
+
+(defn- truncated?
+  "銀行の名義の欄の長さちょうど（30・40・48 文字）なら、切り詰めの可能性がある。"
+  [s]
+  (contains? #{30 40 48} (count (text/replace (str s) #"^\s+|\s+$" ""))))
+
+(defn aliases [db partner] (get-in (settings db) [:aliases partner] []))
+
+(defn name-level
+  "振込依頼人名と取引先の名前の一致: 3 確かめた別名、2 正規化して一致、
+  1 前方一致（名義が切り詰められていそうなとき）、0 なし（部分一致は 0）。"
+  [db line partner]
+  (let [raw (remitter line)
+        l (:key (name-key raw))
+        p (:key (name-key partner))]
+    (cond
+      (or (text/blank? l) (text/blank? partner)) 0
+      (some #(= l %) (aliases db partner)) 3
+      (and (>= (count p) 2) (= l p)) 2
+      (and (truncated? raw) (>= (count l) 4) (text/starts-with? p l)) 1
+      :else 0)))
+
+(defn- alnum [s] (text/replace (normalize-text s) #"[^0-9A-Z]" ""))
+
+(defn ref-hit
+  "摘要・参照・振込依頼人に請求書番号があるか（英数字だけにして比べる、3 文字以上）。"
+  [line number]
+  (let [n (alnum number)
+        hay (alnum (str (:description line) " " (:reference line) " " (:counterparty line)))]
+    (if (and (>= (count n) 3) (text/includes? hay n)) 1 0)))
+
+;; ───────── 請求書の残額 ─────────
+
+(defn statement-entry? [e] (= :statement (get-in e [:origin :format])))
+
+(defn allocated
+  "帳簿にある消込の仕訳が、請求書 id に割り当てた額の和。"
+  [db invoice-id]
+  (reduce + 0 (for [e (:entries db)
+                    :when (statement-entry? e)
+                    a (get-in e [:origin :allocations])
+                    :when (= invoice-id (:invoice-id a))]
+                (:amount a 0))))
+
+(defn open-amount
+  "請求書の残額 = 取り込み元の未回収額（無ければ合計）− 帳簿にある消込の割り当て。"
+  [db inv]
+  (let [base (if (some? (:amount-due inv)) (:amount-due inv) (:total (invoice/totals inv)))]
+    (max 0 (- base (allocated db (:id inv))))))
+
+(defn invoice-posting
+  "請求書の計上の状態: :posted（計上済み・取り込んだ帳簿にある）、:status-ok（まだで、
+  計上できる）、それ以外は計上できない理由（invoice/post-blocker）。"
+  [db inv]
+  (let [b (invoice/post-blocker db inv)]
+    (cond
+      (#{:already-posted :in-ledger} b) :posted
+      (nil? b) :status-ok
+      :else b)))
+
+(defn- open-invoice? [db inv]
+  (and (#{:issued :paid} (:status inv)) (pos? (open-amount db inv))))
+
+;; ───────── 行の状態 ─────────
+
+(defn- line-ids-of [e] (remove nil? (cons (get-in e [:origin :line-id]) (get-in e [:origin :line-ids]))))
+
+(defn posted-entry
+  "行から起こした仕訳（無ければ nil）。振替は 2 行で 1 つの仕訳。"
+  [db line-id]
+  (first (filter (fn [e] (and (statement-entry? e) (some #{line-id} (line-ids-of e)))) (:entries db))))
+
+(defn matched-entry
+  "照合した帳簿の仕訳（帳簿に無くなっていれば nil）。"
+  [db line]
+  (when-let [id (get-in line [:match :entry-id])]
+    (first (filter #(= id (:id %)) (:entries db)))))
+
+(defn status-fn
+  "行 → :posted :matched :excluded :open の関数。帳簿を 1 度だけなめる（行ごとに
+  仕訳をなめ直さない）。"
+  [db]
+  (let [posted (set (for [e (:entries db) :when (statement-entry? e) id (line-ids-of e)] id))
+        entry-ids (set (map :id (:entries db)))]
+    (fn [line]
+      (cond
+        (posted (:id line)) :posted
+        (entry-ids (get-in line [:match :entry-id])) :matched
+        (:excluded? line) :excluded
+        :else :open))))
+
+(defn line-status [db line] ((status-fn db) line))
+
+(def status-label {:open "未処理" :posted "計上済み" :matched "照合済み" :excluded "計上しない"})
+
+;; ───────── 候補: 請求書 ─────────
+
+(defn- date-of [s] (some-> s core/parse-date core/date-int))
+
+(defn- invoice-due [inv] (or (date-of (:due-date inv)) (date-of (:date inv))))
+
+(def level-label {3 "有力" 2 "中" 1 "弱い"})
+
+(defn- reasons [kind ref name]
+  (vec (remove nil? [(when (= ref 1) "請求書番号が摘要にある")
+                     (case name 3 "振込名義が確かめた別名と一致" 2 "振込名義が取引先と一致" 1 "振込名義が前方一致（切り詰め）" nil)
+                     (case kind 1 "金額が一致" 2 "手数料の分だけ少ない" 3 "一部の入金・支払" 4 "請求書より多い" nil)])))
+
+(defn- invoice-candidate [db line invs kind]
+  (let [paid (abs* (:amount line))
+        opens (mapv #(open-amount db %) invs)
+        total (reduce + 0 opens)
+        ref (if (some #(= 1 (ref-hit line (:number %))) invs) 1 0)
+        name (reduce max 0 (map #(name-level db line (get-in % [:partner :name])) invs))
+        level (core/match-level kind ref name)
+        allocations (if (= kind 3)
+                      (vec (keep-indexed (fn [i inv]
+                                           (let [a (core/allocate opens paid i)]
+                                             (when (pos? a) {:invoice-id (:id inv) :amount a})))
+                                         invs))
+                      (mapv (fn [inv o] {:invoice-id (:id inv) :amount o}) invs opens))]
+    (when (pos? level)
+      {:type :invoice
+       :level level
+       :kind kind
+       :invoices (mapv :id invs)
+       :unposted (vec (keep #(when (= :status-ok (invoice-posting db %)) (:id %)) invs))
+       :allocations allocations
+       :fee (if (= kind 2) (- total paid) 0)
+       :reasons (reasons kind ref name)
+       :due (invoice-due (first invs))
+       :issue (date-of (:date (first invs)))})))
+
+(defn invoice-candidates
+  "行の請求書の候補（強い順）。入金は売上、出金は仕入の請求書。発行日より前・
+  期日 + match-window 日より後の請求書は候補にしない（date-fit）。"
+  [db line]
+  (let [{:keys [max-fee match-window]} (settings db)
+        amount (:amount line 0)
+        paid (abs* amount)
+        paid-date (date-of (:date line))
+        kind (if (pos? amount) :sales :purchase)
+        fits (fn [inv]
+               (let [issue (date-of (:date inv)) due (invoice-due inv)]
+                 (and issue due paid-date (= 1 (core/date-fit issue due paid-date match-window)))))
+        open (filterv #(and (= kind (:kind %)) (open-invoice? db %) (fits %)) (:invoices db))
+        singles (keep (fn [inv] (invoice-candidate db line [inv] (core/payment-kind (open-amount db inv) paid max-fee)))
+                      open)
+        by-partner (group-by #(:key (name-key (get-in % [:partner :name]))) open)
+        multis (keep (fn [[_ invs]]
+                       (when (>= (count invs) 2)
+                         (let [invs (vec (sort-by (juxt invoice-due #(date-of (:date %)) :id) invs))
+                               k (core/cover-count (mapv #(open-amount db %) invs) paid max-fee)]
+                           (when (>= k 2)
+                             (let [chosen (subvec invs 0 k)
+                                   total (reduce + 0 (map #(open-amount db %) chosen))]
+                               (invoice-candidate db line chosen (core/payment-kind total paid max-fee)))))))
+                     by-partner)]
+    (when (and (pos? paid) paid-date)
+      (vec (sort-by (juxt #(- (:level %)) #(abs* (core/days-between (:due %) paid-date)) :issue #(first (:invoices %)))
+                    (concat singles multis))))))
+
+;; ───────── 候補: 帳簿にもうある仕訳・振替 ─────────
+
+(defn- matched-entry-ids [db]
+  (set (keep #(get-in % [:match :entry-id]) (:statement-lines db))))
+
+(defn entry-candidates
+  "帳簿にもうある仕訳のうち、口座の科目に同じ向き・同じ額の行があり、日付の差が
+  entry-window 日以内のもの（明細から起こした仕訳と、照合済みの仕訳を除く）。"
+  [db line]
+  (let [{:keys [entry-window]} (settings db)
+        ledger (:ledger-account (account-by-id db (:account-id line)))
+        amount (:amount line 0)
+        d (date-of (:date line))
+        taken (matched-entry-ids db)
+        found (vec (for [e (:entries db)
+                         :when (and (not (statement-entry? e)) (not (taken (:id e))))
+                         :let [ed (date-of (:date e))]
+                         :when (and ed d (<= (abs* (core/days-between ed d)) entry-window))
+                         :when (some (fn [l] (and (= ledger (:account l))
+                                                  (if (pos? amount)
+                                                    (= amount (:debit l 0))
+                                                    (= (- amount) (:credit l 0)))))
+                                     (:lines e))]
+                     e))]
+    (when (and ledger d (not (zero? amount)))
+      (vec (sort-by (juxt #(abs* (core/days-between (date-of (:date %)) d)) :id)
+                    (for [e found]
+                      {:type :entry :entry-id (:id e)
+                       :level (if (and (= 1 (count found)) (= d (date-of (:date e)))) 3 2)
+                       :reasons [(str "帳簿の仕訳 " (:date e) " " (or (:memo e) "") " と同じ額")]}))))))
+
+(defn transfer-candidates
+  "別の口座の、逆の向きで同じ額の未処理の行（transfer-window 日以内）。"
+  [db line]
+  (let [{:keys [transfer-window]} (settings db)
+        status (status-fn db)
+        amount (:amount line 0)
+        d (date-of (:date line))
+        found (vec (for [o (:statement-lines db)
+                         :when (and (not= (:account-id o) (:account-id line))
+                                    (= (- amount) (:amount o))
+                                    (= :open (status o)))
+                         :let [od (date-of (:date o))]
+                         :when (and od d (<= (abs* (core/days-between od d)) transfer-window))]
+                     o))]
+    (when (and d (not (zero? amount)))
+      (vec (for [o (sort-by (juxt #(abs* (core/days-between (date-of (:date %)) d)) :id) found)]
+             {:type :transfer :line-id (:id o)
+              :level (if (= 1 (count found)) 3 2)
+              :reasons [(str (:name (account-by-id db (:account-id o))) " の " (:date o) " の行と逆向きで同じ額")]})))))
+
+;; ───────── 学んだ規則・利用者の規則 ─────────
+
+(defn- tax-accounts [db]
+  (let [a (:accounts (invoice/settings db))] #{(:output-tax a) (:input-tax a)}))
+
+(defn classify-tax
+  "仕訳の行の税区分（各社の文字列）→ {:category :kind}。読めなければ nil（学ぶ
+  ときは税を分けない）。"
+  [code]
+  (when-let [c (some-> code str not-empty)]
+    (cond
+      (text/includes? c "非課税") {:category :exempt}
+      (or (text/includes? c "不課税") (text/includes? c "対象外")) {:category :out-of-scope}
+      (or (text/includes? c "免税") (text/includes? c "輸出")) {:category :zero-rated}
+      (text/includes? c "軽") {:category :taxable :kind 1}
+      (or (text/includes? c "課") (text/includes? c "%")) {:category :taxable :kind 0}
+      :else nil)))
+
+(defn- learn-entry
+  "仕訳 → 学ぶ材料（無ければ nil）。ledger の科目に 1 行だけあり、税の科目を除いた
+  相手の科目が 1 つのもの。"
+  [db ledgers e]
+  (let [taxes (tax-accounts db)
+        o (:origin e)
+        on (if (or (seq (:allocations o)) (seq (:line-ids o)) (= :invoice (:format o)))
+             ;; 消込・振替・請求書の計上の仕訳からは学ばない（科目が売掛金・買掛金・相手の口座になるため）
+             []
+             (filter #(ledgers (:account %)) (:lines e)))
+        others (remove #(or (ledgers (:account %)) (taxes (:account %))) (:lines e))
+        counter (distinct (map :account others))]
+    (when (and (= 1 (count on)) (= 1 (count counter)))
+      (let [l (first on)
+            c (first others)
+            key (text-key (or (some-> (:description l) not-empty) (some-> (:description c) not-empty)
+                              (some-> (:memo e) not-empty) (:partner c) ""))
+            amount (+ (:debit l 0) (:credit l 0))]
+        (when-not (text/blank? key)
+          {:ledger (:account l)
+           :direction (if (pos? (:debit l 0)) :in :out)
+           :key key
+           :account (first counter)
+           :amount amount
+           :date (:date e)
+           :tax (classify-tax (get-in c [:tax :code]))
+           :partner (or (:partner c) (:partner l))
+           :qualified? (= "適格" (get-in c [:invoice :code]))})))))
+
+(defn learn
+  "帳簿の仕訳から学んだ規則。{[帳簿の科目 向き 鍵] {:total n :min :max
+  :accounts {科目 {:hits n :tax :partner :qualified? :last 日付}}}}。取り込んだ過去の
+  仕訳も入れる（判断 4）。税率そのものは学ばない（税の区分だけ）。"
+  [db]
+  (let [ledgers (set (keep :ledger-account (:statement-accounts db)))]
+    (reduce (fn [m {:keys [ledger direction key account amount date tax partner qualified?]}]
+              (update m [ledger direction key]
+                      (fn [r]
+                        (let [r (or r {:total 0 :min amount :max amount :accounts {}})
+                              prev (get-in r [:accounts account])]
+                          (-> r
+                              (update :total inc)
+                              (update :min min amount)
+                              (update :max max amount)
+                              (assoc-in [:accounts account]
+                                        {:hits (inc (:hits prev 0))
+                                         :tax (if (and prev (pos? (compare (str (:last prev)) (str date))))
+                                                (:tax prev) tax)
+                                         :partner (or partner (:partner prev))
+                                         :qualified? (or qualified? (:qualified? prev false))
+                                         :last (if (and prev (pos? (compare (str (:last prev)) (str date))))
+                                                 (:last prev) date)}))))))
+            {}
+            (when (seq ledgers) (keep #(learn-entry db ledgers %) (:entries db))))))
+
+(defn- learned-suggestion [db learned line]
+  (let [{:keys [min-hits min-share]} (settings db)
+        ledger (:ledger-account (account-by-id db (:account-id line)))
+        direction (if (pos? (:amount line 0)) :in :out)
+        r (get learned [ledger direction (text-key (:description line))])]
+    (when r
+      (let [[account {:keys [hits tax partner qualified?]}]
+            (first (sort-by (juxt #(- (:hits (val %))) key) (:accounts r)))
+            a (abs* (:amount line 0))
+            in-range (if (and (>= (* 2 a) (:min r)) (<= a (* 2 (:max r)))) 1 0)
+            level (core/suggestion-level hits (:total r) min-hits min-share in-range)]
+        (when (pos? level)
+          {:type :account :source :learned
+           :level (if (= 2 level) 3 1)
+           :account account :tax tax :partner partner :qualified? qualified?
+           :reasons (vec (remove nil? [(str "過去の仕訳 " (:total r) " 件のうち " hits " 件が " account)
+                                       (when (zero? in-range) "金額が過去の幅の外")]))})))))
+
+(def ops [:exact :prefix :suffix :contains])
+(def op-label {:exact "完全一致" :prefix "前方一致" :suffix "後方一致" :contains "部分一致"})
+
+(defn rule-matches?
+  "利用者の規則が行に当たるか。規則の文字列と摘要は、学んだ規則の鍵と同じ形
+  （text-key: 正規化して数字と振込の語を除く）にして比べる。"
+  [rule line]
+  (let [{:keys [direction text op min max account-id]} (:when rule)
+        t (text-key text)
+        d (text-key (:description line))
+        a (abs* (:amount line 0))]
+    (and (not (text/blank? t))
+         (or (nil? direction) (= direction (if (pos? (:amount line 0)) :in :out)))
+         (or (nil? account-id) (= account-id (:account-id line)))
+         (or (nil? min) (>= a min))
+         (or (nil? max) (<= a max))
+         (case op
+           :exact (= d t)
+           :prefix (text/starts-with? d t)
+           :suffix (text/ends-with? d t)
+           (text/includes? d t)))))
+
+(defn rule-suggestion
+  "仕訳の候補: 利用者の規則（並べた順に最初に当たったもの）、無ければ学んだ規則。"
+  ([db line] (rule-suggestion db (learn db) line))
+  ([db learned line]
+   (if-let [r (first (filter #(rule-matches? % line) (:rules db)))]
+     (merge {:type :account :source :user :rule-id (:id r) :level 3
+             :reasons [(str "規則: 摘要が「" (get-in r [:when :text]) "」に" (op-label (get-in r [:when :op] :contains)))]}
+            (select-keys (:then r) [:account :tax :partner :qualified?]))
+     (learned-suggestion db learned line))))
+
+(defn candidates
+  "行のすべての候補（請求書・帳簿の仕訳・振替・規則）と、最初から選ぶ候補。
+  最初から選ぶのは、強さ 3（有力）が 1 件だけのとき。"
+  ([db line] (candidates db (learn db) line))
+  ([db learned line]
+   (let [cs (vec (concat (invoice-candidates db line)
+                         (entry-candidates db line)
+                         (transfer-candidates db line)
+                         (some-> (rule-suggestion db learned line) vector)))
+         strong (filterv #(= 3 (:level %)) cs)]
+     {:candidates cs
+      :preselected (when (= 1 (count strong)) (first strong))})))
+
+;; ───────── 計上 ─────────
+
+(defn- side-line [normal amount m]
+  (let [other (if (= normal :debit) :credit :debit)]
+    (cond
+      (pos? amount) (merge m {normal amount other 0})
+      (neg? amount) (merge m {other (- amount) normal 0})
+      :else nil)))
+
+(defn- rounding-code [db] (invoice/rounding-code (:rounding (invoice/settings db)) 0))
+
+(defn- split-tax
+  "税込の額 → [税抜 税]（税率ごとに 1 回の端数処理。guest の rate-tax、税込）。"
+  [db gross rate]
+  (let [tax (core/rate-tax [rate gross] rate 1 (rounding-code db))]
+    [(- gross tax) tax]))
+
+(defn- tax-key [{:keys [category kind]} rate]
+  (if (= :taxable category) [rate (contains? #{1 2} kind)] [0 category]))
+
+(defn- return-code [sales? rate reduced?]
+  (str (if sales? "売上の対価の返還 " "仕入の対価の返還 ") (invoice/group-label [rate reduced?])))
+
+(defn- invoice-rate
+  "請求書の課税の区分が 1 つだけならその [税率 軽減か]、無ければ :none、2 つ以上なら nil。"
+  [invs]
+  (let [ks (distinct (for [inv invs l (:lines inv) :when (= :taxable (:category l :taxable))]
+                       [(:rate l) (boolean (:reduced? l))]))]
+    (cond (empty? ks) :none (= 1 (count ks)) (first ks) :else nil)))
+
+(defn- fee-lines
+  "手数料の差額の行。sales? は売上の入金（差額は借方）、そうでなければ仕入の支払
+  （差額は貸方）。戻りは {:lines […]} か {:skipped 理由}。"
+  [db {:keys [fee fee-treatment fee-rate]} invs date sales? partner]
+  (let [{st-accounts :accounts :as st} (settings db)
+        {inv-accounts :accounts :keys [accounting]} (invoice/settings db)
+        included? (= :tax-included accounting)
+        treatment (or fee-treatment (get (:fee-by-partner st) partner) (:fee-treatment st))
+        normal (if sales? :debit :credit)
+        account (if (= treatment :discount) (:discount st-accounts) (:fee st-accounts))
+        tax-account (if (= treatment :purchase)
+                      (:input-tax inv-accounts)
+                      (if sales? (:output-tax inv-accounts) (:input-tax inv-accounts)))
+        k (cond
+            (= treatment :purchase) [(core/consumption-rate (date-of date) 0) false]
+            ;; 2019-10-01 からの 8% は軽減税率
+            fee-rate [fee-rate (boolean (and (= 800 fee-rate) (>= (or (date-of date) 0) 20191001)))]
+            :else (invoice-rate invs))
+        [rate reduced?] (when (vector? k) k)]
+    (cond
+      (not (pos? fee)) {:lines []}
+      (and (= treatment :purchase) (not sales?)) {:skipped :fee-treatment}
+      (nil? k) {:skipped :fee-rate-needed}
+      (and (vector? k) (neg? rate)) {:skipped :rate-unknown}
+      :else
+      (let [taxable? (vector? k)
+            code (cond
+                   (= treatment :purchase) (invoice/tax-code :purchase [rate false])
+                   taxable? (return-code sales? rate reduced?)
+                   :else "対象外")
+            [net tax] (if (and taxable? (not included?)) (split-tax db fee rate) [fee 0])
+            meta (cond-> {:description (if sales? "振込手数料（入金の差額）" "振込手数料（支払の差額）")
+                          :tax {:scheme :kaikei :code code}}
+                   partner (assoc :partner partner)
+                   (= treatment :purchase) (assoc :invoice {:scheme :kaikei :code "未確認"}))]
+        {:lines (vec (remove nil? [(side-line normal net (assoc meta :account account))
+                                   (side-line normal tax (assoc meta :account tax-account))]))
+         :warnings (vec (remove nil? [(when (and sales? (not= treatment :purchase) (>= fee 10000)) :return-invoice)
+                                      (when-not sales? :deducted-fee)]))}))))
+
+(defn- invoice-entry
+  [db line {:keys [allocations] :as choice}]
+  (let [amount (:amount line 0)
+        sales? (pos? amount)
+        paid (abs* amount)
+        ledger (:ledger-account (account-by-id db (:account-id line)))
+        invs (keep #(invoice/invoice-by-id db (:invoice-id %)) allocations)
+        total (reduce + 0 (map :amount allocations))
+        fee (- total paid)
+        partner (some-> (get-in (first invs) [:partner :name]) text/trim not-empty)
+        {inv-accounts :accounts} (invoice/settings db)
+        counter-account (if sales? (:receivable inv-accounts) (:payable inv-accounts))]
+    (cond
+      (empty? allocations) {:skipped :no-allocation}
+      (not= (count invs) (count allocations)) {:skipped :invoice-not-found}
+      (some #(not= (if sales? :sales :purchase) (:kind %)) invs) {:skipped :direction}
+      (neg? fee) {:skipped :overpaid}
+      :else
+      (let [{fee-ls :lines :keys [skipped warnings]} (fee-lines db (assoc choice :fee fee) invs (:date line) sales? partner)
+            description (str "消込 " (text/join "・" (map :number invs)))]
+        (if skipped
+          {:skipped skipped}
+          {:entry {:date (:date line)
+                   :memo (text/join " " (remove text/blank? [partner (:description line)]))
+                   :lines (vec (remove nil?
+                                       (if sales?
+                                         (concat [(side-line :debit paid {:account ledger :description description})]
+                                                 fee-ls
+                                                 [(side-line :credit total (cond-> {:account counter-account :description description}
+                                                                             partner (assoc :partner partner)))])
+                                         (concat [(side-line :debit total (cond-> {:account counter-account :description description}
+                                                                            partner (assoc :partner partner)))]
+                                                 [(side-line :credit paid {:account ledger :description description})]
+                                                 fee-ls))))
+                   :origin {:format :statement :line-id (:id line) :account-id (:account-id line)
+                            :allocations (vec allocations) :fee fee}}
+           :warnings warnings})))))
+
+(defn- account-entry
+  [db line {:keys [account tax partner qualified?] :as choice}]
+  (let [amount (:amount line 0)
+        inflow? (pos? amount)
+        gross (abs* amount)
+        ledger (:ledger-account (account-by-id db (:account-id line)))
+        {inv-accounts :accounts :keys [accounting]} (invoice/settings db)
+        included? (= :tax-included accounting)
+        tax (or tax {:category :out-of-scope})
+        taxable? (= :taxable (:category tax))
+        rate (when taxable? (or (:rate tax) (core/consumption-rate (date-of (:date line)) (:kind tax 0))))
+        account (some-> account str text/trim not-empty)
+        partner (some-> partner str text/trim not-empty)]
+    (cond
+      (nil? account) {:skipped :no-account}
+      (nil? ledger) {:skipped :no-ledger-account}
+      (zero? amount) {:skipped :empty}
+      (and taxable? (or (nil? rate) (neg? rate))) {:skipped :rate-unknown}
+      :else
+      (let [k (tax-key tax rate)
+            code (invoice/tax-code (if inflow? :sales :purchase) k)
+            [net t] (if (and taxable? (not included?)) (split-tax db gross rate) [gross 0])
+            meta (cond-> {:description (:description line) :tax {:scheme :kaikei :code code}}
+                   partner (assoc :partner partner)
+                   (and taxable? (not inflow?)) (assoc :invoice {:scheme :kaikei :code (if qualified? "適格" "未確認")}))
+            body (side-line (if inflow? :credit :debit) net (assoc meta :account account))
+            tax-line (side-line (if inflow? :credit :debit) t
+                                (assoc meta :account (if inflow? (:output-tax inv-accounts) (:input-tax inv-accounts))))
+            bank (side-line (if inflow? :debit :credit) gross (cond-> {:account ledger :description (:description line)}
+                                                                  partner (assoc :partner partner)))]
+        {:entry {:date (:date line)
+                 :memo (:description line)
+                 :lines (vec (remove nil? (if inflow? [bank body tax-line] [body tax-line bank])))
+                 :origin (cond-> {:format :statement :line-id (:id line) :account-id (:account-id line)}
+                           (:rule-id choice) (assoc :rule-id (:rule-id choice)))}}))))
+
+(defn- transfer-entry [db line {other-id :line-id}]
+  (let [other (line-by-id db other-id)
+        [in out] (if (pos? (:amount line 0)) [line other] [other line])
+        ledger #(:ledger-account (account-by-id db (:account-id %)))]
+    (cond
+      (nil? other) {:skipped :line-not-found}
+      (not= (:amount line) (- (:amount other))) {:skipped :amount}
+      (not= :open (line-status db other)) {:skipped :already-posted}
+      (= (ledger in) (ledger out)) {:skipped :same-account}
+      :else
+      {:entry {:date (:date out)
+               :memo (str "振替 " (:description out ""))
+               :lines [{:account (ledger in) :debit (:amount in) :credit 0 :description (:description in)}
+                       {:account (ledger out) :debit 0 :credit (:amount in) :description (:description out)}]
+               :origin {:format :statement :line-id (:id line) :line-ids [(:id in) (:id out)]}}})))
+
+(def skip-label
+  {:not-found "明細の行がありません"
+   :already-posted "計上済みか照合済みです"
+   :excluded "「計上しない」にした行です"
+   :no-allocation "割り当てる請求書がありません"
+   :invoice-not-found "請求書がありません"
+   :direction "入金と売上、出金と仕入の向きが合いません"
+   :overpaid "請求書より多い入金・支払は消込みません（過入金は手で記帳してください）"
+   :fee-rate-needed "8% と 10% の混ざった請求書です。手数料の差額の税率を選んでください"
+   :fee-treatment "支払の差額は課税仕入にできません"
+   :rate-unknown "税率が分かりません（2014-04-01 より前か、2027-04-01 からの飲食料品）。税率を選んでください"
+   :no-account "科目を選んでください"
+   :no-ledger-account "口座の帳簿の科目がありません"
+   :empty "金額が 0 です"
+   :line-not-found "振替の相手の行がありません"
+   :amount "振替の相手と金額が合いません"
+   :same-account "振替の相手が同じ科目です"
+   :entry-not-found "照合する仕訳がありません"
+   :invoice-blocked "消込む請求書を計上できません（下書き・取消・源泉徴収・税率の分からない明細など。請求書タブで確かめてください）"
+   :unknown-choice "知らない選び方です"})
+
+(def warning-label
+  {:return-invoice "差額が 1 万円以上です。対価の返還なら返還インボイスが要ります（1 万円未満の免除の外。消費税法 57 条の 4 ③）"
+   :deducted-fee "支払から手数料を差し引いています。製造委託等で中小受託事業者に負担させることは、合意があっても取適法で禁止されます（国税庁 Q&A 問 29 の注）"})
+
+(defn- add-alias
+  "請求書の消込で確かめた振込名義を、取引先の別名として覚える。"
+  [db line choice]
+  (if (= :invoice (:type choice))
+    (let [inv (some->> choice :allocations first :invoice-id (invoice/invoice-by-id db))
+          partner (get-in inv [:partner :name])
+          k (:key (name-key (remitter line)))]
+      (if (and partner (not (text/blank? k)) (not (some #{k} (aliases db partner))))
+        (update-in db [:statement-settings :aliases partner] (fnil conj []) k)
+        db))
+    db))
+
+(defn- count-rule [db {:keys [rule-id as-suggested?]}]
+  (if rule-id
+    (update db :rules (fn [rs] (mapv #(if (= rule-id (:id %))
+                                         (cond-> (update-in % [:stats :suggested] (fnil inc 0))
+                                           as-suggested? (update-in [:stats :accepted] (fnil inc 0)))
+                                         %)
+                                      rs)))
+    db))
+
+(declare add-rule)
+
+(defn post-line
+  "承認した行を計上する。choice は候補（candidates の 1 つ）か、利用者が選んだ
+  {:type :account …}。戻りは {:db :entry-id :warnings :invoices-posted} か
+  {:db db :skipped 理由}。消込む請求書がまだ計上されていなければ、先に計上する
+  （:invoices-posted。売掛金・買掛金が立たないまま消込むと逆の残高になるため）。
+  {:type :entry} は仕訳を起こさず、行を帳簿の仕訳と照合する。{:type :exclude} は
+  「計上しない」にする。"
+  [db line-id choice]
+  (let [original db
+        line (line-by-id db line-id)
+        status (some->> line (line-status db))]
+    (cond
+      (nil? line) {:db db :skipped :not-found}
+      (#{:posted :matched} status) {:db db :skipped :already-posted}
+      (= :exclude (:type choice)) {:db (update-line db line-id assoc :excluded? true)}
+      (= :entry (:type choice))
+      (if (some #(= (:entry-id choice) (:id %)) (:entries db))
+        {:db (update-line db line-id #(-> % (assoc :match {:entry-id (:entry-id choice)}) (dissoc :excluded?)))}
+        {:db db :skipped :entry-not-found})
+      (and (= :invoice (:type choice))
+           (some #(let [inv (invoice/invoice-by-id db (:invoice-id %))]
+                    (and inv (not (#{:posted :status-ok} (invoice-posting db inv)))))
+                 (:allocations choice)))
+      {:db db :skipped :invoice-blocked}
+      :else
+      (let [;; 消込む請求書がまだ計上されていなければ、先に計上する（売掛金・買掛金が
+            ;; 先に立たないと、消込で逆の残高になる）。承認は消込と一緒
+            pending (when (= :invoice (:type choice))
+                      (vec (keep #(let [inv (invoice/invoice-by-id db (:invoice-id %))]
+                                    (when (and inv (= :status-ok (invoice-posting db inv))) (:id inv)))
+                                 (:allocations choice))))
+            db (reduce (fn [d id] (:db (invoice/post d id))) db pending)
+            {:keys [entry skipped warnings]}
+            (case (:type choice)
+              :invoice (invoice-entry db line choice)
+              :account (account-entry db line choice)
+              :transfer (transfer-entry db line choice)
+              {:skipped :unknown-choice})]
+        (if skipped
+          {:db original :skipped skipped}
+          (let [db (update-line db line-id dissoc :excluded?)
+                [db' entry-id] (core/append-entry db entry)
+                db' (-> db' (add-alias line choice) (count-rule choice))
+                db' (if (and (= :account (:type choice)) (:make-rule? choice)
+                             (not (text/blank? (text-key (:description line)))))
+                      (add-rule db' {:when {:direction (if (pos? (:amount line 0)) :in :out)
+                                            :text (text-key (:description line)) :op :exact
+                                            :account-id (:account-id line)}
+                                     :then (select-keys choice [:account :tax :partner :qualified?])})
+                      db')]
+            (cond-> {:db db' :entry-id entry-id :warnings (vec warnings)}
+              (seq pending) (assoc :invoices-posted pending))))))))
+
+(defn unpost-line
+  "行から起こした仕訳を消し、照合と「計上しない」も外す。"
+  [db line-id]
+  (-> db
+      (update :entries (fn [es] (filterv (fn [e] (not (and (statement-entry? e)
+                                                           (or (= line-id (get-in e [:origin :line-id]))
+                                                               (some #{line-id} (get-in e [:origin :line-ids]))))))
+                                         es)))
+      (update-line line-id #(dissoc % :match :excluded?))))
+
+(defn post-preselected
+  "選んだ行のうち、最初から選んだ候補（有力が 1 件）のある行だけを計上する。
+  戻りは {:db :posted [id …] :skipped [{:id :reason} …]}。"
+  [db line-ids]
+  (let [learned (learn db)]
+    (reduce (fn [{:keys [db] :as acc} id]
+              (let [line (line-by-id db id)
+                    choice (when (and line (= :open (line-status db line)))
+                             (:preselected (candidates db learned line)))]
+                (if-not choice
+                  (update acc :skipped conj {:id id :reason (if (and line (not= :open (line-status db line))) :already-posted :no-preselected)})
+                  (let [{db' :db :keys [skipped]} (post-line db id (assoc choice :as-suggested? true))]
+                    (if skipped
+                      (update acc :skipped conj {:id id :reason skipped})
+                      (-> acc (assoc :db db') (update :posted conj id)))))))
+            {:db db :posted [] :skipped []}
+            line-ids)))
+
+;; ───────── 利用者の規則 ─────────
+
+(defn add-rule [db rule]
+  (let [id (next-id "r" (:rules db))]
+    (update db :rules (fnil conj []) (assoc rule :id id :stats {:suggested 0 :accepted 0}))))
+
+(defn delete-rule [db id] (update db :rules #(filterv (fn [r] (not= id (:id r))) %)))
+
+(defn move-rule
+  "規則を 1 つ上（-1）か下（1）へ。並べた順に当てるので、順番が優先度。"
+  [db id delta]
+  (let [rs (vec (:rules db))
+        i (first (keep-indexed (fn [i r] (when (= id (:id r)) i)) rs))
+        j (when i (+ i delta))]
+    (if (and i (<= 0 j (dec (count rs))))
+      (assoc db :rules (assoc rs i (rs j) j (rs i)))
+      db)))
+
+(defn rule-conflicts
+  "部分一致・前方一致・後方一致の規則が、過去に別の科目へ記帳した摘要にも当たるか
+  （freee のヘルプの「ツバメ」の例）。当たる摘要の鍵と科目の列。"
+  [db rule]
+  (let [learned (learn db)
+        target (get-in rule [:then :account])]
+    (vec (for [[[_ direction key] r] learned
+               :when (rule-matches? rule {:description key :amount (if (= direction :in) 1 -1)
+                                          :account-id (get-in rule [:when :account-id])})
+               [account _] (:accounts r)
+               :when (not= account target)]
+           {:key key :account account}))))
+
+;; ───────── 残高の照合・年齢表 ─────────
+
+(defn- ledger-balance
+  "帳簿の科目の date までの残高（借方 − 貸方）。明細の残高と同じ向き（入金が正）。"
+  [db account date]
+  (let [d (date-of date)]
+    (reduce + 0 (for [e (:entries db)
+                      :let [ed (date-of (:date e))]
+                      :when (and ed d (<= ed d))
+                      l (:lines e)
+                      :when (= account (:account l))]
+                  (- (:debit l 0) (:credit l 0))))))
+
+(defn balance-break
+  "残高のある行の続き具合（guest の running-break）。日付・取り込んだ順に並べ、
+  合わなければ同じ日の中を逆の順でも見る（新しい順の CSV）。食い違う最初の行
+  （無ければ nil）。"
+  [lines]
+  (let [with-balance (filterv #(some? (:balance %)) lines)
+        check (fn [ls]
+                (when (seq ls)
+                  (let [buf (vec (mapcat (fn [l] [(:amount l) (:balance l)]) ls))
+                        opening (- (:balance (first ls)) (:amount (first ls)))
+                        i (core/running-break buf opening)]
+                    (when (>= i 0) (nth ls i)))))
+        forward (sort-by line-order with-balance)
+        broken (check forward)]
+    (when (and broken (check (sort-by (juxt :date #(- (:seq % 0))) with-balance)))
+      broken)))
+
+(defn account-summary
+  "口座の照合: 件数、明細の最後の残高、同じ日の帳簿の科目の残高、差、残高の切れ目。"
+  [db account]
+  (let [ls (lines-of db (:id account))
+        counts (frequencies (map (status-fn db) ls))
+        last-line (last (filter #(some? (:balance %)) ls))
+        closing (cond
+                  (and last-line (or (nil? (:statement-balance account))
+                                     (>= (compare (:date last-line) (get-in account [:statement-balance :date])) 0)))
+                  {:amount (:balance last-line) :date (:date last-line)}
+                  (:statement-balance account) (:statement-balance account))
+        ledger (when closing (ledger-balance db (:ledger-account account) (:date closing)))]
+    {:account account
+     :lines (count ls)
+     :counts counts
+     :closing closing
+     :ledger ledger
+     :difference (when closing (- (:amount closing) ledger))
+     :break (some-> (balance-break ls) :id)}))
+
+(defn aging
+  "請求書の残額の年齢表（guest の aging-bucket、期日から 30 日ごと）。戻りは
+  {:rows [{:partner :buckets [0 1 2 3 4 の額] :total}] :totals [5 つ] :total}。"
+  [db kind as-of]
+  (let [d (date-of as-of)
+        rows (for [inv (:invoices db)
+                   :when (and (= kind (:kind inv)) (open-invoice? db inv))
+                   :let [due (invoice-due inv)]
+                   :when due]
+               [(or (get-in inv [:partner :name]) "") (core/aging-bucket due d) (open-amount db inv)])
+        by-partner (group-by first rows)
+        out (vec (for [[p rs] (sort-by key by-partner)
+                       :let [buckets (reduce (fn [v [_ b a]] (update v b + a)) [0 0 0 0 0] rs)]]
+                   {:partner p :buckets buckets :total (reduce + buckets)}))
+        totals (reduce (fn [t r] (mapv + t (:buckets r))) [0 0 0 0 0] out)]
+    {:rows out :totals totals :total (reduce + totals)}))
+
+(def bucket-labels ["期日前" "1〜30 日" "31〜60 日" "61〜90 日" "91 日〜"])
+
+(defn unconfirmed-entries
+  "明細から起こした課税仕入で、適格請求書が「未確認」の行を持つ仕訳。"
+  [db]
+  (filterv (fn [e] (some #(= "未確認" (get-in % [:invoice :code])) (:lines e))) (:entries db)))
+
+(defn counts
+  "検査の欄の数: 未処理の行、残高の合わない口座、適格請求書の確認が要る仕訳。"
+  [db]
+  (let [summaries (map #(account-summary db %) (:statement-accounts db))
+        status (status-fn db)]
+    {:open (count (filter #(= :open (status %)) (:statement-lines db)))
+     :unbalanced (count (filter #(or (some-> (:difference %) (not= 0)) (:break %)) summaries))
+     :unconfirmed (count (unconfirmed-entries db))}))

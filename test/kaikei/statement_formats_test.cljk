@@ -1,0 +1,127 @@
+(ns kaikei.statement-formats-test
+  "明細の形式（第 4 スライス、JUN-327）: OFX（1.x SGML・2.x XML の QFX）、freee・MF・
+  Xero・QuickBooks の明細の CSV の判定・取り込み・書き出しと往復。fixture の形の
+  出所は test/fixtures/README.md。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [kaikei.core :as core]
+            [kaikei.encoding :as enc]
+            [kaikei.export :as export]
+            [kaikei.ingest :as ingest]))
+
+(defn- fixture [name] (str (fs/readFileSync (str "test/fixtures/" name) "utf8")))
+(defn- fixture-bytes [name] (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" name))))
+
+(defn- rows [parsed] (mapv (juxt :date :amount :description) (:statement-lines parsed)))
+
+(deftest ofx-sgml-bank
+  (let [p (ingest/ingest-text (fixture "ofx-bank.ofx") {})
+        a (first (:statement-accounts p))]
+    (is (= :ofx (:format p)))
+    (is (= "JPY" (:currency p)))
+    (testing "口座: 金融機関（ORG-FID）・口座番号の下 4 桁・種類で見分ける。口座番号は下 4 桁だけを持つ"
+      (is (= [:bank "ofx:KAIKEI-SAMPLE-9999:4567:SAVINGS" "OFX 預金 ****4567" "普通預金"]
+             ((juxt :kind :key :name :ledger-account) a)))
+      (is (not (re-find #"0001234567" (pr-str p)))))
+    (testing "LEDGERBAL は口座の期末残高"
+      (is (= {:amount 1058310 :date "2026-11-30"} (:statement-balance a))))
+    (testing "終わりのタグの無い葉、時刻と時差の付いた日付（日付は書かれたとおり）、符号は口座の持ち主から見た向き"
+      (is (= [["2026-11-28" 58880 "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ"]
+              ["2026-11-30" -3630 "ﾌﾘｺﾐ ﾔﾏﾀﾞﾌﾞﾝｸﾞ A-102"]
+              ["2026-11-30" -440 "ﾌﾘｺﾐﾃｽｳﾘﾖｳ"]]
+             (rows p)))
+      (is (= ["20261128-0001" "20261130-0001" "20261130-0002"] (map :uid (:statement-lines p)))))))
+
+(deftest ofx-xml-card
+  (let [p (ingest/ingest-text (fixture "ofx-card.qfx") {})
+        a (first (:statement-accounts p))]
+    (testing "2.x の XML、INTU.BID（私的なタグ）は読み飛ばす。カードは利用が負、返金が正"
+      (is (= [:card "未払金" "OFX カード ****9999"] ((juxt :kind :ledger-account :name) a)))
+      (is (= [["2026-11-03" -1100 "ｱﾏｿﾞﾝ ﾏｰｹｯﾄﾌﾟﾚｲｽ"] ["2026-11-10" -2200 "ｺｳｷﾞﾖｳ ﾃﾞﾝｷ"]
+              ["2026-11-11" -2200 "ｺｳｷﾞﾖｳ ﾃﾞﾝｷ"] ["2026-11-27" 3300 "ｺﾞｼﾞﾂｾｲｻﾝ 返金"]]
+             (rows p))))
+    (testing "CORRECTFITID と CORRECTACTION は訂正として渡す"
+      (is (= {:uid "C-0002" :action :delete} (:correct (nth (:statement-lines p) 2)))))
+    (testing "CURRENCY の付いた行（換算されていない）は取り込まない"
+      (is (= 1 (:rejected p)))
+      (is (re-find #"USD" (first (:warnings p)))))))
+
+(deftest ofx-decimal-comma-and-detection
+  (let [s (str "<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><CURDEF>USD<BANKACCTFROM><BANKID>1<ACCTID>99<ACCTTYPE>CHECKING</BANKACCTFROM>"
+               "<BANKTRANLIST><STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20261001<TRNAMT>-12,50<FITID>x</STMTTRN></BANKTRANLIST>"
+               "</STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>")]
+    (testing "小数点が , の金額（OFX 2.3 §3.2.9.1）"
+      (is (= [["2026-10-01" -1250 ""]] (rows (ingest/ingest-text s {}))))))
+  (testing "Shift_JIS のバイト列も読む（日本の OFX の文字コードは未確認）"
+    (let [sjis (:bytes (enc/encode (fixture "ofx-bank.ofx") "shift_jis"))
+          p (ingest/ingest-bytes sjis {})]
+      (is (= :ofx (:format p)))
+      (is (= "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ" (:description (first (:statement-lines p))))))))
+
+(deftest freee-statement-csv
+  (testing "銀行のテンプレート（取引日,出金額,入金額,残高,取引内容）"
+    (let [p (ingest/ingest-text (fixture "freee-statement-bank.csv") {})]
+      (is (= :freee-statement-csv (:format p)))
+      (is (= [["2026-11-28" 58880 "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ"] ["2026-11-30" -3630 "ﾌﾘｺﾐ ﾔﾏﾀﾞﾌﾞﾝｸﾞ A-102"] ["2026-11-30" -440 "ﾌﾘｺﾐﾃｽｳﾘﾖｳ"]]
+             (rows p)))
+      (is (= [1062380 1058750 1058310] (map :balance (:statement-lines p))))))
+  (testing "カードのテンプレート: 利用が正・返金が負（銀行の向きと逆）を、kaikei の向きに直す"
+    (let [p (ingest/ingest-text (fixture "freee-statement-card.csv") {})]
+      (is (= [:card "freee-statement-csv:card"] ((juxt :kind :key) (first (:statement-accounts p)))))
+      (is (= [["2026-11-03" -1100 "ｱﾏｿﾞﾝ ﾏｰｹｯﾄﾌﾟﾚｲｽ"] ["2026-11-27" 3300 "ｺﾞｼﾞﾂｾｲｻﾝ 返金"]] (rows p))))))
+
+(deftest mf-statement-csv
+  (let [p (ingest/ingest-bytes (fixture-bytes "mf-statement-sjis.csv") {})]
+    (is (= ["mf-statement-csv" "shift_jis"] [(name (:format p)) (:encoding p)]))
+    (is (= [["2026-11-28" 58880 "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ"] ["2026-11-30" -3630 "ﾌﾘｺﾐ ﾔﾏﾀﾞﾌﾞﾝｸﾞ A-102"]] (rows p))))
+  (testing "1 列の金額（出金が負）"
+    (is (= [["2026-12-01" -500 "x"]] (rows (ingest/ingest-text "日付,内容,金額\n2026/12/1,x,-500\n" {})))))
+  (testing "MF の仕訳帳 CSV（取引No・借方勘定科目）は明細と判定しない"
+    (is (= :mf (:format (ingest/ingest-text (fixture "mf.csv") {}))))))
+
+(deftest xero-statement-csv
+  (let [p (ingest/ingest-text (fixture "xero-statement.csv") {:currency "USD"})]
+    (is (= :xero-statement-csv (:format p)))
+    (testing "見出しの * を外して読む。(36.30) は負。日付の並びは 30/11 から dmy と推す"
+      (is (= [["2026-11-28" 58880 "Minato Ltd Payment"] ["2026-11-30" -3630 "Yamada Stationery Bill A-102"]
+              ["2026-11-30" -440 "Bank fee"]]
+             (rows p)))
+      (is (= ["Minato Ltd" "INV-0001"] ((juxt :counterparty :reference) (first (:statement-lines p)))))))
+  (testing "Xero の manual journal CSV（Narration・AccountCode）は明細と判定しない"
+    (is (= :xero-csv (:format (ingest/ingest-text (fixture "xero-manual-journal.csv") {}))))))
+
+(deftest qbo-bank-csv
+  (testing "3 列（入金が正）"
+    (is (= [["2026-11-28" 58880 "Payment from Minato"] ["2026-11-30" -3630 "Yamada Stationery"]]
+           (rows (ingest/ingest-text (fixture "qbo-bank-3col.csv") {:currency "USD"})))))
+  (testing "4 列は Intuit の例のとおり 支払が Credit・入金が Debit"
+    (is (= [["2026-11-28" 58880 "Payment from Minato"] ["2026-11-30" -3630 "Yamada Stationery"]]
+           (rows (ingest/ingest-text (fixture "qbo-bank-4col.csv") {:currency "USD"}))))))
+
+(defn- round-trip [db fmt & [opts]]
+  (let [{:keys [text error notes]} (export/export db fmt (merge {:encoding "utf-8"} opts))
+        parsed (ingest/ingest-text text {:format fmt :currency (:currency db)})]
+    {:error error :notes notes :text text :rows (rows parsed) :balances (map :balance (:statement-lines parsed))}))
+
+(def sample-db (:db (core/merge-import core/empty-db core/sample-import)))
+
+(deftest statement-csv-round-trips
+  (let [expected (rows {:statement-lines (sort-by (juxt :date :seq) (:statement-lines sample-db))})]
+    (doseq [fmt ["freee-statement-csv" "mf-statement-csv" "xero-statement-csv" "qbo-bank-csv"]]
+      (testing fmt
+        (let [{:keys [error rows notes]} (round-trip sample-db fmt)]
+          (is (nil? error))
+          (is (= expected rows))
+          (is (some #(re-find #"照合・消込・規則" %) notes)))))
+    (testing "freee の銀行は残高も戻る"
+      (is (= [1062820 1059190 1058750 1057650 977650] (:balances (round-trip sample-db "freee-statement-csv")))))
+    (testing "QBO は 3 列・mdy で書く"
+      (is (re-find #"^Date,Description,Amount\r\n11/28/2026," (:text (round-trip sample-db "qbo-bank-csv")))))
+    (testing "MF は既定で Shift_JIS"
+      (is (= "shift_jis" (:encoding (export/export sample-db "mf-statement-csv")))))
+    (testing "口座の無い帳簿・知らない口座"
+      (is (= "明細がありません" (:error (export/export core/empty-db "freee-statement-csv"))))
+      (is (re-find #"x9" (:error (export/export sample-db "freee-statement-csv" {:statement-account "x9"})))))
+    (testing "読むだけの OFX は書き出しの形式に無い"
+      (is (not (some #{"ofx"} ingest/export-format-ids)))
+      (is (not (some #{"freee-statement-csv"} (map :id ingest/ledger-export-formats)))))))

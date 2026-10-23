@@ -1,6 +1,6 @@
 # test/fixtures — the source of each fixture's shape
 
-Every value is synthetic, and no real ledger is included. The shapes (column order, keys, how lines are grouped, and the format of dates and amounts) follow the sources below, as checked on 2026-10-22.
+Every value is synthetic, and no real ledger is included. The shapes (column order, keys, how lines are grouped, and the format of dates and amounts) follow the sources below, as checked on 2026-10-22 (invoices) and 2026-10-23 (statements).
 
 | File | Shape source |
 |---|---|
@@ -27,6 +27,12 @@ Every value is synthetic, and no real ledger is included. The shapes (column ord
 | `zoho-invoices.json` | Zoho Invoice OpenAPI `invoices.yml` (sha256 `53e03d28…`) and the API docs' list sample: `line_items` with `tax_percentage` and `item_total`, `taxes[]` with per-tax amounts, an entity-level discount, a void invoice, and a list item without lines. |
 | `freshbooks-invoices.json` | FreshBooks `/api/invoices` and freshbooks-nodejs-sdk `f1e2d61b`: money as `{amount, code}` strings, `taxAmount1` as a percentage, `v3_status`, and a line with two taxes. |
 | `freshbooks-bills.json` | FreshBooks `/api/bills` "Get Single Bill" sample: `quantity` as a string, `tax_percent1` and `tax_amount1`, `category` as an object, `vendorid` without a vendor name. |
+| `ofx-bank.ofx` | OFX Banking Specification 1.0.2/1.6 (FDX): a 1.x SGML header (`OFXHEADER:100`, `DATA:OFXSGML`), leaf elements without end tags, `STMTRS` with `BANKACCTFROM` (`ACCTTYPE` `SAVINGS`), `STMTTRN` with `FITID`, a `DTPOSTED` with time and `[+9:JST]`, and `LEDGERBAL`. `SONRS/FI` carries `ORG`/`FID`. The names are half-width kana, as Japanese banks print remitters. Accessed 2026-10-23. |
+| `ofx-card.qfx` | OFX Banking Specification 2.3 and its XSD (FDX, 2020-10-16): the XML declaration and the `<?OFX …?>` processing instruction, `CCSTMTRS`/`CCACCTFROM`, card purchases negative and a refund positive (§11.4.4.1), a `CORRECTFITID`/`CORRECTACTION DELETE` pair, a line with `CURRENCY` (not converted, §5.2), a decimal comma, and Intuit's private `INTU.BID` tag (ignored, §2.7.1). |
+| `freee-statement-bank.csv`, `freee-statement-card.csv` | The template files attached to freee help articles 202847120 and 202847810: bank `取引日,出金額,入金額,残高,取引内容` and card `取引日,取引金額,取引内容,カードラベル` (a purchase is positive and a refund negative on cards), dates `YYYY/MM/DD`. |
+| `mf-statement-sjis.csv` | MoneyForward support im01/im02: `日付,内容,出金額,入金額`, Shift_JIS (the sample is offered in Shift-JIS and UTF-8). The header bytes were read from the guide's screenshots; the login-only sample was not checked. |
+| `xero-statement.csv` | Xero Central "Import a CSV bank statement": Date, Amount, Payee, Description, Reference and Cheque Number, spend negative written `(36.30)` or `-4.40`, dates dd/mm/yyyy. The `*` on Date and Amount follows third-party descriptions of the login-only template (unverified). |
+| `qbo-bank-3col.csv`, `qbo-bank-4col.csv` | QuickBooks Help "Format CSV files in Excel to get bank transactions into QuickBooks" (L4BjLWckq): the 3-column `Date,Description,Amount` and the 4-column `Date,Description,Credit,Debit`, where Intuit's own example puts a payment under Credit and a deposit under Debit. |
 | `xero-manual-journal.csv` | Xero Central "Add, import and post manual journals" (UK). Only the first row of a journal has Narration and Date, the Amount is signed, and dates are dd/mm/yyyy. Whether the header has the `*` prefix is unverified. |
 
 Line endings are CRLF.

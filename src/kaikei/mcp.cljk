@@ -6,8 +6,9 @@
   map（通知なら nil）を返す純関数だけを持つ。判定は画面と同じ adapter
   （kaikei.core / ingest / export）で、書き直さない。
 
-  tool は 8 つ。どれも送信せず、保存せず、各社（MoneyForward・freee・弥生・
-  QuickBooks・Xero・Zoho・FreshBooks）の API にも、国税庁の公表サイトにも接続しない:
+  tool は 11。どれも送信せず、保存せず、各社（MoneyForward・freee・弥生・
+  QuickBooks・Xero・Zoho・FreshBooks）の API にも、国税庁の公表サイトにも、
+  銀行・カード会社にも接続しない:
 
     kaikei_import          仕訳・請求書のファイル（テキストか base64 のバイト列）→ kaikei の帳簿 JSON
     kaikei_validate        帳簿 JSON の検査（貸借一致・未分類の勘定科目・問題のある仕訳）
@@ -17,9 +18,14 @@
     kaikei_invoice_totals  請求書の明細 → 税率ごとの対価・消費税額・合計（1 請求書・税率ごとに 1 回の端数処理）
     kaikei_invoice_check   帳簿 JSON の請求書の検査（適格請求書の記載事項の欠け・税額の差・経過措置の割合）
     kaikei_invoice_post    帳簿 JSON の請求書から売掛・買掛の仕訳を起こす
+    kaikei_statement_check   帳簿 JSON の明細の照合（残高の続き具合・明細と帳簿の残高の差・未処理の行・年齢表）
+    kaikei_statement_suggest 明細の行ごとの候補（請求書の消込・帳簿の仕訳との照合・振替・規則）。帳簿は変えない
+    kaikei_statement_post    承認した明細の行だけを計上する（承認の無い行は起こさない）
 
-  帳簿 JSON は kaikei.ledger.v1（kaikei.compat.native）。請求書（invoices）も
-  運ぶ（第 3 スライス、JUN-321）。tool の間で受け渡す。
+  帳簿 JSON は kaikei.ledger.v1（kaikei.compat.native）。請求書（invoices、第 3
+  スライス JUN-321）と明細・規則（statement_lines・rules、第 4 スライス JUN-327）も
+  運ぶ。tool の間で受け渡す。agent の tool の承認は、ブラウザでの利用者の同意の
+  代わりにならない —— kaikei_statement_post は渡された帳簿 JSON の写しを返すだけ。
 
   入力の不正は JSON-RPC の error ではなく tool の結果（isError true、本文は
   {\"error\" \"<名前>\" …}）で返す。"
@@ -29,12 +35,13 @@
             [kaikei.export :as export]
             [kaikei.ingest :as ingest]
             [kaikei.invoice :as invoice]
+            [kaikei.statement :as statement]
             [kaikei.json :as json]
             [kaikei.compat.common :as common]
             [kaikei.compat.native :as native]))
 
 (def server-name "kaikei")
-(def server-version "0.2.0")
+(def server-version "0.3.0")
 (def default-protocol-version "2024-11-05")
 
 (def max-bytes
@@ -121,7 +128,8 @@
   (let [{:keys [error text bytes encoding notes]}
         (export/export db fmt (cond-> {}
                                 (get args "encoding") (assoc :encoding (get args "encoding"))
-                                (get args "output_date_order") (assoc :date-order (get args "output_date_order"))))]
+                                (get args "output_date_order") (assoc :date-order (get args "output_date_order"))
+                                (string? (get args "statement_account")) (assoc :statement-account (get args "statement_account"))))]
     (when error (throw (tool-error "cannot-export" "detail" error)))
     (cond-> {"format" fmt "encoding" encoding "notes" (vec notes)}
       (= encoding "shift_jis") (assoc "bytes_base64" (enc/bytes->base64 bytes))
@@ -136,6 +144,7 @@
      "encoding" (:encoding parsed)
      "entries" (count (:entries db))
      "invoices" (count (:invoices db))
+     "statement_lines" (count (:statement-lines db))
      "rejected" (+ (:rejected parsed 0) (:invoices-rejected parsed 0))
      "skipped" (:invoices-skipped parsed 0)
      "warnings" (vec (:warnings parsed))
@@ -165,7 +174,7 @@
      "data" (json/parse (export/report-text db kind shape from to))}))
 
 (defn export-tool [args]
-  (reject-unknown args ["ledger" "format" "encoding" "output_date_order"])
+  (reject-unknown args ["ledger" "format" "encoding" "output_date_order" "statement_account"])
   (let [db (ledger-arg args)
         fmt (enum-arg args "format" ingest/export-format-ids nil)]
     (when (get args "encoding") (enum-arg args "encoding" enc/encodings nil))
@@ -174,7 +183,7 @@
 
 (defn convert-tool [args]
   (reject-unknown args ["text" "bytes_base64" "from" "to" "input_encoding" "encoding" "currency"
-                        "date_order" "output_date_order"])
+                        "date_order" "output_date_order" "statement_account"])
   (let [to-fmt (enum-arg args "to" ingest/export-format-ids nil)
         {:keys [parsed db]} (read-input (cond-> (select-keys args ["text" "bytes_base64" "currency" "date_order"])
                                           (get args "from") (assoc "format" (get args "from"))
@@ -185,6 +194,7 @@
            {"from" (some-> (:format parsed) name)
             "entries" (count (:entries db))
             "invoices" (count (:invoices db))
+            "statement_lines" (count (:statement-lines db))
             "rejected" (:rejected parsed 0)
             "warnings" (vec (:warnings parsed))})))
 
@@ -312,6 +322,158 @@
      "checks" (checks-out db)
      "ledger" (ledger-out db)}))
 
+;; ───────── 明細の tools（第 4 スライス、JUN-327） ─────────
+
+(defn- tax-json [t]
+  (when t (cond-> {"category" (name (:category t))} (:kind t) (assoc "kind" (:kind t)) (:rate t) (assoc "rate" (:rate t)))))
+
+(defn- choice-out
+  "候補 → kaikei_statement_post に渡す choice（JSON）。"
+  [c exp]
+  (case (:type c)
+    :invoice {"type" "invoice"
+              "allocations" (mapv (fn [a] {"invoice_id" (:invoice-id a) "amount" (money-out (:amount a) exp)}) (:allocations c))}
+    :entry {"type" "entry" "entry_id" (:entry-id c)}
+    :transfer {"type" "transfer" "line_id" (:line-id c)}
+    :account (cond-> {"type" "account" "account" (:account c)}
+               (:tax c) (assoc "tax" (tax-json (:tax c)))
+               (:partner c) (assoc "partner" (:partner c))
+               (:qualified? c) (assoc "qualified" true)
+               (:rule-id c) (assoc "rule_id" (:rule-id c)))))
+
+(defn- candidate-out [db c exp]
+  (cond-> {"type" (name (:type c))
+           "strength" (:level c)
+           "strength_label" (statement/level-label (:level c))
+           "reasons" (:reasons c)
+           "choice" (choice-out c exp)}
+    (= :invoice (:type c)) (assoc "invoices" (vec (for [id (:invoices c) :let [inv (invoice/invoice-by-id db id)]]
+                                                    {"id" id "number" (:number inv) "partner" (get-in inv [:partner :name])}))
+                                  "fee" (money-out (:fee c 0) exp))
+    (= :account (:type c)) (assoc "source" (name (:source c)))))
+
+(defn- line-out [l exp]
+  (cond-> {"id" (:id l) "account_id" (:account-id l) "date" (:date l)
+           "amount" (money-out (:amount l) exp) "description" (:description l)}
+    (some? (:balance l)) (assoc "balance" (money-out (:balance l) exp))
+    (:counterparty l) (assoc "counterparty" (:counterparty l))
+    (:reference l) (assoc "reference" (:reference l))))
+
+(defn- aging-out [db kind as-of exp]
+  (let [{:keys [rows totals total]} (statement/aging db kind as-of)]
+    {"buckets" statement/bucket-labels
+     "rows" (mapv (fn [r] {"partner" (:partner r) "amounts" (mapv #(money-out % exp) (:buckets r)) "total" (money-out (:total r) exp)}) rows)
+     "totals" (mapv #(money-out % exp) totals)
+     "total" (money-out total exp)}))
+
+(defn statement-check-tool [args]
+  (reject-unknown args ["ledger" "as_of"])
+  (let [db (ledger-arg args)
+        exp (core/exponent (:currency db))
+        as-of (if (get args "as_of") (date-arg args "as_of") (or (some-> (core/date-range db) second) "9999-12-31"))
+        counts (statement/counts db)]
+    (plain
+     {"accounts" (vec (for [a (:statement-accounts db)
+                            :let [{:keys [lines counts closing ledger difference break]} (statement/account-summary db a)]]
+                        (cond-> {"id" (:id a) "name" (:name a) "kind" (name (:kind a)) "ledger_account" (:ledger-account a)
+                                 "lines" lines
+                                 "open" (get counts :open 0) "posted" (get counts :posted 0)
+                                 "matched" (get counts :matched 0) "excluded" (get counts :excluded 0)}
+                          closing (assoc "closing" {"amount" (money-out (:amount closing) exp) "date" (:date closing)}
+                                         "ledger_balance" (money-out ledger exp)
+                                         "difference" (money-out difference exp))
+                          break (assoc "balance_break_line" break))))
+      "open_lines" (:open counts)
+      "unbalanced_accounts" (:unbalanced counts)
+      "unconfirmed_qualification_entries" (:unconfirmed counts)
+      "aging" {"as_of" as-of "sales" (aging-out db :sales as-of exp) "purchase" (aging-out db :purchase as-of exp)}
+      "note" "Balances are compared on the statement's last date (debit minus credit of the ledger account). A balance break is the first line where the running balance does not continue."})))
+
+(defn statement-suggest-tool [args]
+  (reject-unknown args ["ledger" "account_id" "line_ids" "limit"])
+  (let [db (ledger-arg args)
+        exp (core/exponent (:currency db))
+        ids (get args "line_ids")
+        _ (when (and (some? ids) (not (and (sequential? ids) (every? string? ids))))
+            (throw (tool-error "invalid-argument" "argument" "line_ids" "expected" "array of statement line ids")))
+        limit (let [n (get args "limit" 200)]
+                (if (and (integer? n) (<= 1 n 1000)) n (throw (tool-error "invalid-argument" "argument" "limit" "expected" "1..1000"))))
+        status (statement/status-fn db)
+        learned (statement/learn db)
+        lines (cond->> (sort-by (juxt :date :seq) (:statement-lines db))
+                (get args "account_id") (filter #(= (get args "account_id") (:account-id %)))
+                ids (filter #(some #{(:id %)} ids))
+                (nil? ids) (filter #(= :open (status %))))]
+    (plain
+     {"lines" (vec (for [l (take limit lines)
+                         :let [{:keys [candidates preselected]} (statement/candidates db learned l)]]
+                     {"line" (line-out l exp)
+                      "status" (name (status l))
+                      "candidates" (mapv #(candidate-out db % exp) candidates)
+                      "preselected" (when preselected (first (keep-indexed (fn [i c] (when (= c preselected) i)) candidates)))}))
+      "note" "Suggestions only; nothing is posted. Pass a candidate's choice (or your own) to kaikei_statement_post with the line id once the user approves it. Strength 3 is pre-selected only when it is the only strong candidate."})))
+
+(defn- choice-in
+  "kaikei_statement_post の choice（JSON）→ kaikei の choice。"
+  [db m exp i]
+  (let [bad #(throw (tool-error "invalid-argument" "argument" "approvals" "detail" (str "approval " (inc i) ": " %)))]
+    (when-not (map? m) (bad "choice must be an object"))
+    (case (get m "type")
+      "invoice" (let [as (get m "allocations")]
+                  (when-not (and (sequential? as) (seq as)) (bad "allocations is required"))
+                  (cond-> {:type :invoice
+                           :allocations (vec (for [a as
+                                                   :let [{:keys [amount error]} (core/parse-amount (get a "amount") exp)]]
+                                               (if (or error (not (string? (get a "invoice_id"))))
+                                                 (bad "each allocation needs invoice_id and amount")
+                                                 {:invoice-id (get a "invoice_id") :amount amount})))}
+                    (get m "fee_treatment") (assoc :fee-treatment (keyword (enum-arg m "fee_treatment" ["return" "purchase" "discount"] nil)))
+                    (get m "fee_rate") (assoc :fee-rate (or (common/percent->rate (get m "fee_rate")) (bad "fee_rate is a percent like 10 or 8")))))
+      "entry" {:type :entry :entry-id (or (get m "entry_id") (bad "entry_id is required"))}
+      "transfer" {:type :transfer :line-id (or (get m "line_id") (bad "line_id is required"))}
+      "exclude" {:type :exclude}
+      "account" (let [t (get m "tax")]
+                  (cond-> {:type :account :account (or (get m "account") (bad "account is required"))}
+                    (map? t) (assoc :tax (cond-> {:category (keyword (enum-arg t "category" categories "taxable"))}
+                                           (integer? (get t "kind")) (assoc :kind (get t "kind"))))
+                    (string? (get m "partner")) (assoc :partner (get m "partner"))
+                    (true? (get m "qualified")) (assoc :qualified? true)
+                    (string? (get m "rule_id")) (assoc :rule-id (get m "rule_id"))))
+      (bad "type is one of invoice, entry, transfer, account, exclude"))))
+
+(defn statement-post-tool [args]
+  (reject-unknown args ["ledger" "approvals"])
+  (let [db (ledger-arg args)
+        exp (core/exponent (:currency db))
+        approvals (get args "approvals")
+        _ (when-not (and (sequential? approvals) (seq approvals))
+            (throw (tool-error "invalid-argument" "argument" "approvals" "detail" "a non-empty array of {line_id, choice}")))
+        {:keys [db posted skipped]}
+        (reduce (fn [acc [i a]]
+                  (let [line-id (get a "line_id")
+                        _ (when-not (string? line-id)
+                            (throw (tool-error "invalid-argument" "argument" "approvals" "detail" (str "approval " (inc i) ": line_id is required"))))
+                        choice (if (= "preselected" (get a "choice"))
+                                 (or (some->> (statement/line-by-id (:db acc) line-id) (statement/candidates (:db acc)) :preselected)
+                                     ::none)
+                                 (choice-in (:db acc) (get a "choice") exp i))]
+                    (if (= ::none choice)
+                      (update acc :skipped conj {"line_id" line-id "reason" "no-preselected" "message" "有力の候補が 1 つではありません"})
+                      (let [{db' :db :keys [entry-id skipped warnings]} (statement/post-line (:db acc) line-id choice)]
+                        (if skipped
+                          (update acc :skipped conj {"line_id" line-id "reason" (name skipped)
+                                                     "message" (get statement/skip-label skipped (name skipped))})
+                          (-> acc (assoc :db db')
+                              (update :posted conj (cond-> {"line_id" line-id}
+                                                     entry-id (assoc "entry_id" entry-id)
+                                                     (seq warnings) (assoc "warnings" (mapv statement/warning-label warnings))))))))))
+                {:db db :posted [] :skipped []}
+                (map-indexed vector approvals))]
+    {"posted" posted
+     "skipped" skipped
+     "checks" (checks-out db)
+     "ledger" (ledger-out db)}))
+
 ;; ───────── tool の宣言 ─────────
 
 (def ^:private input-schema
@@ -329,7 +491,8 @@
   [{"name" "kaikei_import"
     "description" (str "Read a journal export (MoneyForward 仕訳帳 CSV, freee 仕訳 CSV, 弥生インポート形式, "
                        "QuickBooks Online Account/JournalEntry JSON or journal CSV, Xero Accounts/Journals/ManualJournals JSON "
-                       "or manual journal CSV, or a kaikei ledger) into a kaikei ledger with checks. "
+                       "or manual journal CSV, or a kaikei ledger), an invoice file, or a bank/card statement the user downloaded "
+                       "(OFX/QFX/QBO, freee・MF・Xero・QuickBooks statement CSV) into a kaikei ledger with checks. "
                        "Pure: nothing is sent, stored or fetched; it does not call any accounting API.")
     "inputSchema" {"type" "object"
                    "properties" (merge input-schema
@@ -369,7 +532,8 @@
                                  "encoding" {"type" "string" "enum" enc/encodings
                                              "description" "Defaults per format (Shift_JIS for 弥生・MF・freee)."}
                                  "output_date_order" {"type" "string" "enum" common/date-orders
-                                                      "description" "Date order for QBO/Xero CSV (default mdy for QBO, dmy for Xero)."}}
+                                                      "description" "Date order for QBO/Xero CSV (default mdy for QBO, dmy for Xero)."}
+                                 "statement_account" {"type" "string" "description" "Statement account id for statement formats (default: the first)."}}
                    "required" ["ledger" "format"]
                    "additionalProperties" false}
     "run" export-tool}
@@ -383,7 +547,8 @@
                                         "encoding" {"type" "string" "enum" enc/encodings}
                                         "currency" currency-schema
                                         "date_order" {"type" "string" "enum" ["mdy" "dmy"]}
-                                        "output_date_order" {"type" "string" "enum" common/date-orders}})
+                                        "output_date_order" {"type" "string" "enum" common/date-orders}
+                                        "statement_account" {"type" "string"}})
                    "required" ["to"]
                    "additionalProperties" false}
     "run" convert-tool}
@@ -426,7 +591,49 @@
                                                "description" "Overrides the ledger's setting (default tax-excluded: tax goes to 仮受消費税・仮払消費税)."}}
                    "required" ["ledger"]
                    "additionalProperties" false}
-    "run" invoice-post-tool}])
+    "run" invoice-post-tool}
+   {"name" "kaikei_statement_check"
+    "description" (str "Reconcile the bank, card and expense statements in a kaikei ledger: for each statement account, line counts "
+                       "by status (open, posted, matched, excluded), the statement's last balance against the ledger account's "
+                       "balance on that date, and the first line where the running balance breaks. Also an accounts receivable "
+                       "and payable aging (30-day buckets from the due date). Pure; nothing is fetched from any bank.")
+    "inputSchema" {"type" "object"
+                   "properties" {"ledger" ledger-schema
+                                 "as_of" {"type" "string" "description" "Aging date, YYYY-MM-DD (default: the ledger's last date)."}}
+                   "required" ["ledger"]
+                   "additionalProperties" false}
+    "run" statement-check-tool}
+   {"name" "kaikei_statement_suggest"
+    "description" (str "Suggestions for statement lines, without changing the ledger: invoices the payment settles (exact amount, "
+                       "short by a bank fee, partial, or several invoices of one customer), existing journal entries to match, "
+                       "transfers between statement accounts, and journal suggestions from the user's rules and from rules "
+                       "learned deterministically from the user's own past journals. Each candidate has a strength (3 strong, "
+                       "2 medium, 1 weak), the reasons, and a choice to pass to kaikei_statement_post after the user approves it.")
+    "inputSchema" {"type" "object"
+                   "properties" {"ledger" ledger-schema
+                                 "account_id" {"type" "string" "description" "Only this statement account."}
+                                 "line_ids" {"type" "array" "items" {"type" "string"} "description" "These lines (default: every open line)."}
+                                 "limit" {"type" "integer" "minimum" 1 "maximum" 1000 "default" 200}}
+                   "required" ["ledger"]
+                   "additionalProperties" false}
+    "run" statement-suggest-tool}
+   {"name" "kaikei_statement_post"
+    "description" (str "Post only the statement lines the user approved, each with its choice: settle invoices (a short payment's "
+                       "difference is booked as a bank fee per the ledger's setting), match an existing journal entry, post a "
+                       "transfer, post to an account with consumption tax split from the date's rate, or mark the line not to "
+                       "post. choice \"preselected\" uses the single strong candidate. Lines without an approval are untouched. "
+                       "Returns the updated ledger; nothing is stored or sent, and no payment is made.")
+    "inputSchema" {"type" "object"
+                   "properties" {"ledger" ledger-schema
+                                 "approvals" {"type" "array"
+                                              "items" {"type" "object"
+                                                       "properties" {"line_id" {"type" "string"}
+                                                                     "choice" {"type" ["object" "string"]
+                                                                               "description" "A candidate's choice from kaikei_statement_suggest, your own {type: account|invoice|entry|transfer|exclude, ...}, or \"preselected\"."}}
+                                                       "required" ["line_id" "choice"]}}}
+                   "required" ["ledger" "approvals"]
+                   "additionalProperties" false}
+    "run" statement-post-tool}])
 
 (def ^:private tool-by-name (into {} (map (juxt #(get % "name") identity)) tools))
 

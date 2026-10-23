@@ -18,13 +18,28 @@
             [kaikei.compat.mf-invoices :as mf-invoices]
             [kaikei.compat.yayoi :as yayoi]
             [kaikei.compat.mf :as mf]
-            [kaikei.compat.freee :as freee]))
+            [kaikei.compat.freee :as freee]
+            [kaikei.compat.statement-csv :as statement-csv]))
+
+(defn- pick-account
+  "明細の形式で書き出す口座（opts の :statement-account、無ければ最初の口座）。"
+  [db id]
+  (or (first (filter #(= id (:id %)) (:statement-accounts db)))
+      (when (nil? id) (first (:statement-accounts db)))))
 
 (defn write-text
   "db → {:text :notes} か {:error}。opts の :date-order は QBO・Xero の CSV の
-  日付の並び。"
-  [db format-id {:keys [date-order]}]
+  日付の並び、:statement-account は明細の形式で書き出す口座の id。"
+  [db format-id {:keys [date-order statement-account]}]
   (case format-id
+    ("freee-statement-csv" "mf-statement-csv" "xero-statement-csv" "qbo-bank-csv")
+    (if-let [acct (pick-account db statement-account)]
+      (case format-id
+        "freee-statement-csv" (statement-csv/write-freee db acct)
+        "mf-statement-csv" (statement-csv/write-mf db acct)
+        "xero-statement-csv" (statement-csv/write-xero db acct)
+        "qbo-bank-csv" (statement-csv/write-qbo db acct (cond-> {} date-order (assoc :date-order date-order))))
+      {:error (if statement-account (str "明細の口座 " statement-account " がありません") "明細がありません")})
     "kaikei-json" {:text (native/write db) :notes []}
     "xero-json" (xero/write db)
     "qbo-json" (qbo/write db)
@@ -53,11 +68,13 @@
                     "計上した請求書の仕訳は書き出しています"))
     :invoices (when (seq (:entries db))
                 (str "仕訳 " (count (:entries db)) " 件はこの形式に入りません（請求書だけを書き出します）"))
+    :statements (when (or (seq (:entries db)) (seq (:invoices db)))
+                  "仕訳・請求書はこの形式に入りません（1 つの口座の明細だけを書き出します）")
     nil))
 
 (defn export
   "db → 書き出し。opts: :encoding（省けば形式の既定。弥生・MF・freee は
-  Shift_JIS）、:date-order（QBO・Xero の CSV）。"
+  Shift_JIS）、:date-order（QBO・Xero の CSV）、:statement-account（明細の形式）。"
   ([db format-id] (export db format-id {}))
   ([db format-id {:keys [encoding] :as opts}]
    (let [fmt (ingest/format-by-id format-id)

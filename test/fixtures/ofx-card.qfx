@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<?OFX OFXHEADER="200" VERSION="220" SECURITY="NONE" OLDFILEUID="NONE" NEWFILEUID="NONE"?>
+<OFX>
+  <SIGNONMSGSRSV1>
+    <SONRS>
+      <STATUS><CODE>0</CODE><SEVERITY>INFO</SEVERITY></STATUS>
+      <DTSERVER>20261205120000.000[+9:JST]</DTSERVER>
+      <LANGUAGE>JPN</LANGUAGE>
+      <INTU.BID>99999</INTU.BID>
+    </SONRS>
+  </SIGNONMSGSRSV1>
+  <CREDITCARDMSGSRSV1>
+    <CCSTMTTRNRS>
+      <TRNUID>1</TRNUID>
+      <STATUS><CODE>0</CODE><SEVERITY>INFO</SEVERITY></STATUS>
+      <CCSTMTRS>
+        <CURDEF>JPY</CURDEF>
+        <CCACCTFROM><ACCTID>4980000000009999</ACCTID></CCACCTFROM>
+        <BANKTRANLIST>
+          <DTSTART>20261101</DTSTART>
+          <DTEND>20261201</DTEND>
+          <STMTTRN>
+            <TRNTYPE>DEBIT</TRNTYPE>
+            <DTPOSTED>20261103</DTPOSTED>
+            <TRNAMT>-1100</TRNAMT>
+            <FITID>C-0001</FITID>
+            <NAME>ｱﾏｿﾞﾝ ﾏｰｹｯﾄﾌﾟﾚｲｽ</NAME>
+          </STMTTRN>
+          <STMTTRN>
+            <TRNTYPE>DEBIT</TRNTYPE>
+            <DTPOSTED>20261110</DTPOSTED>
+            <TRNAMT>-2200</TRNAMT>
+            <FITID>C-0002</FITID>
+            <NAME>ｺｳｷﾞﾖｳ ﾃﾞﾝｷ</NAME>
+          </STMTTRN>
+          <STMTTRN>
+            <TRNTYPE>DEBIT</TRNTYPE>
+            <DTPOSTED>20261111</DTPOSTED>
+            <TRNAMT>-2200</TRNAMT>
+            <FITID>C-0003</FITID>
+            <CORRECTFITID>C-0002</CORRECTFITID>
+            <CORRECTACTION>DELETE</CORRECTACTION>
+            <NAME>ｺｳｷﾞﾖｳ ﾃﾞﾝｷ</NAME>
+          </STMTTRN>
+          <STMTTRN>
+            <TRNTYPE>DEBIT</TRNTYPE>
+            <DTPOSTED>20261115</DTPOSTED>
+            <TRNAMT>-12,50</TRNAMT>
+            <FITID>C-0004</FITID>
+            <NAME>SAMPLE STORE</NAME>
+            <CURRENCY><CURRATE>150</CURRATE><CURSYM>USD</CURSYM></CURRENCY>
+          </STMTTRN>
+          <STMTTRN>
+            <TRNTYPE>CREDIT</TRNTYPE>
+            <DTPOSTED>20261127</DTPOSTED>
+            <TRNAMT>3300</TRNAMT>
+            <FITID>C-0005</FITID>
+            <NAME>ｺﾞｼﾞﾂｾｲｻﾝ</NAME>
+            <MEMO>返金</MEMO>
+          </STMTTRN>
+        </BANKTRANLIST>
+        <LEDGERBAL><BALAMT>0</BALAMT><DTASOF>20261130</DTASOF></LEDGERBAL>
+      </CCSTMTRS>
+    </CCSTMTTRNRS>
+  </CREDITCARDMSGSRSV1>
+</OFX>

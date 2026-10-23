@@ -4,7 +4,9 @@
             ["fs" :as fs]
             [kaikei.encoding :as enc]
             [kaikei.ingest :as ingest]
-            [kaikei.mcp :as mcp]))
+            [kaikei.mcp :as mcp]
+            [kaikei.core]
+            [kaikei.compat.native]))
 
 (defn- call [tool args]
   (get (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "tools/call" "params" {"name" tool "arguments" args}}) "result"))
@@ -22,10 +24,11 @@
 (defn- fixture-text [f] (str (fs/readFileSync (str "test/fixtures/" f) "utf8")))
 (defn- fixture-base64 [f] (enc/bytes->base64 (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" f)))))
 
-(deftest lists-eight-tools
+(deftest lists-eleven-tools
   (let [tools (get-in (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "tools/list"}) ["result" "tools"])]
     (is (= ["kaikei_import" "kaikei_validate" "kaikei_report" "kaikei_export" "kaikei_convert"
-            "kaikei_invoice_totals" "kaikei_invoice_check" "kaikei_invoice_post"]
+            "kaikei_invoice_totals" "kaikei_invoice_check" "kaikei_invoice_post"
+            "kaikei_statement_check" "kaikei_statement_suggest" "kaikei_statement_post"]
            (map #(get % "name") tools)))
     (is (every? #(get-in % ["inputSchema" "type"]) tools))
     (is (not-any? #(contains? % "run") tools))))
@@ -127,3 +130,57 @@
       (testing "帳簿 JSON を受け渡しても id が変わらず、二重には計上しない"
         (is (= [] (get again "posted")))
         (is (= #{"already-posted"} (set (map #(get % "reason") (get again "skipped")))))))))
+
+;; ───────── 明細の tools（第 4 スライス、JUN-327） ─────────
+
+(def ^:private sample-ledger
+  (let [db (:db (kaikei.core/merge-import kaikei.core/empty-db kaikei.core/sample-import))]
+    (js->clj (.parse js/JSON (kaikei.compat.native/write db)))))
+
+(deftest statement-check
+  (let [r (ok "kaikei_statement_check" {"ledger" sample-ledger "as_of" "2027-01-31"})
+        a (first (get r "accounts"))]
+    (is (= ["a1" "サンプル銀行 普通 ****1234" 5 5 {"amount" 977650 "date" "2026-12-25"} 1003500 -25850]
+           ((juxt #(get % "id") #(get % "name") #(get % "lines") #(get % "open") #(get % "closing")
+                  #(get % "ledger_balance") #(get % "difference")) a)))
+    (is (= 5 (get r "open_lines")))
+    (is (= [0 0 0 59320 0] (get-in r ["aging" "sales" "totals"])))))
+
+(deftest statement-suggest-and-post
+  (let [s (ok "kaikei_statement_suggest" {"ledger" sample-ledger})
+        by-id (into {} (map (juxt #(get-in % ["line" "id"]) identity)) (get s "lines"))
+        l1 (by-id "l1")]
+    (testing "未処理の行ごとの候補。最初から選ぶのは有力が 1 件のとき"
+      (is (= ["l1" "l2" "l3" "l4" "l5"] (map #(get-in % ["line" "id"]) (get s "lines"))))
+      (is (= 0 (get l1 "preselected")))
+      (is (= {"type" "invoice" "allocations" [{"invoice_id" "i1" "amount" 59320}]}
+             (get-in l1 ["candidates" 0 "choice"])))
+      (is (= [] (get-in by-id ["l4" "candidates"])))
+      (is (nil? (get-in by-id ["l5" "preselected"]))))
+    (testing "承認した行だけを計上する（choice は候補のもの・自分で作ったもの・\"preselected\"）"
+      (let [p (ok "kaikei_statement_post"
+                  {"ledger" sample-ledger
+                   "approvals" [{"line_id" "l1" "choice" (get-in l1 ["candidates" 0 "choice"])}
+                                {"line_id" "l3" "choice" "preselected"}
+                                {"line_id" "l4" "choice" {"type" "account" "account" "消耗品費"
+                                                          "tax" {"category" "taxable" "kind" 0}}}
+                                {"line_id" "l5" "choice" "preselected"}]})]
+        (is (= ["l1" "l3" "l4"] (map #(get % "line_id") (get p "posted"))))
+        (is (= [{"line_id" "l5" "reason" "no-preselected" "message" "有力の候補が 1 つではありません"}] (get p "skipped")))
+        (testing "承認の無い l2 はそのまま（次の suggest でまだ未処理）"
+          (let [s2 (ok "kaikei_statement_suggest" {"ledger" (get p "ledger")})]
+            (is (= ["l2" "l5"] (map #(get-in % ["line" "id"]) (get s2 "lines"))))))
+        (testing "帳簿 JSON の往復で id が変わらない"
+          (let [c (ok "kaikei_statement_check" {"ledger" (get p "ledger")})]
+            (is (= 3 (get-in c ["accounts" 0 "posted"])))))))
+    (testing "入力の不正は tool の error"
+      (is (= "invalid-argument" (err "kaikei_statement_post" {"ledger" sample-ledger})))
+      (is (= "invalid-argument" (err "kaikei_statement_post" {"ledger" sample-ledger "approvals" [{"line_id" "l1" "choice" {"type" "pay"}}]})))
+      (is (= "unknown-argument" (err "kaikei_statement_suggest" {"ledger" sample-ledger "send" true}))))))
+
+(deftest statement-formats-through-mcp
+  (let [r (ok "kaikei_import" {"text" (fixture-text "ofx-bank.ofx")})]
+    (is (= ["ofx" 3] [(get r "format") (get r "statement_lines")]))
+    (let [x (ok "kaikei_export" {"ledger" (get r "ledger") "format" "freee-statement-csv"})]
+      (is (re-find #"^取引日,出金額,入金額,残高,取引内容" (get x "text")))))
+  (is (= "cannot-export" (err "kaikei_export" {"ledger" sample-ledger "format" "freee-statement-csv" "statement_account" "zz"}))))

@@ -3,7 +3,8 @@
 ;;
 ;; 判断コア guest（:effects #{}）を指す。imports は今のところ無し——
 ;; 仕訳の検証・試算表・P/L・B/S・請求書の税額（税率ごとに 1 回の端数処理、
-;; 第 3 スライス JUN-321）の判定は計算だけで、I/O（取り込み・保存・
+;; 第 3 スライス JUN-321）、明細の残高・消込・仕訳の候補の強さ（第 4
+;; スライス JUN-327）の判定は計算だけで、I/O（取り込み・保存・
 ;; 書き出し）はこの外の層が持つ。:limits の fuel は wasm にも焼き込む
 ;; （kaikei_journal.policy.edn。amu の既定 512 では帳票の判定が止まる）。
 ;; aiueos session/grant への配線は未実装（docs/aiueos-dapp.md の未実装境界を参照）。
@@ -37,6 +38,18 @@
                    :app/tax-share
                    :app/invoice-buffer-valid?
                    :app/registration-format?
-                   :app/deduction-percent}
+                   :app/deduction-percent
+                   :app/days-between
+                   :app/consumption-rate
+                   :app/aging-bucket
+                   :app/running-break
+                   :app/closing-gap
+                   :app/line-buffer-valid?
+                   :app/payment-kind
+                   :app/cover-count
+                   :app/allocate
+                   :app/date-fit
+                   :app/match-level
+                   :app/suggestion-level}
  :aiueos/effects #{}
  :aiueos/limits {:memory-pages 16 :fuel 5000000}}

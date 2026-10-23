@@ -1,0 +1,177 @@
+(ns kaikei.compat.ofx
+  "OFX（Open Financial Exchange）の明細 —— 1.x（SGML）と 2.x（XML）、Intuit の
+  QFX・QBO（Web Connect）。読むだけ（第 4 スライス、JUN-327）。
+
+  形の正本: OFX Banking Specification 2.3（Financial Data Exchange、2020-10-16）と
+  XSD、1.0.2・1.6 の仕様書。
+
+  - 1.x は `TAG:値` のヘッダの後に <OFX>。葉の要素（TRNAMT・FITID・NAME…）は
+    終わりのタグを省ける（1.6 §1.3.8）。2.x は XML で、終わりのタグがある。
+    どちらも 1 つの読み方で読む: 値の続くタグは葉、値の無いタグは集まり
+    （終わりのタグまで、か親の終わりのタグまで）。
+  - 銀行は BANKMSGSRSV1 > STMTTRNRS > STMTRS、カードは CREDITCARDMSGSRSV1 >
+    CCSTMTTRNRS > CCSTMTRS。行は BANKTRANLIST > STMTTRN。
+  - 金額は口座の持ち主から見た符号（2.3 §11.4.4.1。カードは利用が負、返済が正）。
+    小数点は `.` か `,`（桁区切りは無い。§3.2.9.1）。
+  - 日付は DTPOSTED の先頭 8 桁（YYYYMMDD）。時差は付いたまま読み、端末の時刻に
+    直さない（§3.2.8.4。Quicken も同じ）。
+  - 重複は（金融機関・口座・FITID）で見る（§3.2.3）。CORRECTFITID と
+    CORRECTACTION（REPLACE・DELETE）は訂正として渡す（kaikei.core の
+    merge-statements）。
+  - CURRENCY の付いた行は CURDEF に換算されていない（§5.2）ので、取り込まずに
+    数える（1 帳簿 1 通貨）。ORIGCURRENCY の行は換算済みなので取り込む。
+  - INTU.BID などのピリオドの入ったタグは私的なタグ（§2.7.1）で、読み飛ばす。
+  - 保留の行（BANKTRANLISTP の STMTTRNP）は記帳しない（§11.4.4.2）ので読まない。
+
+  未確認: 日本の OFX の文字コード（仕様は USASCII・UTF-8 だけ。取り込みは
+  BOM → UTF-8 → Shift_JIS の順に試す）。今 OFX を出す日本の銀行は見つから
+  なかった（みずほは 2024-11-10 に廃止）。JCB（カード）は出す。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]))
+
+(defn detect-text?
+  "テキストが OFX か（1.x のヘッダか、<OFX> があるか）。"
+  [s]
+  (boolean (text/re-find #"OFXHEADER\s*[:=]|<OFX>" (text/upper (or s "")))))
+
+(defn- unescape [s]
+  (-> s
+      (text/replace "&lt;" "<")
+      (text/replace "&gt;" ">")
+      (text/replace "&nbsp;" " ")
+      (text/replace "&apos;" "'")
+      (text/replace "&quot;" "\"")
+      (text/replace "&amp;" "&")))
+
+(defn parse-tree
+  "OFX の本文 → 木（{:tag \"OFX\" :children […]}。葉は {:tag :value}）。"
+  [s]
+  (let [start (or (text/index-of (text/upper s) "<OFX>") 0)
+        body (subs s start)
+        tokens (text/re-seq #"<(/?)([A-Za-z0-9.]+)>([^<]*)" body)
+        root {:tag "ROOT" :children []}]
+    (loop [stack [root] ts tokens]
+      (if-let [[_ closing tag value] (first ts)]
+        (let [tag (text/upper tag)
+              value (text/trim (or value ""))]
+          (cond
+            (= "/" closing)
+            (let [i (last (keep-indexed (fn [i n] (when (= tag (:tag n)) i)) stack))]
+              (if (and i (pos? i))
+                ;; 閉じる集まりと、その中の閉じていない集まりをまとめて親に付ける
+                (let [closed (reduce (fn [child parent] (update parent :children conj child))
+                                     (peek stack)
+                                     (reverse (subvec stack i (dec (count stack)))))
+                      parent (update (nth stack (dec i)) :children conj closed)]
+                  (recur (conj (subvec stack 0 (dec i)) parent) (rest ts)))
+                ;; 葉の終わりのタグ（2.x）・知らない終わりのタグは読み飛ばす
+                (recur stack (rest ts))))
+            (not= "" value)
+            (recur (update stack (dec (count stack)) update :children conj {:tag tag :value (unescape value)})
+                   (rest ts))
+            :else
+            (recur (conj stack {:tag tag :children []}) (rest ts))))
+        ;; 閉じていない集まりを閉じる
+        (reduce (fn [child parent] (update parent :children conj child))
+                (peek stack)
+                (reverse (pop stack)))))))
+
+(defn- children [node tag] (filter #(= tag (:tag %)) (:children node)))
+(defn- child [node tag] (first (children node tag)))
+(defn- value [node tag] (:value (child node tag)))
+
+(defn- find-all
+  "木の中の tag の集まりをすべて（深さ優先）。"
+  [node tag]
+  (concat (when (= tag (:tag node)) [node])
+          (mapcat #(find-all % tag) (filter :children (:children node)))))
+
+(defn- ofx-date [s]
+  (some->> s (text/re-find #"^\d{8}") core/parse-date))
+
+(defn- ofx-amount
+  "TRNAMT・BALAMT → 最小通貨単位。小数点は . か ,（桁区切りは無い）。"
+  [s exp]
+  (let [s (text/trim (str s))
+        s (if (and (text/includes? s ",") (not (text/includes? s "."))) (text/replace s "," ".") s)
+        s (text/replace s #"^\+" "")]
+    (core/parse-amount s exp)))
+
+(defn- tail [s n] (let [s (str s)] (if (> (count s) n) (subs s (- (count s) n)) s)))
+
+(defn- read-line* [tr exp where]
+  (let [date (ofx-date (value tr "DTPOSTED"))
+        {:keys [amount error]} (ofx-amount (value tr "TRNAMT") exp)
+        name (or (value tr "NAME") (some-> (child tr "PAYEE") (value "NAME")))
+        memo (value tr "MEMO")
+        extd (value tr "EXTDNAME")
+        fitid (value tr "FITID")
+        correct (value tr "CORRECTFITID")
+        action (some-> (value tr "CORRECTACTION") text/upper)]
+    (cond
+      (child tr "CURRENCY") {:problem (str where ": 別の通貨（" (some-> (child tr "CURRENCY") (value "CURSYM"))
+                                           "）の行は取り込みません（1 帳簿 1 通貨）")}
+      (nil? date) {:problem (str where ": DTPOSTED \"" (value tr "DTPOSTED") "\" を読めません")}
+      error {:problem (str where ": TRNAMT \"" (value tr "TRNAMT") "\" を読めません")}
+      :else
+      {:line (cond-> {:date date :amount amount
+                      :description (text/join " " (distinct (remove text/blank? [(or extd name) memo])))
+                      :origin (cond-> {:format :ofx} fitid (assoc :fitid fitid))}
+               name (assoc :counterparty name)
+               (or (value tr "CHECKNUM") (value tr "REFNUM")) (assoc :reference (or (value tr "CHECKNUM") (value tr "REFNUM")))
+               fitid (assoc :uid fitid)
+               (value tr "TRNTYPE") (assoc :hints {:trntype (value tr "TRNTYPE")})
+               (and correct (#{"REPLACE" "DELETE"} action))
+               (assoc :correct {:uid correct :action (if (= "DELETE" action) :delete :replace)}))})))
+
+(defn read-text
+  "OFX の文字列 → 取り込み結果（:statement-accounts :statement-lines）。"
+  [s]
+  (let [tree (parse-tree s)
+        fi (when-let [f (first (find-all tree "FI"))]
+             (not-empty (text/join "-" (remove nil? [(value f "ORG") (value f "FID")]))))
+        stmts (concat (map #(vector :bank %) (find-all tree "STMTRS"))
+                      (map #(vector :card %) (find-all tree "CCSTMTRS")))
+        currency (some (fn [[_ st]] (value st "CURDEF")) stmts)
+        results
+        (map-indexed
+         (fn [i [kind st]]
+           (let [cur (value st "CURDEF")
+                 exp (core/exponent cur)
+                 acct (or (child st "BANKACCTFROM") (child st "CCACCTFROM"))
+                 acct-id (value acct "ACCTID")
+                 type (or (value acct "ACCTTYPE") (if (= kind :card) "CREDITCARD" ""))
+                 id (str "s" (inc i))
+                 bal (child st "LEDGERBAL")
+                 bal-amount (when bal (ofx-amount (value bal "BALAMT") (or exp 0)))
+                 trs (mapcat #(children % "STMTTRN") (children st "BANKTRANLIST"))]
+             (cond
+               (nil? exp) {:warnings [(str "明細 " (inc i) ": 通貨 " cur " の桁を知らないので取り込みません")]
+                           :rejected (count trs)}
+               (not= cur currency) {:warnings [(str "明細 " (inc i) ": 通貨 " cur " は最初の明細の " currency
+                                                    " と違うので取り込みません（1 帳簿 1 通貨）")]
+                                    :rejected (count trs)}
+               :else
+               (let [parts (map-indexed (fn [j tr] (read-line* tr exp (str "明細 " (inc i) " の行 " (inc j)))) trs)]
+                 {:account (cond-> {:id id :kind kind
+                                    :key (str "ofx:" (or fi (value acct "BANKID") "") ":" (tail acct-id 4) ":" type)
+                                    :name (str "OFX " (if (= kind :card) "カード" "預金") " ****" (tail acct-id 4))
+                                    :ledger-account (if (= kind :card) "未払金" "普通預金")
+                                    :currency cur
+                                    :origin {:format :ofx}}
+                             (and bal (not (:error bal-amount)) (ofx-date (value bal "DTASOF")))
+                             (assoc :statement-balance {:amount (:amount bal-amount) :date (ofx-date (value bal "DTASOF"))}))
+                  :lines (vec (for [{:keys [line]} parts :when line] (assoc line :account-id id)))
+                  :warnings (vec (keep :problem parts))
+                  :rejected (count (filter :problem parts))}))))
+         stmts)]
+    (if (empty? stmts)
+      {:format :ofx :entries [] :accounts [] :rejected 0
+       :warnings ["OFX に銀行・カードの明細（STMTRS・CCSTMTRS）がありません"]}
+      {:format :ofx
+       :currency currency
+       :accounts []
+       :statement-accounts (vec (keep :account results))
+       :statement-lines (vec (mapcat :lines results))
+       :warnings (vec (mapcat :warnings results))
+       :rejected (reduce + 0 (map #(:rejected % 0) results))})))

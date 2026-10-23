@@ -26,7 +26,16 @@
     zoho-invoice-json        Zoho Invoice API v3 の invoice（読むだけ）
     freshbooks-invoice-json  FreshBooks の invoices・bills（読むだけ）
 
-  :content は :journal（仕訳と勘定科目）・:invoices（請求書）・:all（kaikei-json）。
+  明細の形式（第 4 スライス、JUN-327。:content :statements）:
+
+    ofx                  OFX 1.x・2.x、QFX・QBO（銀行・カードの明細。読むだけ）
+    freee-statement-csv  freee 会計の明細のテンプレート（銀行・カード）
+    mf-statement-csv     マネーフォワード クラウド会計の明細の取り込み
+    xero-statement-csv   Xero の明細の CSV
+    qbo-bank-csv         QuickBooks Online の明細の CSV（3 列・4 列）
+
+  :content は :journal（仕訳と勘定科目）・:invoices（請求書）・:statements（明細）・
+  :all（kaikei-json）。明細の形式の書き出しは口座ごと（opts の :statement-account）。
   :read-only の形式は書き出さない。Xero の bills の CSV は見出しが customer invoices
   と同じなので、自動の判定では売上の請求書として読む（受け取った請求書は形式を選ぶ）。
 
@@ -47,7 +56,9 @@
             [kaikei.compat.freshbooks-invoices :as freshbooks-invoices]
             [kaikei.compat.yayoi :as yayoi]
             [kaikei.compat.mf :as mf]
-            [kaikei.compat.freee :as freee]))
+            [kaikei.compat.freee :as freee]
+            [kaikei.compat.ofx :as ofx]
+            [kaikei.compat.statement-csv :as statement-csv]))
 
 (def formats
   [{:id "kaikei-json" :label "kaikei 帳簿 JSON（すべての項目）" :kind :json :encoding "utf-8" :content :all
@@ -87,7 +98,17 @@
    {:id "zoho-invoice-json" :content :invoices :read-only true :label "Zoho Invoice API JSON（invoice、読むだけ）"
     :kind :json :encoding "utf-8"}
    {:id "freshbooks-invoice-json" :content :invoices :read-only true :label "FreshBooks API JSON（invoices・bills、読むだけ）"
-    :kind :json :encoding "utf-8"}])
+    :kind :json :encoding "utf-8"}
+   {:id "ofx" :content :statements :read-only true :label "OFX・QFX・QBO（銀行・カードの明細、読むだけ）"
+    :kind :ofx :encoding "utf-8"}
+   {:id "freee-statement-csv" :content :statements :label "freee 会計 明細 CSV（銀行・カードのテンプレート）" :kind :csv
+    :encoding "utf-8" :encodings ["utf-8" "utf-8-bom" "shift_jis"] :file "kaikei-freee-statement.csv" :mime "text/csv"}
+   {:id "mf-statement-csv" :content :statements :label "マネーフォワード クラウド会計 明細 CSV" :kind :csv
+    :encoding "shift_jis" :encodings ["shift_jis" "utf-8"] :file "kaikei-moneyforward-statement.csv" :mime "text/csv"}
+   {:id "xero-statement-csv" :content :statements :label "Xero 明細 CSV（bank statement）" :kind :csv
+    :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-xero-statement.csv" :mime "text/csv"}
+   {:id "qbo-bank-csv" :content :statements :label "QuickBooks Online 明細 CSV（bank transactions）" :kind :csv
+    :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-quickbooks-bank.csv" :mime "text/csv"}])
 
 (def format-ids (mapv :id formats))
 
@@ -97,8 +118,14 @@
 
 (def export-format-ids (mapv :id export-formats))
 
+(def ledger-export-formats
+  "帳簿全体を書き出す形式（画面のツールバー）。明細の形式は口座ごとに「明細」タブから。"
+  (filterv #(not= :statements (:content %)) export-formats))
+
+(def statement-export-formats (filterv #(= :statements (:content %)) export-formats))
+
 (defn content-formats
-  "content（:journal・:invoices）を書ける形式。kaikei-json はどちらにも入る。"
+  "content（:journal・:invoices・:statements）を書ける形式。kaikei-json はどれにも入る。"
   [content]
   (filterv #(#{content :all} (:content %)) formats))
 
@@ -128,6 +155,12 @@
 
 (defn detect-csv [rows]
   (cond
+    ;; 明細の CSV は見出しが短いので、仕訳・請求書の形（見出しに勘定科目や請求書番号が
+    ;; ある）と重ならない条件だけで見る
+    (statement-csv/freee-kind rows) "freee-statement-csv"
+    (statement-csv/mf-detect? rows) "mf-statement-csv"
+    (statement-csv/qbo-detect? rows) "qbo-bank-csv"
+    (statement-csv/xero-detect? rows) "xero-statement-csv"
     (freee-invoices/csv-detect? rows) "freee-invoice-csv"
     (mf-invoices/csv-detect? rows) "mf-invoice-csv"
     (xero-invoices/csv-detect? rows) "xero-invoice-csv"
@@ -151,13 +184,16 @@
   :date-order QBO・Xero の CSV の数だけの日付の並び（\"mdy\"・\"dmy\"。無ければ推す）"
   [s {:keys [format currency date-order] :or {format "auto" currency "JPY"}}]
   (let [opts (cond-> {:currency currency} date-order (assoc :date-order date-order))
+        ofx? (or (= format "ofx") (and (= format "auto") (ofx/detect-text? s)))
         json-format? (= :json (:kind (format-by-id format)))
         data (when (or json-format? (and (= format "auto") (json-text? s)))
                (try (json/parse s) (catch #?(:cljs :default :clj Exception) e ::bad)))
         ;; 形式を指定したら、その形式の種類（JSON か CSV）で読む。判定に任せるときは、
         ;; [ で始まっても JSON として読めないもの（freee の [表題行]）を CSV として読む。
         json? (if (= format "auto") (and (some? data) (not= data ::bad)) json-format?)]
-    (if json?
+    (cond
+      ofx? (ofx/read-text s)
+      json?
       (if (= data ::bad)
         (empty-result format "JSON として読めません")
         (let [fmt (if (= format "auto") (detect-json data) format)]
@@ -174,6 +210,7 @@
             (empty-result fmt (if (nil? fmt)
                                 "JSON の形を判定できません（kaikei の帳簿 JSON、Xero の Accounts・Journals・ManualJournals・Invoices、QBO の query の応答のどれでもありません）"
                                 (str (:label (format-by-id fmt)) " は JSON ではありません"))))))
+      :else
       (let [rows (csv/parse s)
             fmt (if (= format "auto") (detect-csv rows) format)]
         (case fmt
@@ -187,6 +224,12 @@
           "qbo-invoice-csv" (qbo-invoices/read-csv rows opts)
           "freee-invoice-csv" (freee-invoices/read-csv rows)
           "mf-invoice-csv" (mf-invoices/read-csv rows)
+          "freee-statement-csv" (if (statement-csv/freee-kind rows)
+                                  (statement-csv/read-freee rows)
+                                  (empty-result fmt "freee の明細のテンプレートの見出し（取引日・出金額・入金額・取引内容、カードは取引日・取引金額・取引内容）がありません"))
+          "mf-statement-csv" (statement-csv/read-mf rows)
+          "xero-statement-csv" (statement-csv/read-xero rows opts)
+          "qbo-bank-csv" (statement-csv/read-qbo rows opts)
           (empty-result fmt (if (nil? fmt)
                               "CSV の形を判定できません。形式を選んでから取り込んでください"
                               (str (:label (format-by-id fmt)) " は CSV ではありません"))))))))

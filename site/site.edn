@@ -10,8 +10,8 @@
 ;;   <script type="application/x-scittle"> に並ぶ。scittle は同じ SCI 文脈で
 ;;   順に評価するので、require される側を先に置く。
 ;; - (kaikei.page/document opts) が完全な HTML を返す。
-{:title "kaikei — 会計帳簿と請求書（MF・freee・弥生・QuickBooks・Xero 互換）"
- :description "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作る。請求書を作って適格請求書の記載事項を確かめ、売掛金・買掛金の仕訳として計上する。データは送信されず、この端末のブラウザの中（IndexedDB）にだけ残る。"
+{:title "kaikei — 会計帳簿・請求書・明細の消込（MF・freee・弥生・QuickBooks・Xero 互換）"
+ :description "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作る。請求書を作って適格請求書の記載事項を確かめ、売掛金・買掛金の仕訳として計上する。自分で落とした銀行・カードの明細（OFX・各社の明細 CSV）を取り込み、請求書の消込と仕訳の候補を確かめてから計上する。データは送信されず、この端末のブラウザの中（IndexedDB）にだけ残る。"
  :page {:ns kaikei.page :fn document}
  :vendor ["react.production.min.js" "react-dom.production.min.js"
           "scittle.js" "scittle.reagent.js" "scittle.re-frame.js"]
@@ -22,6 +22,7 @@
            {:from "src/kaikei/csv.cljk" :to "kaikei/csv.cljs"}
            {:from "src/kaikei/encoding.cljk" :to "kaikei/encoding.cljs"}
            {:from "src/kaikei/invoice.cljk" :to "kaikei/invoice.cljs"}
+           {:from "src/kaikei/statement.cljk" :to "kaikei/statement.cljs"}
            {:from "src/kaikei/compat/common.cljk" :to "kaikei/compat/common.cljs"}
            {:from "src/kaikei/compat/native.cljk" :to "kaikei/compat/native.cljs"}
            {:from "src/kaikei/compat/xero.cljk" :to "kaikei/compat/xero.cljs"}
@@ -35,6 +36,8 @@
            {:from "src/kaikei/compat/yayoi.cljk" :to "kaikei/compat/yayoi.cljs"}
            {:from "src/kaikei/compat/mf.cljk" :to "kaikei/compat/mf.cljs"}
            {:from "src/kaikei/compat/freee.cljk" :to "kaikei/compat/freee.cljs"}
+           {:from "src/kaikei/compat/ofx.cljk" :to "kaikei/compat/ofx.cljs"}
+           {:from "src/kaikei/compat/statement_csv.cljk" :to "kaikei/compat/statement_csv.cljs"}
            {:from "src/kaikei/ingest.cljk" :to "kaikei/ingest.cljs"}
            {:from "src/kaikei/export.cljk" :to "kaikei/export.cljs"}
            {:from "src/kaikei/view.cljk" :to "kaikei/view.cljs"}

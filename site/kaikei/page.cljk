@@ -20,10 +20,10 @@
             [kaikei.core :as core]
             [kaikei.view :as view]))
 
-(def ^:private site-title "kaikei — 会計帳簿と請求書（MF・freee・弥生・QuickBooks・Xero 互換）")
+(def ^:private site-title "kaikei — 会計帳簿・請求書・明細の消込（MF・freee・弥生・QuickBooks・Xero 互換）")
 
 (def ^:private site-description
-  "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作ります。請求書を作り、適格請求書の記載事項を確かめて計上できます。データは送信されません。")
+  "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作ります。請求書を作り、適格請求書の記載事項を確かめて計上できます。自分で落とした銀行・カードの明細を取り込み、請求書の消込と仕訳の候補を確かめてから計上できます。データは送信されません。")
 
 (def app-css
   "DADS の上に載せる配置だけ。色は DADS の custom property から引く。"
@@ -62,6 +62,10 @@
 .kk-bs{display:grid;grid-template-columns:minmax(0,1fr);gap:1rem;}
 @media (min-width:64rem){.kk-bs{grid-template-columns:minmax(0,1fr) minmax(0,1fr);}}
 .kk-row--warn{background:var(--color-primitive-yellow-50,#fffbe6);}
+.kk-row--selected{background:var(--color-primitive-blue-50,#eef4ff);}
+.kk-candidates{list-style:none;margin:0;padding:0;display:grid;gap:.5rem;}
+.kk-candidate{border:1px solid var(--color-neutral-solid-gray-200,#ddd);border-radius:.5rem;padding:.5rem .75rem;}
+.kk-candidate p{margin:.25rem 0;overflow-wrap:anywhere;}
 .kk-link{border:0;background:transparent;padding:0;font:inherit;color:var(--color-primitive-blue-900,#0031d8);text-decoration:underline;cursor:pointer;text-align:left;}
 .kk-entries{list-style:none;margin:0;padding:0;}
 .kk-entry{border-bottom:1px solid var(--color-neutral-solid-gray-200,#ddd);padding:.75rem 0;}

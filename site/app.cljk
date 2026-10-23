@@ -21,6 +21,7 @@
             [kaikei.ingest :as ingest]
             [kaikei.export :as export]
             [kaikei.invoice :as invoice]
+            [kaikei.statement :as statement]
             [kaikei.view :as view]))
 
 (def storage-key "itonami.kaikei.v1")
@@ -149,7 +150,8 @@
              (not= (saved-state db) (saved-state db')))
          (assoc ::store {:backend (:backend db')
                          :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db')))
-                                          (seq (:invoices (:data db'))) (seq (:business (:data db'))))
+                                          (seq (:invoices (:data db'))) (seq (:business (:data db')))
+                                          (seq (:statement-lines (:data db'))) (seq (:rules (:data db'))))
                                   (saved-state db'))}))))))
 
 (defn- reg-ui-event [id f]
@@ -193,14 +195,17 @@
 
 (defn- import-into [db result]
   (let [mode (if (= "replace" (get-in db [:ui :import-mode])) :replace :append)
-        {data :db :keys [added duplicates error] :as merged} (core/merge-import (:data db) result mode)]
+        {data :db :keys [added duplicates error] :as merged}
+        (core/merge-import (:data db) result mode {:statement-account (get-in db [:ui :import-account] "auto")})]
     (-> db
         (assoc :data data)
         (update :ui assoc
-                :import-result (merge (select-keys result [:format :encoding :rejected :warnings :invoices-rejected])
-                                      {:added added :duplicates duplicates :error error}
-                                      (select-keys merged [:invoices-added :invoices-duplicates :invoices-dropped]))
-                :import-open? (zero? (+ (or added 0) (or (:invoices-added merged) 0)))
+                :import-result (merge (select-keys result [:format :encoding :rejected :invoices-rejected])
+                                      {:added added :duplicates duplicates :error error
+                                       :warnings (vec (concat (:warnings result) (:warnings merged)))}
+                                      (select-keys merged [:invoices-added :invoices-duplicates :invoices-dropped
+                                                           :lines-added :lines-duplicates :lines-corrected :lines-dropped]))
+                :import-open? (zero? (+ (or added 0) (or (:invoices-added merged) 0) (or (:lines-added merged) 0)))
                 :period nil
                 :journal-page 0))))
 
@@ -332,6 +337,135 @@
 
 (rf/reg-event-fx :print-invoice (fn [_ _] {::print true}))
 
+;; ───────── 明細（第 4 スライス、JUN-327） ─────────
+
+(reg-ui-event :set-ui (fn [db [_ k v]] (assoc-in db [:ui k] v)))
+(reg-ui-event :toggle-ui (fn [db [_ k]] (update-in db [:ui k] not)))
+(reg-ui-event :show-statements (fn [db [_ f]] (update db :ui assoc :mode :statements :statement-filter (or f "open") :statement-page 0)))
+(reg-ui-event :select-statement-account
+              (fn [db [_ id]] (update db :ui assoc :statement-account id :statement-line nil :statement-selected #{} :statement-page 0)))
+(reg-ui-event :set-statement-filter
+              (fn [db [_ v]] (update db :ui assoc :statement-filter v :statement-page 0 :statement-selected #{})))
+(reg-ui-event :close-statement-line (fn [db _] (update db :ui assoc :statement-line nil :statement-line-result nil)))
+(reg-ui-event :dismiss-statement-result (fn [db _] (assoc-in db [:ui :statement-result] nil)))
+(reg-ui-event :toggle-statement-select
+              (fn [db [_ id checked]] (update-in db [:ui :statement-selected] (fnil (if checked conj disj) #{}) id)))
+(reg-ui-event :set-statement-form (fn [db [_ k v]] (assoc-in db [:ui :statement-form k] v)))
+(reg-ui-event :set-rule-draft (fn [db [_ k v]] (update db :ui #(-> % (assoc-in [:rule-draft k] v) (dissoc :rule-conflicts)))))
+
+(reg-ui-event
+ :select-statement-line
+ (fn [db [_ id]]
+   ;; 科目の欄は規則の候補で埋めておく（承認は利用者が押すまでしない）
+   (let [data (:data db)
+         line (statement/line-by-id data id)
+         s (when line (statement/rule-suggestion data line))]
+     (update db :ui assoc :statement-line id :statement-line-result nil :statement-fee-rate ""
+             :statement-form {:account (if (= 3 (:level s)) (or (:account s) "") "")
+                              :tax (if (:tax s) (view/tax->choice (:tax s)) "taxable-0")
+                              :partner (or (:partner s) "") :qualified? (boolean (:qualified? s)) :make-rule? false}))))
+
+(reg-ui-event
+ :select-strong-statements
+ (fn [db _]
+   (let [sd (view/derive-statements (:data db) (:ui db))]
+     (assoc-in db [:ui :statement-selected]
+               (set (for [{:keys [line candidates]} (:rows sd) :when (:preselected candidates)] (:id line)))))))
+
+(defn- after-statement [db {data :db :as r}]
+  (-> db
+      (assoc :data data)
+      (update :ui assoc :statement-line-result (dissoc r :db) :period nil)))
+
+(reg-data-event
+ :post-statement-candidate
+ (fn [db [_ line-id i]]
+   (let [data (:data db)
+         line (statement/line-by-id data line-id)
+         {:keys [candidates preselected]} (statement/candidates data line)
+         c (nth candidates i nil)
+         fee-rate (parse-long (str (get-in db [:ui :statement-fee-rate])))]
+     (if c
+       (after-statement db (statement/post-line data line-id (cond-> (assoc c :as-suggested? (= c preselected))
+                                                                fee-rate (assoc :fee-rate fee-rate))))
+       db))))
+
+(reg-data-event
+ :post-statement-form
+ (fn [db [_ line-id]]
+   (let [form (get-in db [:ui :statement-form])
+         data (:data db)
+         line (statement/line-by-id data line-id)
+         s (statement/rule-suggestion data line)
+         choice (cond-> {:type :account :account (:account form) :tax (view/tax-choice->tax (:tax form))
+                         :partner (:partner form) :qualified? (:qualified? form) :make-rule? (:make-rule? form)}
+                  (= :user (:source s)) (assoc :rule-id (:rule-id s)
+                                               :as-suggested? (= (:account s) (text/trim (str (:account form))))))]
+     (after-statement db (statement/post-line data line-id choice)))))
+
+(reg-data-event :exclude-statement-line
+                (fn [db [_ id]] (after-statement db (statement/post-line (:data db) id {:type :exclude}))))
+(reg-data-event :unpost-statement-line
+                (fn [db [_ id]] (-> db (assoc :data (statement/unpost-line (:data db) id))
+                                    (update :ui assoc :statement-line-result nil :period nil))))
+
+(reg-data-event
+ :post-selected-statements
+ (fn [db _]
+   (let [ids (vec (get-in db [:ui :statement-selected]))
+         {data :db :keys [posted skipped]} (statement/post-preselected (:data db) ids)]
+     (-> db
+         (assoc :data data)
+         (update :ui assoc :statement-selected #{} :statement-result {:posted posted :skipped skipped} :period nil)))))
+
+(reg-data-event
+ :add-rule
+ (fn [db _]
+   (let [{:keys [text op direction account tax]} (get-in db [:ui :rule-draft])
+         rule {:when (cond-> {:text (text/trim (str text)) :op (keyword op)}
+                       (not (text/blank? (str direction))) (assoc :direction (keyword direction)))
+               :then {:account (text/trim (str account)) :tax (view/tax-choice->tax tax)}}
+         conflicts (statement/rule-conflicts (:data db) rule)]
+     (if (and (seq conflicts) (not= conflicts (get-in db [:ui :rule-conflicts])))
+       ;; 別の科目に記帳した摘要にも当たるときは、1 度だけ知らせる（もう 1 度押すと足す）
+       (assoc-in db [:ui :rule-conflicts] conflicts)
+       (-> db
+           (update :data statement/add-rule rule)
+           (update :ui assoc :rule-conflicts nil :rule-draft (:rule-draft view/initial-ui)))))))
+
+(reg-data-event :delete-rule (fn [db [_ id]] (update db :data statement/delete-rule id)))
+(reg-data-event :move-rule (fn [db [_ id delta]] (update db :data statement/move-rule id delta)))
+
+(reg-data-event
+ :set-statement-setting
+ (fn [db [_ k v]]
+   (case k
+     :fee-treatment (assoc-in db [:data :statement-settings :fee-treatment] (keyword v))
+     :max-fee (if-let [n (parse-long (text/trim (str v)))]
+                (assoc-in db [:data :statement-settings :max-fee] (max 0 n))
+                db)
+     :fee-account (assoc-in db [:data :statement-settings :accounts :fee] v)
+     :discount-account (assoc-in db [:data :statement-settings :accounts :discount] v)
+     db)))
+
+(reg-data-event
+ :delete-alias
+ (fn [db [_ partner k]]
+   (update-in db [:data :statement-settings :aliases partner] (fn [ks] (vec (remove #{k} ks))))))
+
+(reg-data-event
+ :set-statement-account-field
+ (fn [db [_ id field v]]
+   (update db :data statement/set-account-field id field (if (= field :kind) (keyword v) v))))
+
+(rf/reg-event-fx
+ :export-statements
+ (fn [{:keys [db]} [_ account-id]]
+   (let [ui (:ui db)
+         result (export/export (:data db) (:statement-export-format ui) {:statement-account account-id})]
+     (cond-> {:db (assoc-in db [:ui :export-result] (select-keys result [:error :notes :filename]))}
+       (:bytes result) (assoc ::download (select-keys result [:filename :mime :bytes]))))))
+
 ;; ───────── subscription / 描画 ─────────
 
 (rf/reg-sub ::data (fn [db _] (:data db)))
@@ -340,6 +474,11 @@
 ;; 期間は値（{:from :to}）なので、ui の他の欄が変わっても帳票は計算し直さない
 (rf/reg-sub ::period :<- [::data] :<- [::ui] (fn [[data ui] _] (view/period data ui)))
 (rf/reg-sub ::derived :<- [::data] :<- [::period] (fn [[data p] _] (view/derive data p)))
+
+;; 明細のタブの値は、帳簿か明細のタブの表示（口座・絞り込み・ページ）が変わったときだけ
+(rf/reg-sub ::statement-view-ui (fn [db _] (select-keys (:ui db) [:statement-account :statement-filter :statement-page :mode])))
+(rf/reg-sub ::statements :<- [::data] :<- [::statement-view-ui]
+            (fn [[data sui] _] (when (= :statements (:mode sui)) (view/derive-statements data sui))))
 
 (defn- handlers
   "kaikei.view の h。ev は re-frame の event ベクタ。"
@@ -354,13 +493,14 @@
 (defn root []
   (let [data @(rf/subscribe [::data])
         ui @(rf/subscribe [::ui])
-        derived @(rf/subscribe [::derived])]
+        derived @(rf/subscribe [::derived])
+        statements @(rf/subscribe [::statements])]
     [:<>
      (when-let [e (:store-error ui)]
        [:p {:class "kk-warnings kk-app" :role "alert"}
         (str "この端末に保存できませんでした（" e "）。書き出して手元に残してください。")])
      ;; :booting? の間は SSR と同じ「読み込んでいます」を描く（保存の読み出しは非同期）
-     (view/root {:data data :ui ui} derived handlers)]))
+     (view/root (cond-> {:data data :ui ui} statements (assoc :statements statements)) derived handlers)]))
 
 (rf/dispatch-sync [:init])
 (rdom/render [root] (.getElementById js/document "app"))
