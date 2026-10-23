@@ -576,6 +576,34 @@ kaikei.ledger.v1 には任意のキー（`statement_accounts`・`statement_lines
     楽天銀行、住信 SBI、PayPay 銀行、ゆうちょ BizDirect（列の名前だけ確かめた）、楽天カード、
     Vpass（見出しなし。自動では選ばない）。
 
+### 経費・買掛（判断 6、3 つ目の PR。読むだけ）
+
+| id | 形式 | 読むもの | 形の正本（2026-10-23 に取得） |
+|---|---|---|---|
+| `ramp-json` | Ramp Developer API の一覧（`{"data", "page"}`） | カードの取引 → カードの口座、立替 → 立替経費の口座、請求書 → 仕入の請求書 | Ramp の OpenAPI `developer-api.json`（info.version v1、sha256 `a2a3e577…`）、ガイド「Monetary Values」 |
+| `brex-json` | Brex の一覧（`{"items", "next_cursor"}`） | カードの取引 → カード、立替（expense_type REIMBURSEMENT）→ 立替経費 | Transactions API 1.0・Expenses API 0.1 の OpenAPI |
+| `expensify-csv` | kaikei の template で Report Exporter から書き出した CSV | 立替 → 立替経費、会社のカードの経費 → カード | Expensify Integration Server の文書（template の項目） |
+| `bill-json` | BILL v3 の請求書（`{"results"}`、1 件の応答も） | 仕入の請求書 | BILL v3 API reference（2026-06-29）、ap-bills ガイド（2026-03-24） |
+
+- 金額: Ramp・Brex・Expensify は最小単位の整数（Expensify はセントを帳簿の通貨の桁に直す）、
+  BILL は 10 進の主単位。帳簿と違う通貨の行は読まない（1 帳簿 1 通貨。多くは USD の帳簿向け）。
+- 向き: Ramp のカードは entity_amount の符号（利用が正・返金が負）を kaikei の向き（利用が負）に、
+  立替は direction で。Brex のカードは返金の符号が書かれていないので type で（COLLECTION は
+  カードの支払で正）。Expensify は経費が正・返金が負。
+- 記帳しないもの: Ramp の DECLINED・PENDING など、Brex の CARD・BILLPAY・CLAWBACK の経費（カードの
+  経費はカードの取引で読む）と承認前の立替、Expensify の Open・Processing のレポート。数えて警告する。
+- 請求書（Ramp・BILL）は税の項目が無いので「税なし」で読む。BILL の請求書には通貨の項目が無いので、
+  帳簿の通貨とみなして警告する。消込むときは第 3 スライスの請求書と同じ（まだ計上していなければ
+  先に計上）。
+- 取り込み元の科目・分類（Ramp の accounting_field_selections の GL_ACCOUNT、Expensify の category）は
+  「中」の候補（取り込み元の科目）にする。最初からは選ばない。Expensify の税額は、科目を選んで計上する
+  ときに使い、kaikei の計算と違えば知らせる。
+- カードと立替: カードの口座・立替経費の口座の帳簿の科目は既定で「未払金」（口座ごとに変えられる）。
+  カードの引き落とし（預金の出金とカードの口座の支払の行）は振替の候補で結ぶ。Expensify の会社の
+  カードの経費はカードの明細と同じものなので、両方を取り込むなら一方を計上する（警告を出す）。
+- 書き出さない（判断 6）。各社とも、書き出しても利用者が先方に入れる経路が無い。
+- Expensify の template は `src/kaikei/compat/expensify.cljk` の `template`（画面の取り込みの欄にも出す）。
+
 ### 取り込んだ元のファイル（判断 5、2 つ目の PR）
 
 - ファイル選択で取り込んで明細の行が増えたとき、元のバイト列を IndexedDB の `files` の store
@@ -609,6 +637,9 @@ kaikei.ledger.v1 には任意のキー（`statement_accounts`・`statement_lines
   固定長の正式な仕様書は公開されていない（全銀協の XML の文書の対応表と銀行の仕様で読んだ）。
 - 汎用 CSV の未確認の型（上）。みずほ・三井住友 Value Door・りそなの形は一次資料が無く、型に
   入れていない（列を割り当てて読む）。
+- 経費・買掛: Ramp・Brex の見本の応答はほとんど公開されていない（fixture は schema から作った）。
+  Brex の REFUND の額の符号。Expensify の template を Expensify で動かしていないことと、Report
+  Exporter の金額の符号・taxAmount の単位（セントと推す）。BILL の請求書の通貨。
 
 ### 実測（2026-10-23、1 つ目の PR）
 
@@ -649,3 +680,15 @@ kaikei.ledger.v1 には任意のキー（`statement_accounts`・`statement_lines
     2 行とも重複。
   - 元のファイルを消す → IndexedDB からも消え、明細の行は残る。
   - 375px で割り当ての欄に横スクロールなし。console のエラーは無し。
+
+### 実測（2026-10-23、3 つ目の PR）
+
+- `npm test`（kbb）→ **129 tests, 1214 assertions, 0 failures**（Ramp・Brex・Expensify・BILL の取り込み、
+  記帳しないもの、向き、取り込み元の科目の候補、Expensify の税額、BILL の請求書の消込、MCP の取り込み）。
+  guest は変えていない。
+- **ブラウザ**（同じ調べる用の写し）: USD の帳簿に Ramp の一覧（JSON）を取り込む → 請求書 1 件・明細 4 行と
+  「記帳しない項目 1 件（状態 DECLINED）」、口座「Ramp カード」「Ramp 立替経費」→ Office Depot の行の候補
+  「中 科目 Office Supplies（取り込み元の科目）」で計上（Office Supplies 25.99 ／ 未払金 25.99、不課税）→
+  BILL の請求書 2 件（通貨の警告）、Expensify の CSV 2 行（Open の 1 行と、会社のカードの警告）。取り込みの
+  欄の Expensify の template。375px で横スクロールなし、network は 127.0.0.1 と blob: だけ、console の
+  エラーなし。

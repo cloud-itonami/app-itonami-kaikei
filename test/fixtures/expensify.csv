@@ -1,0 +1,4 @@
+transactionID,reportID,date,merchant,amount_cents,currency,category,categoryGlCode,tag,comment,reimbursable,billable,taxAmount_cents,taxRateName,reportStatus
+"t-1001","R-77","2026-11-05","Yellow Cab",4250,"USD","Travel","6200","","client visit","true","false",0,"","Approved"
+"t-1002","R-77","2026-11-07","Corner Deli",1890,"USD","Meals","6300","","","false","false",140,"Sales Tax","Reimbursed"
+"t-1003","R-78","2026-11-20","Bookstore",2500,"USD","Books","","","","true","false",0,"","Open"

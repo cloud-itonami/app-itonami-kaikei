@@ -1,0 +1,94 @@
+(ns kaikei.compat.brex
+  "Brex の Transactions API（カードの取引）と Expenses API（立替）の一覧の応答
+  （{\"items\": […], \"next_cursor\": …}）を読む（第 4 スライス、JUN-327。読むだけ）。
+
+  形の正本: Brex の OpenAPI（Transactions API 1.0、Expenses API 0.1。2026-10-23 に取得）の
+  `CardTransaction`・`ExpandableExpense`・`Money`（最小単位の整数）。
+
+  - カードの取引 → 明細（カードの口座）。返金の額が負かは書かれていない（「符号つきでも
+    なしでもよい」）ので、向きは符号ではなく type で決める: PURCHASE・BNPL_FEE は利用
+    （負）、REFUND・CHARGEBACK・REWARDS_CREDIT・COLLECTION（カードの支払）は正。
+  - 経費は expense_type REIMBURSEMENT だけを立替（立替経費の口座、負）として読む。CARD の
+    経費はカードの取引と同じものなので読まない（カードの取引で読む）。BILLPAY・CLAWBACK も
+    読まない。status が APPROVED・SETTLED でないものは記帳しない。
+  - 税の項目は無い。category は Brex の分類（勘定科目ではない）で、候補のヒントにだけ使う。
+
+  未確認: REFUND の額の符号（type で判定する）。見本の応答はほとんど公開されていない。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]))
+
+(defn- kind-of [m]
+  (cond
+    (contains? m "expense_type") :expense
+    (and (contains? m "posted_at_date") (contains? m "type")) :card
+    :else nil))
+
+(defn detect? [data]
+  (let [items (when (map? data) (get data "items"))]
+    (boolean (and (sequential? items) (seq items) (every? kind-of items)))))
+
+(defn- magnitude [n] (if (neg? n) (- n) n))
+
+(def ^:private card-sign
+  {"PURCHASE" -1 "BNPL_FEE" -1 "REFUND" 1 "CHARGEBACK" 1 "REWARDS_CREDIT" 1 "COLLECTION" 1})
+
+(defn- read-card [m currency]
+  (let [{:strs [amount] cur "currency"} (get m "amount")
+        sign (card-sign (get m "type"))
+        date (core/parse-date (or (get m "posted_at_date") (get m "initiated_at_date")))]
+    (cond
+      (not= (or cur "USD") currency) {:skip (str "通貨 " cur)}
+      (nil? sign) {:skip (str "種類 " (get m "type"))}
+      (not (integer? amount)) {:problem (str "取引 " (get m "id") ": amount が読めません")}
+      (nil? date) {:problem (str "取引 " (get m "id") ": 日付が読めません")}
+      :else {:line (cond-> {:account-id "s1" :date date :amount (* sign (magnitude amount))
+                            :description (str (or (get m "description") (get-in m ["merchant" "raw_descriptor"]) ""))
+                            :uid (get m "id")
+                            :origin {:format :brex-json :id (get m "id") :type (get m "type")}}
+                     (get-in m ["merchant" "raw_descriptor"]) (assoc :counterparty (get-in m ["merchant" "raw_descriptor"]))
+                     (get-in m ["merchant" "mcc"]) (assoc :hints {:merchant-category (get-in m ["merchant" "mcc"])}))})))
+
+(defn- read-expense [m currency]
+  (let [money (or (get m "billing_amount") (get m "original_amount"))
+        {:strs [amount] cur "currency"} money
+        date (core/parse-date (or (get m "purchased_at") (get m "payment_posted_at")))
+        merchant (or (get-in m ["merchant" "raw_descriptor"]) (when (string? (get m "merchant")) (get m "merchant")))]
+    (cond
+      (not= "REIMBURSEMENT" (get m "expense_type")) {:skip (str "経費の種類 " (get m "expense_type"))}
+      (not (#{"APPROVED" "SETTLED"} (get m "status"))) {:skip (str "状態 " (get m "status"))}
+      (not= (or cur "USD") currency) {:skip (str "通貨 " cur)}
+      (not (integer? amount)) {:problem (str "経費 " (get m "id") ": 金額が読めません")}
+      (nil? date) {:problem (str "経費 " (get m "id") ": 日付が読めません")}
+      :else {:line {:account-id "s2" :date date :amount (- (magnitude amount))
+                    :description (text/join " " (remove text/blank? [merchant (get m "memo")]))
+                    :counterparty (or (get-in m ["user" "first_name"]) (get m "user_id"))
+                    :uid (get m "id")
+                    :hints (cond-> {:reimbursable? true}
+                             (get m "category") (assoc :category (get m "category"))
+                             (seq (get m "receipts")) (assoc :receipt? true))
+                    :origin {:format :brex-json :id (get m "id") :type "REIMBURSEMENT"}}})))
+
+(defn read-data
+  "構文解析済みの JSON → 取り込み結果。opts の :currency は帳簿の通貨。"
+  [data {:keys [currency] :or {currency "USD"}}]
+  (let [parts (for [m (get data "items")]
+                (case (kind-of m)
+                  :card (read-card m currency)
+                  :expense (read-expense m currency)
+                  {:problem "Brex のカードの取引・経費のどちらでもない項目があります"}))
+        lines (keep :line parts)
+        skipped (keep :skip parts)]
+    {:format :brex-json :currency currency :accounts []
+     :statement-accounts (cond-> []
+                           (some #(= "s1" (:account-id %)) lines)
+                           (conj {:id "s1" :key "brex:card" :kind :card :name "Brex カード" :ledger-account "未払金"
+                                  :currency currency :origin {:format :brex-json}})
+                           (some #(= "s2" (:account-id %)) lines)
+                           (conj {:id "s2" :key "brex:reimbursement" :kind :expense :name "Brex 立替経費" :ledger-account "未払金"
+                                  :currency currency :origin {:format :brex-json}}))
+     :statement-lines (vec lines)
+     :warnings (vec (concat (keep :problem parts)
+                            (when (seq skipped)
+                              [(str "記帳しない項目 " (count skipped) " 件（" (text/join "、" (distinct skipped))
+                                    "。カードの経費はカードの取引で読みます）")])))
+     :rejected (count (filter :problem parts))}))

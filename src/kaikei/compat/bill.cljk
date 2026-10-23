@@ -1,0 +1,71 @@
+(ns kaikei.compat.bill
+  "BILL（bill.com）v3 API の請求書（bills）を、第 3 スライスの仕入の請求書として読む
+  （第 4 スライス、JUN-327。読むだけ）。
+
+  形の正本: BILL v3 API reference（getbill・listbills、embedded OpenAPI \"BILL v3 API\"、
+  updatedAt 2026-06-29）と ap-bills ガイド（2026-03-24）。一覧の応答は
+  {\"nextPage\", \"prevPage\", \"results\": […]}。1 件の応答（id が 00n で始まる）も読む。
+
+  - 金額は 10 進の主単位（$228.99 は 228.99）。
+  - 請求書に通貨の項目は無い（外国の取引先は取引先の billCurrency）。帳簿の通貨とみなし、
+    警告する。
+  - 税の項目は無いので「税なし」で読む。行の科目（classifications.chartOfAccountId）は
+    BILL の id なので、科目の名前にはしない。
+  - paymentStatus PAID は支払済み、dueAmount を残額にする。archived・recordStatus INACTIVE は
+    取消、DRAFT は下書き。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]))
+
+(defn- bill? [m] (and (map? m) (map? (get m "invoice")) (contains? m "vendorId")))
+
+(defn detect? [data]
+  (boolean (or (and (map? data) (sequential? (get data "results")) (seq (get data "results"))
+                    (every? bill? (get data "results")))
+               (bill? data))))
+
+(defn- money [v exp]
+  (let [{:keys [amount error]} (core/parse-amount (if (number? v) (str v) v) exp)]
+    (when-not error amount)))
+
+(defn- read-bill [m exp]
+  (let [items (get m "billLineItems")
+        lines (if (seq items)
+                (vec (for [li items]
+                       {:description (str (or (get li "description") ""))
+                        :amount (money (get li "amount") exp)
+                        :category :out-of-scope :rate 0}))
+                [{:description (str (or (get m "description") "")) :amount (money (get m "amount") exp)
+                  :category :out-of-scope :rate 0}])
+        status (cond
+                 (or (true? (get m "archived")) (= "INACTIVE" (get m "recordStatus"))) :void
+                 (#{"DRAFT" "DRAFT_DELETED"} (get m "recordStatus")) :draft
+                 (= "PAID" (get m "paymentStatus")) :paid
+                 :else :issued)
+        number (get-in m ["invoice" "invoiceNumber"])]
+    (if (some #(nil? (:amount %)) lines)
+      {:problem (str "請求書 " number ": 金額が読めません")}
+      {:invoice (cond-> {:kind :purchase :number number
+                         :date (core/parse-date (get-in m ["invoice" "invoiceDate"]))
+                         :due-date (core/parse-date (get m "dueDate"))
+                         :status status
+                         :partner {:name (get m "vendorName")}
+                         :tax-mode :none :rounding :floor
+                         :lines lines
+                         :origin {:format :bill-json :id (get m "id")}}
+                  (some? (get m "dueAmount")) (assoc :amount-due (money (get m "dueAmount") exp))
+                  (some? (get m "paidAmount")) (assoc :amount-paid (money (get m "paidAmount") exp))
+                  (get m "description") (assoc :subject (get m "description")))})))
+
+(defn read-data
+  "構文解析済みの JSON → 取り込み結果（:invoices）。opts の :currency は帳簿の通貨。"
+  [data {:keys [currency] :or {currency "USD"}}]
+  (let [exp (core/exponent currency)
+        bills (if (bill? data) [data] (get data "results"))
+        parts (map #(read-bill % exp) bills)]
+    {:format :bill-json :currency currency
+     :invoices (vec (keep :invoice parts))
+     :warnings (vec (concat (keep :problem parts)
+                            [(str "BILL の請求書には通貨の項目が無いので、帳簿の通貨（" currency "）とみなしました。"
+                                  "外国の取引先の請求書は、取引先の通貨（billCurrency）で書かれています")]))
+     :rejected 0
+     :invoices-rejected (count (filter :problem parts))}))

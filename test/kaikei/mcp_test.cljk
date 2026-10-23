@@ -184,3 +184,9 @@
     (let [x (ok "kaikei_export" {"ledger" (get r "ledger") "format" "freee-statement-csv"})]
       (is (re-find #"^取引日,出金額,入金額,残高,取引内容" (get x "text")))))
   (is (= "cannot-export" (err "kaikei_export" {"ledger" sample-ledger "format" "freee-statement-csv" "statement_account" "zz"}))))
+
+(deftest expense-formats-through-mcp
+  (let [r (ok "kaikei_import" {"text" (fixture-text "ramp-list.json") "currency" "USD"})]
+    (is (= ["ramp-json" 4 1] [(get r "format") (get r "statement_lines") (get r "invoices")])))
+  (testing "読むだけの形式は書き出しの形式に無い"
+    (is (= "invalid-argument" (err "kaikei_export" {"ledger" sample-ledger "format" "ramp-json"})))))

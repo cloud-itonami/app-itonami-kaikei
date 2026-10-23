@@ -1,0 +1,53 @@
+{
+  "nextPage": null,
+  "prevPage": null,
+  "results": [
+    {
+      "id": "00n01ABCDEFGHIJK0001",
+      "archived": false,
+      "recordStatus": "ACTIVE",
+      "vendorId": "00901ABCDEFGHIJK0001",
+      "vendorName": "Music Supplies",
+      "invoice": {
+        "invoiceNumber": "MS-228",
+        "invoiceDate": "2026-11-02"
+      },
+      "dueDate": "2026-12-02",
+      "amount": 228.99,
+      "paidAmount": 0,
+      "dueAmount": 228.99,
+      "paymentStatus": "UNPAID",
+      "approvalStatus": "APPROVED",
+      "description": "Studio gear",
+      "billLineItems": [
+        {
+          "id": "bli01A",
+          "amount": 149.0,
+          "description": "USB audio interface",
+          "classifications": {
+            "chartOfAccountId": "0ca01ABC"
+          }
+        },
+        {
+          "id": "bli01B",
+          "amount": 79.99,
+          "description": "Drum foot pedal"
+        }
+      ]
+    },
+    {
+      "id": "00n01ABCDEFGHIJK0002",
+      "archived": false,
+      "recordStatus": "DRAFT",
+      "vendorId": "00901ABCDEFGHIJK0001",
+      "vendorName": "Music Supplies",
+      "invoice": {
+        "invoiceNumber": "MS-229",
+        "invoiceDate": "2026-11-10"
+      },
+      "dueDate": "2026-12-10",
+      "amount": 50,
+      "paymentStatus": "UNPAID"
+    }
+  ]
+}

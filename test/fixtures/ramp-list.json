@@ -1,0 +1,166 @@
+{
+  "data": [
+    {
+      "id": "5f1c0a52-0001-4b2a-9d6e-000000000001",
+      "entity_amount": {
+        "value": 2599,
+        "currency": "USD"
+      },
+      "merchant_amount": {
+        "value": 2599,
+        "currency": "USD"
+      },
+      "merchant_name": "Office Depot",
+      "merchant_descriptor": "OFFICE DEPOT #123",
+      "user_transaction_time": "2026-11-03T18:22:10+00:00",
+      "accounting_date": "2026-11-03T00:00:00+00:00",
+      "settlement_date": "2026-11-04T00:00:00+00:00",
+      "state": "CLEARED",
+      "card_id": "c-0001",
+      "sk_category_id": 17,
+      "sk_category_name": "Office Supplies",
+      "memo": "toner",
+      "receipts": [
+        "r-1"
+      ],
+      "accounting_field_selections": [
+        {
+          "id": "afs1",
+          "name": "Office Supplies",
+          "display_name": "Office Supplies",
+          "external_id": "6100",
+          "type": "GL_ACCOUNT",
+          "source": "ACCOUNTING"
+        },
+        {
+          "id": "afs2",
+          "name": "Non-Taxable",
+          "type": "TAX_CODE"
+        }
+      ]
+    },
+    {
+      "id": "5f1c0a52-0001-4b2a-9d6e-000000000002",
+      "entity_amount": {
+        "value": -1000,
+        "currency": "USD"
+      },
+      "merchant_name": "Office Depot",
+      "user_transaction_time": "2026-11-10T10:00:00+00:00",
+      "state": "CLEARED",
+      "card_id": "c-0001",
+      "original_transaction_id": "5f1c0a52-0001-4b2a-9d6e-000000000001",
+      "accounting_field_selections": []
+    },
+    {
+      "id": "5f1c0a52-0001-4b2a-9d6e-000000000003",
+      "entity_amount": {
+        "value": 5000,
+        "currency": "USD"
+      },
+      "merchant_name": "Casino",
+      "user_transaction_time": "2026-11-11T10:00:00+00:00",
+      "state": "DECLINED",
+      "card_id": "c-0001",
+      "decline_details": {
+        "reason": "MERCHANT_BLOCKED",
+        "declined_amount": {
+          "value": 5000,
+          "currency": "USD"
+        }
+      }
+    },
+    {
+      "id": "9b2e0000-0000-4000-8000-000000000010",
+      "type": "OUT_OF_POCKET",
+      "direction": "BUSINESS_TO_USER",
+      "entity_amount": {
+        "value": 4250,
+        "currency": "USD"
+      },
+      "merchant": "Yellow Cab",
+      "memo": "client visit",
+      "transaction_date": "2026-11-05",
+      "state": "APPROVED",
+      "user_full_name": "Sam Lee",
+      "receipts": [
+        "r-2"
+      ],
+      "accounting_field_selections": [
+        {
+          "id": "afs1",
+          "name": "Travel",
+          "display_name": "Travel",
+          "external_id": "6100",
+          "type": "GL_ACCOUNT",
+          "source": "ACCOUNTING"
+        }
+      ]
+    },
+    {
+      "id": "9b2e0000-0000-4000-8000-000000000011",
+      "type": "PAYBACK_FULL",
+      "direction": "USER_TO_BUSINESS",
+      "entity_amount": {
+        "value": 1000,
+        "currency": "USD"
+      },
+      "merchant": "Personal charge",
+      "transaction_date": "2026-11-12",
+      "state": "REIMBURSED",
+      "user_full_name": "Sam Lee"
+    },
+    {
+      "id": "b-0001",
+      "vendor": {
+        "id": "v-1",
+        "name": "Acme Hosting",
+        "type": "BUSINESS"
+      },
+      "invoice_number": "AH-1007",
+      "issued_at": "2026-11-01T00:00:00+00:00",
+      "due_at": "2026-11-30T00:00:00+00:00",
+      "status": "OPEN",
+      "amount": {
+        "amount": 150000,
+        "currency_code": "USD",
+        "minor_unit_conversion_rate": 100
+      },
+      "memo": "November hosting",
+      "line_items": [
+        {
+          "id": "bli-1",
+          "amount": {
+            "amount": 120000,
+            "currency_code": "USD",
+            "minor_unit_conversion_rate": 100
+          },
+          "memo": "Servers",
+          "accounting_field_selections": [
+            {
+              "id": "afs1",
+              "name": "Hosting",
+              "display_name": "Hosting",
+              "external_id": "6100",
+              "type": "GL_ACCOUNT",
+              "source": "ACCOUNTING"
+            }
+          ]
+        },
+        {
+          "id": "bli-2",
+          "amount": {
+            "amount": 30000,
+            "currency_code": "USD",
+            "minor_unit_conversion_rate": 100
+          },
+          "memo": "Support",
+          "accounting_field_selections": []
+        }
+      ]
+    }
+  ],
+  "page": {
+    "next": null
+  }
+}

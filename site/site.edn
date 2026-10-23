@@ -39,6 +39,10 @@
            {:from "src/kaikei/compat/ofx.cljk" :to "kaikei/compat/ofx.cljs"}
            {:from "src/kaikei/compat/statement_csv.cljk" :to "kaikei/compat/statement_csv.cljs"}
            {:from "src/kaikei/compat/zengin.cljk" :to "kaikei/compat/zengin.cljs"}
+           {:from "src/kaikei/compat/ramp.cljk" :to "kaikei/compat/ramp.cljs"}
+           {:from "src/kaikei/compat/brex.cljk" :to "kaikei/compat/brex.cljs"}
+           {:from "src/kaikei/compat/expensify.cljk" :to "kaikei/compat/expensify.cljs"}
+           {:from "src/kaikei/compat/bill.cljk" :to "kaikei/compat/bill.cljs"}
            {:from "src/kaikei/ingest.cljk" :to "kaikei/ingest.cljs"}
            {:from "src/kaikei/export.cljk" :to "kaikei/export.cljs"}
            {:from "src/kaikei/view.cljk" :to "kaikei/view.cljs"}

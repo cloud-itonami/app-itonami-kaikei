@@ -1,0 +1,131 @@
+(ns kaikei.compat.ramp
+  "Ramp Developer API の一覧の応答（{\"data\": […], \"page\": {…}}）を読む（第 4 スライス、
+  JUN-327。読むだけ）。
+
+  形の正本: Ramp の OpenAPI `developer-api.json`（info.version v1、sha256 a2a3e577…、
+  2026-10-23 に取得）の `Transaction`・`Reimbursement`・`Bill`、ガイド「Monetary Values」。
+
+  - 金額は最小単位の整数（ApiSignedAmount・ApiReimbursementAmount の value、
+    CurrencyAmount の amount）。
+  - カードの取引（Transaction）→ 明細（カードの口座）。entity_amount は利用が正・返金が
+    負（original_transaction_id で元の取引）なので、kaikei の向き（利用が負）に直す。
+    state が CLEARED・COMPLETION でない行（DECLINED・PENDING など）は記帳しない。
+  - 立替（Reimbursement）→ 明細（立替経費の口座）。value は 0 以上で、向きは direction
+    （BUSINESS_TO_USER は会社が払う＝負、USER_TO_BUSINESS は従業員が返す＝正）。却下・取消は
+    読まない。
+  - 請求書（Bill）→ 第 3 スライスの仕入の請求書。税の項目は無いので「税なし」。
+  - 科目・税コードは accounting_field_selections（type GL_ACCOUNT・TAX_CODE）を候補の
+    ヒントにする。
+
+  未確認: 見本の応答が公開されていない（fixture は schema から作った）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]))
+
+(defn- kind-of [m]
+  (cond
+    (and (map? (get m "vendor")) (contains? m "invoice_number")) :bill
+    (contains? m "direction") :reimbursement
+    (or (contains? m "card_id") (contains? m "user_transaction_time") (contains? m "merchant_name")) :transaction
+    :else nil))
+
+(defn detect? [data]
+  (let [items (when (map? data) (get data "data"))]
+    (boolean (and (sequential? items) (contains? data "page") (some kind-of items)))))
+
+(defn- selection [m type]
+  (some #(when (= type (get % "type")) (or (get % "name") (get % "display_name"))) (get m "accounting_field_selections")))
+
+(defn- hints [m]
+  (not-empty (cond-> {}
+               (selection m "GL_ACCOUNT") (assoc :account (selection m "GL_ACCOUNT"))
+               (selection m "TAX_CODE") (assoc :tax-code (selection m "TAX_CODE"))
+               (get m "sk_category_name") (assoc :category (get m "sk_category_name"))
+               (seq (get m "receipts")) (assoc :receipt? true))))
+
+(defn- line [account-id m date amount description extra]
+  (cond-> (merge {:account-id account-id :date date :amount amount
+                  :description description :uid (get m "id")
+                  :origin {:format :ramp-json :id (get m "id")}}
+                 extra)
+    (hints m) (assoc :hints (merge (hints m) (:hints extra)))))
+
+(defn- read-transaction [m currency]
+  (let [{:strs [value] cur "currency"} (get m "entity_amount")
+        date (core/parse-date (or (get m "accounting_date") (get m "user_transaction_time") (get m "settlement_date")))]
+    (cond
+      (not (#{"CLEARED" "COMPLETION"} (get m "state"))) {:skip (str "状態 " (get m "state"))}
+      (not= cur currency) {:skip (str "通貨 " cur)}
+      (not (integer? value)) {:problem (str "取引 " (get m "id") ": entity_amount が読めません")}
+      (nil? date) {:problem (str "取引 " (get m "id") ": 日付が読めません")}
+      :else {:line (line "s1" m date (- value)
+                         (text/join " " (remove text/blank? [(get m "merchant_name") (get m "memo")]))
+                         (cond-> {:counterparty (or (get m "merchant_descriptor") (get m "merchant_name"))}
+                           (get m "original_transaction_id") (assoc :reference (get m "original_transaction_id"))))})))
+
+(defn- read-reimbursement [m currency]
+  (let [{:strs [value] cur "currency"} (get m "entity_amount")
+        date (core/parse-date (or (get m "accounting_date") (get m "transaction_date")))]
+    (cond
+      (#{"REJECTED" "CANCELED" "DRAFT"} (get m "state")) {:skip (str "状態 " (get m "state"))}
+      (not= cur currency) {:skip (str "通貨 " cur)}
+      (not (integer? value)) {:problem (str "立替 " (get m "id") ": entity_amount が読めません")}
+      (nil? date) {:problem (str "立替 " (get m "id") ": 日付が読めません")}
+      :else {:line (line "s2" m date (if (= "USER_TO_BUSINESS" (get m "direction")) value (- value))
+                         (text/join " " (remove text/blank? [(get m "merchant") (get m "memo")]))
+                         {:counterparty (get m "user_full_name")
+                          :hints {:reimbursable? true}})})))
+
+(defn- read-bill [m currency exp]
+  (let [{:strs [amount currency_code]} (get m "amount")
+        items (get m "line_items")
+        lines (if (seq items)
+                (vec (for [li items]
+                       {:description (str (get li "memo" ""))
+                        :amount (get-in li ["amount" "amount"])
+                        :account (selection li "GL_ACCOUNT")
+                        :category :out-of-scope :rate 0}))
+                [{:description (str (get m "memo" "")) :amount amount :category :out-of-scope :rate 0}])
+        paid? (= "PAID" (get m "status"))]
+    (cond
+      (not= currency_code currency) {:skip (str "通貨 " currency_code)}
+      (not (every? #(integer? (:amount %)) lines)) {:problem (str "請求書 " (get m "invoice_number") ": 金額が読めません")}
+      :else
+      {:invoice (cond-> {:kind :purchase :number (get m "invoice_number")
+                         :date (core/parse-date (or (get m "issued_at") (get m "accounting_date")))
+                         :due-date (core/parse-date (get m "due_at"))
+                         :status (cond (get m "archived_at") :void paid? :paid :else :issued)
+                         :partner {:name (get-in m ["vendor" "name"])}
+                         :tax-mode :none :rounding :floor
+                         :lines (mapv #(cond-> % (nil? (:account %)) (dissoc :account)) lines)
+                         :amount-due (if paid? 0 amount)
+                         :origin {:format :ramp-json :id (get m "id")}}
+                  (get m "memo") (assoc :subject (get m "memo")))})))
+
+(defn read-data
+  "構文解析済みの JSON → 取り込み結果。opts の :currency は帳簿の通貨。"
+  [data {:keys [currency] :or {currency "USD"}}]
+  (let [exp (core/exponent currency)
+        items (get data "data")
+        parts (for [m items]
+                (case (kind-of m)
+                  :transaction (read-transaction m currency)
+                  :reimbursement (read-reimbursement m currency)
+                  :bill (read-bill m currency exp)
+                  {:problem "Ramp の取引・立替・請求書のどれでもない項目があります"}))
+        lines (keep :line parts)
+        accounts (cond-> []
+                   (some #(= "s1" (:account-id %)) lines)
+                   (conj {:id "s1" :key "ramp:card" :kind :card :name "Ramp カード" :ledger-account "未払金"
+                          :currency currency :origin {:format :ramp-json}})
+                   (some #(= "s2" (:account-id %)) lines)
+                   (conj {:id "s2" :key "ramp:reimbursement" :kind :expense :name "Ramp 立替経費" :ledger-account "未払金"
+                          :currency currency :origin {:format :ramp-json}}))
+        skipped (keep :skip parts)]
+    (cond-> {:format :ramp-json :currency currency :accounts []
+             :statement-accounts accounts
+             :statement-lines (vec lines)
+             :warnings (vec (concat (keep :problem parts)
+                                    (when (seq skipped)
+                                      [(str "記帳しない項目 " (count skipped) " 件（" (text/join "、" (distinct skipped)) "）")])))
+             :rejected (count (filter :problem parts))}
+      (some :invoice parts) (assoc :invoices (vec (keep :invoice parts))))))

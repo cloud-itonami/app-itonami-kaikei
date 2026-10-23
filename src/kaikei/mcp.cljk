@@ -491,8 +491,10 @@
   [{"name" "kaikei_import"
     "description" (str "Read a journal export (MoneyForward 仕訳帳 CSV, freee 仕訳 CSV, 弥生インポート形式, "
                        "QuickBooks Online Account/JournalEntry JSON or journal CSV, Xero Accounts/Journals/ManualJournals JSON "
-                       "or manual journal CSV, or a kaikei ledger), an invoice file, or a bank/card statement the user downloaded "
-                       "(OFX/QFX/QBO, freee・MF・Xero・QuickBooks statement CSV) into a kaikei ledger with checks. "
+                       "or manual journal CSV, or a kaikei ledger), an invoice file, a bank/card statement the user downloaded "
+                       "(OFX/QFX/QBO, 全銀 fixed-length or CSV, freee・MF・Xero・QuickBooks statement CSV, a bank or card CSV with a "
+                       "preset), or an expense/AP export (Ramp or Brex API JSON, Expensify CSV from kaikei's template, BILL v3 bills) "
+                       "into a kaikei ledger with checks. "
                        "Pure: nothing is sent, stored or fetched; it does not call any accounting API.")
     "inputSchema" {"type" "object"
                    "properties" (merge input-schema

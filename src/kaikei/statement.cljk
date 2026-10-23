@@ -525,10 +525,17 @@
   最初から選ぶのは、強さ 3（有力）が 1 件だけのとき。"
   ([db line] (candidates db (learn db) line))
   ([db learned line]
-   (let [cs (vec (concat (invoice-candidates db line)
+   (let [rule (rule-suggestion db learned line)
+         hint (get-in line [:hints :account])
+         ;; 取り込み元（Ramp・Expensify など）の科目・分類のヒント。規則と同じ科目なら出さない
+         hint-c (when (and hint (not= hint (:account rule)))
+                  {:type :account :source :hint :level 2 :account hint
+                   :reasons [(str "取り込み元の科目・分類: " hint)]})
+         cs (vec (concat (invoice-candidates db line)
                          (entry-candidates db line)
                          (transfer-candidates db line)
-                         (some-> (rule-suggestion db learned line) vector)))
+                         (some-> rule vector)
+                         (some-> hint-c vector)))
          strong (filterv #(= 3 (:level %)) cs)]
      {:candidates cs
       :preselected (when (= 1 (count strong)) (first strong))})))
@@ -663,6 +670,10 @@
       (let [k (tax-key tax rate)
             code (invoice/tax-code (if inflow? :sales :purchase) k)
             [net t] (if (and taxable? (not included?)) (split-tax db gross rate) [gross 0])
+            ;; 取り込み元が税額を持つとき（Expensify）はその額を使い、kaikei の計算と違えば知らせる
+            stated (get-in line [:hints :tax-amount])
+            differs? (and stated taxable? (not included?) (not= stated t))
+            [net t] (if (and stated taxable? (not included?)) [(- gross stated) stated] [net t])
             meta (cond-> {:description (:description line) :tax {:scheme :kaikei :code code}}
                    partner (assoc :partner partner)
                    (and taxable? (not inflow?)) (assoc :invoice {:scheme :kaikei :code (if qualified? "適格" "未確認")}))
@@ -675,7 +686,8 @@
                  :memo (:description line)
                  :lines (vec (remove nil? (if inflow? [bank body tax-line] [body tax-line bank])))
                  :origin (cond-> {:format :statement :line-id (:id line) :account-id (:account-id line)}
-                           (:rule-id choice) (assoc :rule-id (:rule-id choice)))}}))))
+                           (:rule-id choice) (assoc :rule-id (:rule-id choice)))}
+         :warnings (if differs? [:tax-amount-differs] [])}))))
 
 (defn- transfer-entry [db line {other-id :line-id}]
   (let [other (line-by-id db other-id)
@@ -715,7 +727,8 @@
    :unknown-choice "知らない選び方です"})
 
 (def warning-label
-  {:return-invoice "差額が 1 万円以上です。対価の返還なら返還インボイスが要ります（1 万円未満の免除の外。消費税法 57 条の 4 ③）"
+  {:tax-amount-differs "取り込み元の税額を使いました。kaikei の計算（税込から税率ごとに 1 回の端数処理）とは違います"
+   :return-invoice "差額が 1 万円以上です。対価の返還なら返還インボイスが要ります（1 万円未満の免除の外。消費税法 57 条の 4 ③）"
    :deducted-fee "支払から手数料を差し引いています。製造委託等で中小受託事業者に負担させることは、合意があっても取適法で禁止されます（国税庁 Q&A 問 29 の注）"})
 
 (defn- add-alias

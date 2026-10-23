@@ -1,0 +1,105 @@
+(ns kaikei.compat.expensify
+  "Expensify の Report Exporter に kaikei の template（下の `template`）で書き出した CSV を
+  読む（第 4 スライス、JUN-327。読むだけ、判断 6）。
+
+  形の正本: Expensify Integration Server の文書（Report Exporter、template の項目
+  export_report_template.html。2026-10-23 に取得）。既定の template（「All Data - Expense
+  Level Export」など）の見出しは公開されていないので、kaikei が template を配る。
+
+  - 項目: transactionID・reportID・日付（modifiedCreated か created）・取引先
+    （modifiedMerchant か merchant）・金額（convertedAmount → modifiedAmount → amount の順。
+    セント）・通貨・category・categoryGlCode・tag・comment・reimbursable・billable・
+    taxAmount・taxRateName・レポートの状態。
+  - 金額はセント（100 分の 1）。帳簿の通貨の桁に直す（JPY は 100 で割る。割り切れなければ
+    読まない）。経費は正・返金や返戻は負（Expensify のヘルプの書き出しの式）なので、kaikei の
+    向き（出ていくのが負）に直す。
+  - reimbursable の経費は立替（立替経費の口座）、そうでないものは会社のカードの経費
+    （カードの口座）。後者はカードの明細と同じものなので、両方を取り込むなら一方を計上する。
+  - レポートの状態が Approved・Reimbursed・Closed のものだけを読む（Open・Processing は
+    まだ承認されていない）。
+  - 税額（taxAmount）は候補で使い、kaikei の計算（税率ごとに 1 回）と違えば知らせる。
+
+  未確認: template は Expensify で動かしていない（項目の名前は文書のとおり）。Report
+  Exporter の金額の符号と taxAmount の単位（セントと推す）。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]))
+
+(def template
+  "Report Exporter の template（Freemarker）。Expensify の Integration Server に、
+  outputSettings.fileExtension \"csv\" で渡す。"
+  (str "<#if addHeader == true>transactionID,reportID,date,merchant,amount_cents,currency,category,categoryGlCode,"
+       "tag,comment,reimbursable,billable,taxAmount_cents,taxRateName,reportStatus\n</#if>"
+       "<#list reports as report><#list report.transactionList as expense>"
+       "\"${expense.transactionID}\",\"${report.reportID}\","
+       "\"<#if expense.modifiedCreated?has_content>${expense.modifiedCreated}<#else>${expense.created}</#if>\","
+       "\"<#if expense.modifiedMerchant?has_content>${expense.modifiedMerchant?replace('\"','\"\"')}<#else>${expense.merchant?replace('\"','\"\"')}</#if>\","
+       "<#if expense.convertedAmount?has_content>${expense.convertedAmount?c}<#elseif expense.modifiedAmount?has_content>${expense.modifiedAmount?c}<#else>${expense.amount?c}</#if>,"
+       "\"<#if expense.convertedAmount?has_content>${report.currency}<#else>${expense.currency}</#if>\","
+       "\"${(expense.category!'')?replace('\"','\"\"')}\",\"${expense.categoryGlCode!''}\",\"${(expense.tag!'')?replace('\"','\"\"')}\","
+       "\"${(expense.comment!'')?replace('\"','\"\"')}\",\"${expense.reimbursable?c}\",\"${expense.billable?c}\","
+       "<#if expense.taxAmount?has_content>${expense.taxAmount?c}<#else>0</#if>,\"${expense.taxRateName!''}\",\"${report.status}\"\n"
+       "</#list></#list>"))
+
+(defn csv-detect? [rows]
+  (let [h (set (map #(text/trim (str %)) (first rows)))]
+    (every? h ["transactionID" "reportID" "amount_cents" "reimbursable"])))
+
+(defn- cents->minor
+  "セント → 帳簿の通貨の最小単位（割り切れなければ nil）。"
+  [cents exp]
+  (case exp
+    2 cents
+    3 (* 10 cents)
+    0 (when (zero? (mod cents 100)) (quot cents 100))
+    nil))
+
+(defn- int-of [s] (let [t (text/trim (str s))] (when (text/re-matches #"-?\d+" t) (parse-long t))))
+
+(defn read-csv
+  "kaikei の template の CSV の行 → 取り込み結果。opts の :currency は帳簿の通貨。"
+  [rows {:keys [currency] :or {currency "USD"}}]
+  (let [exp (core/exponent currency)
+        recs (csv/records rows)
+        parts (for [r recs
+                    :let [where (str "行 " (::csv/row r))
+                          cents (int-of (get r "amount_cents"))
+                          amount (some-> cents (cents->minor exp))
+                          tax (some-> (int-of (get r "taxAmount_cents")) (cents->minor exp))
+                          date (core/parse-date (get r "date"))
+                          reimbursable? (= "true" (text/lower (text/trim (str (get r "reimbursable")))))
+                          status (text/trim (str (get r "reportStatus")))]]
+                (cond
+                  (not (#{"Approved" "Reimbursed" "Closed"} status)) {:skip (str "レポートの状態 " status)}
+                  (not= currency (text/trim (str (get r "currency")))) {:skip (str "通貨 " (get r "currency"))}
+                  (nil? amount) {:problem (str where ": 金額 \"" (get r "amount_cents") "\" を読めません（セントで書きます）")}
+                  (nil? date) {:problem (str where ": 日付が読めません")}
+                  :else
+                  {:line {:account-id (if reimbursable? "s2" "s1")
+                          :date date :amount (- amount)
+                          :description (text/join " " (remove text/blank? [(get r "merchant") (get r "comment")]))
+                          :counterparty (text/trim (str (get r "merchant")))
+                          :reference (text/trim (str (get r "reportID")))
+                          :uid (text/trim (str (get r "transactionID")))
+                          :hints (cond-> {:reimbursable? reimbursable?}
+                                   (not (text/blank? (str (get r "category")))) (assoc :account (text/trim (get r "category")))
+                                   (not (text/blank? (str (get r "taxRateName")))) (assoc :tax-code (text/trim (get r "taxRateName")))
+                                   (and tax (not (zero? tax))) (assoc :tax-amount tax))
+                          :origin {:format :expensify-csv :row (::csv/row r)}}}))
+        lines (keep :line parts)
+        skipped (keep :skip parts)]
+    {:format :expensify-csv :currency currency :accounts []
+     :statement-accounts (cond-> []
+                           (some #(= "s1" (:account-id %)) lines)
+                           (conj {:id "s1" :key "expensify:card" :kind :card :name "Expensify 会社のカードの経費" :ledger-account "未払金"
+                                  :currency currency :origin {:format :expensify-csv}})
+                           (some #(= "s2" (:account-id %)) lines)
+                           (conj {:id "s2" :key "expensify:reimbursement" :kind :expense :name "Expensify 立替経費" :ledger-account "未払金"
+                                  :currency currency :origin {:format :expensify-csv}}))
+     :statement-lines (vec lines)
+     :warnings (vec (concat (keep :problem parts)
+                            (when (seq skipped)
+                              [(str "記帳しない行 " (count skipped) " 行（" (text/join "、" (distinct skipped)) "）")])
+                            (when (some #(= "s1" (:account-id %)) lines)
+                              ["会社のカードの経費（reimbursable でない行）は、カードの明細と同じものです。両方を取り込むなら、どちらか一方を計上してください"])))
+     :rejected (count (filter :problem parts))}))

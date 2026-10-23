@@ -495,7 +495,10 @@
          s (when line (statement/rule-suggestion data line))]
      (update db :ui assoc :statement-line id :statement-line-result nil :statement-fee-rate ""
              :statement-form {:account (if (= 3 (:level s)) (or (:account s) "") "")
-                              :tax (if (:tax s) (view/tax->choice (:tax s)) "taxable-0")
+                              ;; 消費税（日本の税率）は JPY の帳簿だけの既定。ほかの通貨の帳簿は不課税
+                              :tax (cond (:tax s) (view/tax->choice (:tax s))
+                                         (= "JPY" (:currency data)) "taxable-0"
+                                         :else "out-of-scope")
                               :partner (or (:partner s) "") :qualified? (boolean (:qualified? s)) :make-rule? false}))))
 
 (reg-ui-event

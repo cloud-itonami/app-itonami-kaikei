@@ -1,0 +1,53 @@
+{
+  "next_cursor": null,
+  "items": [
+    {
+      "id": "ctx_0001",
+      "card_id": "card_1",
+      "description": "AWS",
+      "amount": {
+        "amount": 4599,
+        "currency": "USD"
+      },
+      "initiated_at_date": "2026-11-02",
+      "posted_at_date": "2026-11-03",
+      "type": "PURCHASE",
+      "merchant": {
+        "raw_descriptor": "AMAZON WEB SERVICES",
+        "mcc": "7372",
+        "country": "USA"
+      },
+      "expense_id": "exp_1"
+    },
+    {
+      "id": "ctx_0002",
+      "card_id": "card_1",
+      "description": "AWS credit",
+      "amount": {
+        "amount": 1500,
+        "currency": "USD"
+      },
+      "initiated_at_date": "2026-11-08",
+      "posted_at_date": "2026-11-09",
+      "type": "REFUND",
+      "merchant": {
+        "raw_descriptor": "AMAZON WEB SERVICES",
+        "mcc": "7372",
+        "country": "USA"
+      }
+    },
+    {
+      "id": "ctx_0003",
+      "card_id": null,
+      "description": "Payment",
+      "amount": {
+        "amount": -50000,
+        "currency": "USD"
+      },
+      "initiated_at_date": "2026-11-25",
+      "posted_at_date": "2026-11-25",
+      "type": "COLLECTION",
+      "merchant": null
+    }
+  ]
+}
