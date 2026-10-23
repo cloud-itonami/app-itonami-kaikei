@@ -58,6 +58,18 @@
       (is (= (get result "structuredContent")
              (js->clj (.parse js/JSON (get-in result ["content" 0 "text"]))))))))
 
+(deftest imports-into-the-ledger-a-previous-call-returned
+  (testing "agent が前の call の帳簿 JSON を次の call に渡す形（プロセスは call ごとに別）"
+    (let [first-r (exchange "/" "tools/call" {"name" "kaikei_import"
+                                              "arguments" {"text" (str (fs/readFileSync "test/fixtures/mf.csv" "utf8"))}})
+          ledger (get-in (by-id first-r 2) ["result" "structuredContent" "ledger"])
+          r (exchange "/" "tools/call" {"name" "kaikei_import"
+                                        "arguments" {"text" (str (fs/readFileSync "test/fixtures/ofx-bank.ofx" "utf8"))
+                                                     "ledger" ledger}})
+          out (get-in (by-id r 2) ["result" "structuredContent"])]
+      (is (= 0 (:status r)) (:stderr r))
+      (is (= [4 3 3] [(get out "entries") (get out "statement_lines") (get-in out ["added" "statement_lines"])])))))
+
 (deftest invalid-input-is-a-tool-error
   (let [r (exchange "/" "tools/call" {"name" "kaikei_report" "arguments" {"report" "balance-sheet"}})
         result (get (by-id r 2) "result")]
