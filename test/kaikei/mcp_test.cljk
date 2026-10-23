@@ -185,6 +185,56 @@
       (is (re-find #"^取引日,出金額,入金額,残高,取引内容" (get x "text")))))
   (is (= "cannot-export" (err "kaikei_export" {"ledger" sample-ledger "format" "freee-statement-csv" "statement_account" "zz"}))))
 
+;; ───────── 今の帳簿に足す取り込み（JUN-338） ─────────
+
+(def ^:private books-ledger
+  "仕訳と請求書はあるが、明細はまだ無い帳簿（サンプルから明細を除いたもの）。"
+  (let [db (:db (kaikei.core/merge-import kaikei.core/empty-db
+                                          (dissoc kaikei.core/sample-import :statement-accounts :statement-lines)))]
+    (js->clj (.parse js/JSON (kaikei.compat.native/write db)))))
+
+(deftest import-into-a-ledger
+  (let [ofx (fixture-text "ofx-bank.ofx")
+        r (ok "kaikei_import" {"text" ofx "ledger" books-ledger})]
+    (testing "帳簿の仕訳・請求書はそのまま、明細の行だけが足される"
+      (is (= [(count (get books-ledger "entries")) (count (get books-ledger "invoices")) 3]
+             [(get r "entries") (get r "invoices") (get r "statement_lines")]))
+      (is (= {"entries" 0 "entries_duplicates" 0 "invoices" 0 "invoices_duplicates" 0
+              "statement_lines" 3 "statement_lines_duplicates" 0 "statement_lines_corrected" 0}
+             (get r "added"))))
+    (testing "足した明細に、帳簿の請求書の消込が出る（手数料の分だけ少ない入金）"
+      (let [s (ok "kaikei_statement_suggest" {"ledger" (get r "ledger")})
+            minato (first (filter #(re-find #"ﾐﾅﾄ" (str (get-in % ["line" "description"]))) (get s "lines")))
+            c (get-in minato ["candidates" 0])]
+        (is (= ["invoice" 3] [(get c "type") (get c "strength")]))
+        (is (= [{"invoice_id" "i1" "amount" 59320}] (get-in c ["choice" "allocations"])))
+        (is (= 440 (get c "fee")))))
+    (testing "同じファイルをもう一度足しても、行は増えない"
+      (let [again (ok "kaikei_import" {"text" ofx "ledger" (get r "ledger")})]
+        (is (= 3 (get again "statement_lines")))
+        (is (= [0 3] [(get-in again ["added" "statement_lines"])
+                      (get-in again ["added" "statement_lines_duplicates"])]))))
+    (testing "statement_account は帳簿の口座の id か new。知らない id はエラー"
+      (let [acct (get-in r ["ledger" "statement_accounts" 0 "id"])
+            same (ok "kaikei_import" {"text" ofx "ledger" (get r "ledger") "statement_account" acct})
+            fresh (ok "kaikei_import" {"text" ofx "ledger" (get r "ledger") "statement_account" "new"})]
+        (is (= [1 3] [(count (get-in same ["ledger" "statement_accounts"])) (get same "statement_lines")]))
+        (is (= [2 6] [(count (get-in fresh ["ledger" "statement_accounts"])) (get fresh "statement_lines")]))
+        (is (= "invalid-argument" (err "kaikei_import" {"text" ofx "ledger" (get r "ledger") "statement_account" "a9"})))))))
+
+(deftest import-into-a-ledger-keeps-one-currency
+  (let [csv (fixture-text "qbo-bank-3col.csv")
+        usd (ok "kaikei_import" {"text" csv "currency" "USD"})]
+    (testing "ファイルが通貨を言わなければ、帳簿の通貨を使う（既定の JPY にしない）"
+      (let [again (ok "kaikei_import" {"text" csv "ledger" (get usd "ledger")})]
+        (is (= [0 (get usd "statement_lines")]
+               [(get-in again ["added" "statement_lines"]) (get-in again ["added" "statement_lines_duplicates"])]))))
+    (testing "通貨の違うファイルは足さずにエラー（行を黙って落とさない）"
+      (is (= "currency-mismatch" (err "kaikei_import" {"text" (fixture-text "ofx-bank.ofx") "ledger" (get usd "ledger")})))
+      (is (= "currency-mismatch" (err "kaikei_import" {"text" csv "ledger" (get usd "ledger") "currency" "JPY"}))))
+    (testing "帳簿でないものは invalid-argument"
+      (is (= "invalid-argument" (err "kaikei_import" {"text" csv "ledger" "not a ledger"}))))))
+
 (deftest expense-formats-through-mcp
   (let [r (ok "kaikei_import" {"text" (fixture-text "ramp-list.json") "currency" "USD"})]
     (is (= ["ramp-json" 4 1] [(get r "format") (get r "statement_lines") (get r "invoices")])))

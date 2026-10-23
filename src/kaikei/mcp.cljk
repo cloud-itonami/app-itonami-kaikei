@@ -10,7 +10,8 @@
   QuickBooks・Xero・Zoho・FreshBooks）の API にも、国税庁の公表サイトにも、
   銀行・カード会社にも接続しない:
 
-    kaikei_import          仕訳・請求書のファイル（テキストか base64 のバイト列）→ kaikei の帳簿 JSON
+    kaikei_import          仕訳・請求書・明細のファイル（テキストか base64 のバイト列）→ kaikei の帳簿 JSON
+                           （ledger を渡せば、その帳簿に足す。app の「追加」の取り込みと同じ合流、JUN-338）
     kaikei_validate        帳簿 JSON の検査（貸借一致・未分類の勘定科目・問題のある仕訳）
     kaikei_report          帳簿 JSON → 試算表・P/L・B/S（kaikei・QBO・Xero の形）
     kaikei_export          帳簿 JSON → 各形式のテキスト（Shift_JIS は base64）
@@ -41,7 +42,7 @@
             [kaikei.compat.native :as native]))
 
 (def server-name "kaikei")
-(def server-version "0.3.0")
+(def server-version "0.4.0")
 (def default-protocol-version "2024-11-05")
 
 (def max-bytes
@@ -112,17 +113,34 @@
      "unclassified_lines" (:unclassified-lines c)
      "invalid_entries" (:invalid-entries c)}))
 
-(defn- import-opts [args]
+(defn- import-opts [args currency]
   (cond-> {:format (enum-arg args "format" (cons "auto" ingest/format-ids) "auto")
            :encoding (enum-arg args "encoding" ["auto" "utf-8" "shift_jis"] "auto")
-           :currency (enum-arg args "currency" (sort (keys core/currency-exponent)) "JPY")}
+           :currency (enum-arg args "currency" (sort (keys core/currency-exponent)) currency)}
     (get args "date_order") (assoc :date-order (enum-arg args "date_order" ["mdy" "dmy"] nil))))
 
-(defn- read-input [args]
-  (let [parsed (ingest/ingest-bytes (input-bytes args) (import-opts args))
-        {:keys [db error]} (core/merge-import (assoc core/empty-db :currency (:currency parsed "JPY")) parsed)]
-    (when error (throw (tool-error "currency-mismatch" "detail" error)))
-    {:parsed parsed :db db}))
+(defn- statement-account-arg
+  "明細を入れる口座: \"auto\"（既定）・\"new\"・帳簿の明細の口座の id。知らない id は
+  黙って auto にせず、名前の付いたエラーにする。"
+  [args db]
+  (let [v (get args "statement_account" "auto")
+        ids (map :id (:statement-accounts db))]
+    (if (or (= v "auto") (= v "new") (some #(= v %) ids))
+      v
+      (throw (tool-error "invalid-argument" "argument" "statement_account"
+                         "expected" (vec (concat ["auto" "new"] ids)))))))
+
+(defn- read-input
+  "ファイルを読み、base（無ければ空の帳簿）に :append で合流する。base があれば、
+  ファイルが通貨を言わないときの既定は base の通貨（Ramp の JSON を USD の帳簿に
+  足すとき、既定の JPY で通貨違いにならないように）。"
+  ([args] (read-input args nil "auto"))
+  ([args base statement-account]
+   (let [parsed (ingest/ingest-bytes (input-bytes args) (import-opts args (:currency base "JPY")))
+         base (or base (assoc core/empty-db :currency (:currency parsed "JPY")))
+         {:keys [db error] :as merged} (core/merge-import base parsed :append {:statement-account statement-account})]
+     (when error (throw (tool-error "currency-mismatch" "detail" error)))
+     {:parsed parsed :db db :merged merged})))
 
 (defn- export-out [db fmt args]
   (let [{:keys [error text bytes encoding notes]}
@@ -138,16 +156,25 @@
 ;; ───────── tools ─────────
 
 (defn import-tool [args]
-  (reject-unknown args ["text" "bytes_base64" "format" "encoding" "currency" "date_order"])
-  (let [{:keys [parsed db]} (read-input args)]
+  (reject-unknown args ["text" "bytes_base64" "format" "encoding" "currency" "date_order"
+                        "ledger" "statement_account"])
+  (let [base (when (contains? args "ledger") (ledger-arg args))
+        {:keys [parsed db merged]} (read-input args base (statement-account-arg args base))]
     {"format" (some-> (:format parsed) name)
      "encoding" (:encoding parsed)
      "entries" (count (:entries db))
      "invoices" (count (:invoices db))
      "statement_lines" (count (:statement-lines db))
+     "added" {"entries" (:added merged 0)
+              "entries_duplicates" (:duplicates merged 0)
+              "invoices" (:invoices-added merged 0)
+              "invoices_duplicates" (:invoices-duplicates merged 0)
+              "statement_lines" (:lines-added merged 0)
+              "statement_lines_duplicates" (:lines-duplicates merged 0)
+              "statement_lines_corrected" (:lines-corrected merged 0)}
      "rejected" (+ (:rejected parsed 0) (:invoices-rejected parsed 0))
      "skipped" (:invoices-skipped parsed 0)
-     "warnings" (vec (:warnings parsed))
+     "warnings" (vec (concat (:warnings parsed) (:warnings merged)))
      "checks" (checks-out db)
      "ledger" (ledger-out db)}))
 
@@ -494,15 +521,27 @@
                        "or manual journal CSV, or a kaikei ledger), an invoice file, a bank/card statement the user downloaded "
                        "(OFX/QFX/QBO, 全銀 fixed-length or CSV, freee・MF・Xero・QuickBooks statement CSV, a bank or card CSV with a "
                        "preset), or an expense/AP export (Ramp or Brex API JSON, Expensify CSV from kaikei's template, BILL v3 bills) "
-                       "into a kaikei ledger with checks. "
+                       "into a kaikei ledger with checks. Pass ledger to add the file to that ledger instead of a new one, "
+                       "as the app's append import does: duplicates (same entry, invoice, or statement line by FITID/uid or "
+                       "content) are skipped and counted in added; a file in another currency is an error. "
                        "Pure: nothing is sent, stored or fetched; it does not call any accounting API.")
     "inputSchema" {"type" "object"
                    "properties" (merge input-schema
                                        {"format" {"type" "string" "enum" (vec (cons "auto" ingest/format-ids)) "default" "auto"}
                                         "encoding" {"type" "string" "enum" ["auto" "utf-8" "shift_jis"] "default" "auto"}
-                                        "currency" currency-schema
+                                        "currency" (-> currency-schema
+                                                       (dissoc "default")
+                                                       (assoc "description" (str "Currency when the file does not say (Xero responses, QBO without "
+                                                                                 "CurrencyRef, Xero/QBO CSV, Ramp, Brex). Default: the ledger's "
+                                                                                 "currency when ledger is given, else JPY.")))
                                         "date_order" {"type" "string" "enum" ["mdy" "dmy"]
-                                                      "description" "Numeric date order in QBO/Xero CSV; guessed when omitted."}})
+                                                      "description" "Numeric date order in QBO/Xero CSV; guessed when omitted."}
+                                        "ledger" (assoc ledger-schema "description"
+                                                        "A kaikei.ledger.v1 object to add the file to (default: a new, empty ledger).")
+                                        "statement_account" {"type" "string"
+                                                             "description" (str "Statement account for statement lines: auto (default; the "
+                                                                                "account with the same bank/account key, else a new one), new, "
+                                                                                "or an existing account id in ledger.")}})
                    "additionalProperties" false}
     "run" import-tool}
    {"name" "kaikei_validate"

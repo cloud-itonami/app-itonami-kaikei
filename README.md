@@ -38,7 +38,7 @@
 | 判断コア（guest） | `aiueos/kaikei_journal.cljk`（仕訳の検証・試算表・段階利益・B/S の照合・請求書の税率ごとの税額・明細の残高と消込の強さ。`:effects #{}`） |
 | adapter・形式・帳票・請求書・明細 | `src/kaikei/`（`core` `invoice` `statement` `ingest` `export` `compat/*` `view` `mcp`） |
 | 画面 | `site/`（scittle + Re-frame／Reagent、DADS）。公開先は `https://itonami.cloud/sites/app/kaikei/` |
-| agent の tool | `bin/kaikei-mcp`（stdio MCP、tool 11、pure） |
+| agent の tool | `bin/kaikei-mcp`（stdio MCP、tool 11、pure。`kaikei_import` は `ledger` を渡すと、その帳簿に足す） |
 | 設計の正本 | `docs/aiueos-dapp.md` |
 | 旧来の入口（Cloudflare Worker、静的） | `appview/kaikei-core-kaikei01/`（下の歴史の節） |
 

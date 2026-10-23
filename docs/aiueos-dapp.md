@@ -692,3 +692,34 @@ kaikei.ledger.v1 には任意のキー（`statement_accounts`・`statement_lines
   BILL の請求書 2 件（通貨の警告）、Expensify の CSV 2 行（Open の 1 行と、会社のカードの警告）。取り込みの
   欄の Expensify の template。375px で横スクロールなし、network は 127.0.0.1 と blob: だけ、console の
   エラーなし。
+
+### MCP: 今の帳簿に足す取り込み（2026-10-23、Linear JUN-338）
+
+第 4 スライスの登録（cloud-itonami/itonami-registry#20）で見つけた穴を埋めた。それまでの
+`kaikei_import` は 1 つのファイルを空の帳簿に読むだけで、MCP だけでは明細を帳簿の仕訳・
+請求書と突き合わせられなかった（app から書き出した帳簿 JSON が要った）。
+
+- `kaikei_import` に `ledger`（任意）を足した。渡すと、画面の「追加」の取り込みと同じ
+  `core/merge-import` の `:append` で、その帳簿に足す。重複（同じ仕訳・同じ請求書、明細は
+  FITID／uid か内容の鍵と何番目か）は飛ばし、新しい出力 `added` に数を返す。
+- `statement_account`（`auto`・`new`・帳簿の口座の id）を足した。画面の取り込みの欄と同じ。
+  知らない id は、黙って `auto` にせず `invalid-argument` にする。
+- ファイルが通貨を言わないとき（QBO・Xero の CSV など）の既定は、`ledger` があればその
+  帳簿の通貨（無ければ JPY）。通貨の違うファイルは、行を落とさず `currency-mismatch` にする。
+- 合流の警告（OFX の訂正が計上済みの行に当たったときなど）も `warnings` に出す（前は出して
+  いなかった）。
+- サーバの版は 0.4.0。tool の数（11）と、ほかの tool の形は変わらない。画面は `mcp.cljk` を
+  読まないので、公開物は変わらない。
+
+**実測（2026-10-23）**
+
+- `npm test`（kbb）→ **132 tests, 1241 assertions, 0 failures**。
+  - 明細の無い帳簿（サンプルから明細を除いたもの）に `ofx-bank.ofx` を足す → 仕訳・請求書は
+    そのままで明細 3 行。`kaikei_statement_suggest` の ﾐﾅﾄ の入金 58,880 に、請求書 i1（59,320）の
+    消込が強さ 3・手数料 440 で出る。
+  - 同じファイルをもう一度足すと、`added` は 0 行・重複 3 行。
+  - `statement_account` は口座の id で 1 口座のまま、`new` で 2 口座・6 行。知らない id はエラー。
+  - USD の帳簿に通貨の無い QBO の CSV を足すと、帳簿の通貨で読む。OFX（JPY）はエラー。
+  - stdio: 別のプロセスの call が返した帳簿 JSON を次の call に渡して、OFX を足せる。
+- 負の対照: 既定の通貨を JPY に戻した写しは、通貨の test が 2 つ落ちる。
+
