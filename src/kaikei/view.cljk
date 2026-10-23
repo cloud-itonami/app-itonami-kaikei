@@ -18,7 +18,8 @@
             [kaikei.core :as core]
             [kaikei.ingest :as ingest]
             [kaikei.invoice :as invoice]
-            [kaikei.statement :as statement]))
+            [kaikei.statement :as statement]
+            [kaikei.compat.statement-csv :as statement-csv]))
 
 ;; ───────── 小部品（dandori.view と同じ形） ─────────
 
@@ -86,7 +87,46 @@
    :statement-form {:account "" :tax "taxable-0" :partner "" :qualified? false :make-rule? false}
    :rule-draft {:text "" :op "contains" :direction "out" :account "" :tax "taxable-0"}
    :statement-settings-open? false :rules-open? false
-   :statement-export-format "freee-statement-csv" :statement-export-encoding nil})
+   :statement-export-format "freee-statement-csv" :statement-export-encoding nil
+   :import-pending nil :import-mapping nil :confirm-delete-file nil})
+
+(def default-mapping
+  "画面の列の割り当ての初期値（値はすべて文字列）。"
+  {:preset "" :date "" :date-order "auto" :amount "" :out "" :in "" :direction-column "" :in-value "1"
+   :out-value "2" :description "" :description2 "" :counterparty "" :balance "" :reference ""
+   :kind "bank" :invert? false :header? true :skip-rows "0"})
+
+(defn- blank->nil* [v] (when-not (text/blank? (str v)) (str v)))
+
+(defn ui->mapping
+  "画面の割り当て（文字列）→ kaikei.compat.statement-csv の mapping。"
+  [m]
+  (cond-> {:date (blank->nil* (:date m)) :date-order (:date-order m "auto")
+           :description (vec (keep blank->nil* [(:description m) (:description2 m)]))
+           :kind (keyword (:kind m "bank")) :invert? (boolean (:invert? m))
+           :header? (not (false? (:header? m))) :skip-rows (or (some-> (:skip-rows m) str text/trim parse-long) 0)}
+    (blank->nil* (:amount m)) (assoc :amount (:amount m))
+    (blank->nil* (:out m)) (assoc :out (:out m))
+    (blank->nil* (:in m)) (assoc :in (:in m))
+    (blank->nil* (:direction-column m)) (assoc :direction {:column (:direction-column m)
+                                                           :in (str (:in-value m)) :out (str (:out-value m))})
+    (blank->nil* (:counterparty m)) (assoc :counterparty (:counterparty m))
+    (blank->nil* (:balance m)) (assoc :balance (:balance m))
+    (blank->nil* (:reference m)) (assoc :reference (:reference m))
+    (blank->nil* (:preset m)) (assoc :preset (:preset m))))
+
+(defn mapping->ui
+  "kaikei.compat.statement-csv の mapping → 画面の割り当て。"
+  [m]
+  (merge default-mapping
+         {:preset (or (:preset m) "") :date (or (:date m) "") :date-order (or (:date-order m) "auto")
+          :amount (or (:amount m) "") :out (or (:out m) "") :in (or (:in m) "")
+          :direction-column (or (get-in m [:direction :column]) "")
+          :in-value (or (get-in m [:direction :in]) "1") :out-value (or (get-in m [:direction :out]) "2")
+          :description (or (first (:description m)) "") :description2 (or (second (:description m)) "")
+          :counterparty (or (:counterparty m) "") :balance (or (:balance m) "") :reference (or (:reference m) "")
+          :kind (name (or (:kind m) :bank)) :invert? (boolean (:invert? m))
+          :header? (not (false? (:header? m))) :skip-rows (str (or (:skip-rows m) 0))}))
 
 (def page-size 100)
 
@@ -222,6 +262,70 @@
     (btn h [:run-import-text] "貼り付けたテキストを取り込む"
          {:type "solid-fill" :disabled (text/blank? (or (:import-text ui) ""))})]])
 
+(defn mapping-panel
+  "汎用の明細 CSV の列の割り当て（判断 3）。形式を判定できなかった CSV に出す。"
+  [{:keys [ui]} h]
+  (let [{:keys [name rows]} (:import-pending ui)
+        m (or (:import-mapping ui) default-mapping)
+        mapping (ui->mapping m)
+        cols (statement-csv/headers rows mapping)
+        opts (cons ["" "（使わない）"] (map (fn [c] [c c]) cols))
+        col (fn [id label k & [support]]
+              (field id label (select-el h [:set-import-mapping k] (get m k "") opts {:id id}) support))]
+    [:section {:class "kk-panel" :aria-labelledby "kk-mapping-heading"}
+     [:h2 {:id "kk-mapping-heading" :class "kk-h2"} (str "明細の CSV の列を割り当てる（" name "）")]
+     [:p {:class "kk-help"}
+      "形式を判定できませんでした。銀行・カードの型を選ぶか、列を割り当ててください。"
+      "割り当ては口座に残り、次にその口座へ取り込むときに使います。「未確認」の型は、列の名前を第三者の資料から読んだもので、"
+      "取り込んだ日付・金額・向きを確かめてください。"]
+     [:div {:class "kk-settings"}
+      (field "kk-map-preset" "型"
+             (select-el h [:apply-preset] (:preset m "")
+                        (concat [["" "列を割り当てる"]]
+                                (for [p statement-csv/presets]
+                                  [(:id p) (str (:label p) (if (:verified? p) "（確かめた）" "（未確認）"))]))
+                        {:id "kk-map-preset"}))
+      (field "kk-map-kind" "口座の種類"
+             (select-el h [:set-import-mapping :kind] (:kind m) [["bank" "預金（入金が正）"] ["card" "カード"]] {:id "kk-map-kind"}))
+      (field "kk-map-skip" "見出しの前に読み飛ばす行" (text-input h [:set-import-mapping :skip-rows] (:skip-rows m) {:id "kk-map-skip" :input-mode "numeric"}))]
+     [:div {:class "kk-settings"}
+      [:label {:class "kk-check"}
+       [:input (with-handler {:type "checkbox" :checked (not (false? (:header? m)))}
+                 :on-change (h :checked [:set-import-mapping :header?]))]
+       " 1 行目は見出し"]
+      [:label {:class "kk-check"}
+       [:input (with-handler {:type "checkbox" :checked (boolean (:invert? m))}
+                 :on-change (h :checked [:set-import-mapping :invert?]))]
+       " 利用（出金）が正の数で書かれている（カードの明細に多い）"]]
+     [:div {:class "kk-settings"}
+      (col "kk-map-date" "日付の列" :date)
+      (field "kk-map-date-order" "日付の形"
+             (select-el h [:set-import-mapping :date-order] (:date-order m)
+                        [["auto" "自動（年が先頭、または推す）"] ["ymd" "年/月/日"] ["mdy" "月/日/年"] ["dmy" "日/月/年"]
+                         ["wareki" "和暦 YYMMDD（令和）"]]
+                        {:id "kk-map-date-order"}))
+      (col "kk-map-amount" "金額の列（1 列）" :amount "入金が正・出金が負。入出金区分の列があればそれで向きを決める")
+      (col "kk-map-out" "出金の列" :out)
+      (col "kk-map-in" "入金の列" :in)]
+     [:div {:class "kk-settings"}
+      (col "kk-map-direction" "入出金区分の列" :direction-column)
+      (field "kk-map-in-value" "入金の値" (text-input h [:set-import-mapping :in-value] (:in-value m) {:id "kk-map-in-value"}))
+      (field "kk-map-out-value" "出金の値" (text-input h [:set-import-mapping :out-value] (:out-value m) {:id "kk-map-out-value"}))
+      (col "kk-map-desc" "摘要の列" :description)
+      (col "kk-map-desc2" "摘要の列（2 つ目）" :description2)
+      (col "kk-map-counterparty" "振込依頼人・取引先の列" :counterparty)
+      (col "kk-map-balance" "残高の列" :balance)
+      (col "kk-map-reference" "参照・番号の列" :reference)]
+     [:h3 {:class "kk-h3"} "先頭の行"]
+     [:div {:class "kk-table-wrap"}
+      [:table {:class "kk-table"}
+       (into [:tbody] (for [r (take 6 rows)] (into [:tr] (map (fn [v] [:td v]) r))))]]
+     [:div {:class "kk-actions"}
+      (btn h [:run-import-mapped] "この割り当てで取り込む"
+           {:type "solid-fill" :disabled (or (nil? (:date mapping))
+                                             (not (or (:amount mapping) (:out mapping) (:in mapping))))})
+      (btn h [:cancel-import-mapping] "やめる" {:type "text"})]]))
+
 (defn import-result [{:keys [format encoding added duplicates rejected warnings error
                              invoices-added invoices-duplicates invoices-rejected invoices-dropped
                              lines-added lines-duplicates lines-corrected lines-dropped]} h]
@@ -231,11 +335,13 @@
      [:p (str (or (:label (ingest/format-by-id (some-> format name))) "入力")
               (when encoding (str "（" (ingest/encoding-label encoding) "）"))
               " から "
-              (text/join "、" (remove nil? [(when (or (pos? (or added 0))
-                                                      (and (zero? (or invoices-added 0)) (zero? (or lines-added 0))))
-                                              (str added " 件の仕訳"))
-                                            (when (pos? (or invoices-added 0)) (str invoices-added " 件の請求書"))
-                                            (when (pos? (or lines-added 0)) (str lines-added " 行の明細"))]))
+              (let [statements? (= :statements (:content (ingest/format-by-id (some-> format name))))]
+                (text/join "、" (remove nil? [(when (and (not statements?)
+                                                         (or (pos? (or added 0))
+                                                             (and (zero? (or invoices-added 0)) (zero? (or lines-added 0)))))
+                                                (str added " 件の仕訳"))
+                                              (when (pos? (or invoices-added 0)) (str invoices-added " 件の請求書"))
+                                              (when (or (pos? (or lines-added 0)) statements?) (str (or lines-added 0) " 行の明細"))])))
               "を取り込みました。"
               (when (pos? (or duplicates 0)) (str "同じ仕訳 " duplicates " 件は飛ばしました。"))
               (when (pos? (or invoices-duplicates 0)) (str "同じ請求書 " invoices-duplicates " 件は飛ばしました。"))
@@ -1105,6 +1211,37 @@
              (for [[partner ks] (sort-by key (:aliases st)) k ks]
                [:li (str partner " ← " k " ") (btn h [:delete-alias partner k] "削除" {:type "text"})])))]))
 
+(defn- original-files
+  "取り込んだ元のファイル（判断 5）。バイト列はこの端末の IndexedDB に、帳簿には
+  名前・SHA-256・大きさ・時刻だけを持つ。"
+  [data ui account h]
+  (let [fs (filter #(some #{(:id account)} (:account-ids %)) (:files data))]
+    [:div
+     [:h3 {:class "kk-h3"} "取り込んだ元のファイル"]
+     [:p {:class "kk-help"}
+      "ファイル選択で取り込んだ明細は、元のバイト列のまま、この端末に残します（SHA-256 で同じものか確かめられます）。"
+      "受け取ったデータそのものの保存（電子帳簿保存法 一問一答【電子取引関係】問 36）を助けるだけで、要件を満たすとは言いません。"
+      "ブラウザの保存は消えることがあるので、書き出して手元にも残してください。"]
+     (if (empty? fs)
+       [:p "まだありません（貼り付けた明細は残しません）。"]
+       [:div {:class "kk-table-wrap"}
+        [:table {:class "kk-table"}
+         [:thead [:tr [:th {:scope "col"} "ファイル"] [:th {:scope "col"} "取り込み"] [:th {:scope "col"} "SHA-256"]
+                  [:th {:scope "col" :class "kk-num"} "バイト"] [:th {:scope "col" :class "kk-num"} "行"]
+                  [:th {:scope "col"} [:span {:class "kk-visually-hidden"} "操作"]]]]
+         (into [:tbody]
+               (for [f fs]
+                 [:tr [:th {:scope "row"} (:name f)] [:td (:imported-at f)]
+                  [:td [:code {:title (:sha256 f)} (str (subs (str (:sha256 f)) 0 (min 16 (count (str (:sha256 f))))) "…")]]
+                  [:td {:class "kk-num"} (:size f)]
+                  [:td {:class "kk-num"} (count (filter #(= (:id f) (:file-id %)) (:statement-lines data)))]
+                  [:td (btn h [:download-original (:id f)] "書き出す" {:type "text"})
+                   (if (= (:id f) (:confirm-delete-file ui))
+                     [:span {:class "kk-confirm"}
+                      (btn h [:delete-original (:id f)] "本当に消す" {:type "solid-fill" :class "kk-danger"})
+                      (btn h [:set-ui :confirm-delete-file nil] "やめる")]
+                     (btn h [:set-ui :confirm-delete-file (:id f)] "消す" {:type "text"}))]]))]])]))
+
 (defn statements-view [{:keys [data ui] :as state} h]
   (let [{:keys [account summaries rows count page pages] :as sd} (or (:statements state) (derive-statements data ui))
         selected (:statement-selected ui #{})
@@ -1171,7 +1308,8 @@
         (when (> pages 1)
           [:div {:class "kk-actions"}
            (btn h [:set-ui :statement-page (dec page)] "前へ" {:disabled (zero? page)})
-           (btn h [:set-ui :statement-page (inc page)] "次へ" {:disabled (>= (inc page) pages)})])])
+           (btn h [:set-ui :statement-page (inc page)] "次へ" {:disabled (>= (inc page) pages)})])
+        (original-files data ui account h)])
      (when line (statement-line-detail data ui line status candidates h))]))
 
 ;; ───────── 年齢表（請求書タブ） ─────────
@@ -1254,6 +1392,7 @@
      (toolbar state h)
      (when-let [r (:export-result ui)] (export-result r h))
      (when (:import-open? ui) (import-panel state h))
+     (when (:import-pending ui) (mapping-panel state h))
      (when-let [r (:import-result ui)] (import-result r h))
      (if (and (empty-book? data) (not (#{:invoices :statements} (:mode ui))))
        (empty-state h)

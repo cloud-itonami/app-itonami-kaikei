@@ -1,0 +1,299 @@
+(ns kaikei.compat.zengin
+  "全銀協の固定長 200 バイトの明細（第 4 スライス、JUN-327）。読むだけ。
+
+    種別 03  入出金取引明細（普通・当座・貯蓄）
+    種別 01  振込入金通知（フォーマット A・B）
+
+  形の正本: 全銀協「XML形式 適用業務およびレコード・フォーマット」（2026-10 改正。
+  固定長の項目と桁数を XML への対応表の中に載せている）、北陸銀行の仕様（変位）、
+  三菱 UFJ BizSTATION・山梨中央銀行・GMO あおぞらネット銀行の仕様。山梨中央と GMO
+  あおぞらの「全銀 CSV」（同じ項目をカンマで区切ったもの）も読む。
+
+  - レコードはヘッダ（データ区分 1）・データ（2）・トレーラ（8）・エンド（9）。
+    改行（CR+LF）のあるファイルも、200 バイトが続くだけのファイルも読む。
+  - 文字は半角だけ（JIS X 0201。Shift_JIS の 1 バイトの範囲と同じ）。コード区分 1
+    （EBCDIC）は読まない。
+  - 日付は和暦 YYMMDD（全銀協の文書の対応表の注）。令和として読む（kaikei の推測。
+    31 で 4 月 30 日までは平成 31 年 = 2019 年）。
+  - 03 の金額は符号なしで、向きは入払区分（1 入金・2 出金）。取引区分 19（訂正）は
+    入払区分がもう逆になっている。行ごとの残高は無く、ヘッダの取引前残高とトレーラの
+    取引後残高（貸越区分が符号）だけ。トレーラの件数・合計と、取引前残高 + 明細の和 =
+    取引後残高（guest の closing-gap）を確かめ、合えば行ごとの残高を足し上げて付ける。
+  - 03 の通知預金・定期預金（預金種目 5・6）はデータの形が違うので読まない。
+  - 01 は入金だけ。取消区分 1 は負。フォーマット B（金額(1) が 0 で金額(2) がある）も読む。
+    01 は 03 と同じ入金を持つので、別の口座（鍵 zengin-01:…）に入れて警告する。
+
+  一意な id は無いので、照会番号と勘定日で作る（kaikei の推測）。口座は銀行コード・
+  支店コード・預金種目・口座番号の下 4 桁で見分け、口座番号は下 4 桁だけを持つ。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]))
+
+;; ───────── レコードの形（[名前 開始（1 始まり） 長さ]） ─────────
+
+(def header-03
+  [[:data-kind 1 1] [:type 2 2] [:code 4 1] [:created 5 6] [:from 11 6] [:to 17 6]
+   [:bank-code 23 4] [:bank-name 27 15] [:branch-code 42 3] [:branch-name 45 15] [:dummy 60 3]
+   [:deposit-type 63 1] [:account-number 64 10] [:account-name 74 40] [:overdraft 114 1]
+   [:passbook 115 1] [:opening 116 14] [:dummy2 130 71]])
+
+(def data-03
+  [[:data-kind 1 1] [:inquiry 2 8] [:date 10 6] [:value-date 16 6] [:direction 22 1]
+   [:transaction-type 23 2] [:amount 25 12] [:other-checks 37 12] [:exchange-date 49 6]
+   [:dishonor-date 55 6] [:bill-kind 61 1] [:bill-number 62 7] [:branch-no 69 3]
+   [:payer-code 72 10] [:payer-name 82 48] [:remit-bank 130 15] [:remit-branch 145 15]
+   [:summary 160 20] [:edi 180 20] [:dummy 200 1]])
+
+(def trailer-03
+  [[:data-kind 1 1] [:in-count 2 6] [:in-total 8 13] [:out-count 21 6] [:out-total 27 13]
+   [:overdraft 40 1] [:closing 41 14] [:records 55 7] [:dummy 62 139]])
+
+(def header-01
+  [[:data-kind 1 1] [:type 2 2] [:code 4 1] [:created 5 6] [:from 11 6] [:to 17 6]
+   [:bank-code 23 4] [:bank-name 27 15] [:branch-code 42 3] [:branch-name 45 15]
+   [:deposit-type 60 1] [:account-number 61 7] [:account-name 68 40] [:dummy 108 93]])
+
+(def data-01
+  [[:data-kind 1 1] [:inquiry 2 6] [:date 8 6] [:value-date 14 6] [:amount 20 10]
+   [:other-checks 30 10] [:payer-code 40 10] [:payer-name 50 48] [:remit-bank 98 15]
+   [:remit-branch 113 15] [:cancel 128 1] [:edi 129 20] [:dummy 149 52]])
+
+(def data-01-b
+  "フォーマット B: 金額(1) は 0 で、取消区分の後に金額(2)・うち他店券金額(2)・EDI 情報。"
+  [[:data-kind 1 1] [:inquiry 2 6] [:date 8 6] [:value-date 14 6] [:amount1 20 10]
+   [:other-checks 30 10] [:payer-code 40 10] [:payer-name 50 48] [:remit-bank 98 15]
+   [:remit-branch 113 15] [:cancel 128 1] [:amount 129 12] [:other-checks2 141 12] [:edi 153 20]
+   [:dummy 173 28]])
+
+(def trailer-01
+  [[:data-kind 1 1] [:count 2 6] [:total 8 12] [:cancel-count 20 6] [:cancel-total 26 12] [:dummy 38 163]])
+
+(defn- fixed-fields [spec s]
+  (into {} (for [[k start len] spec]
+             [k (let [a (dec start) b (min (count s) (+ a len))]
+                  (if (< a (count s)) (subs s a b) ""))])))
+
+(defn- csv-fields [spec row]
+  (into {} (map (fn [[k] v] [k (or v "")]) spec (concat row (repeat nil)))))
+
+;; ───────── 判定・レコードへの分割 ─────────
+
+(def ^:private record-start #"^[1289]")
+
+(defn- fixed-records
+  "固定長の文字列 → 200 文字のレコードの列（改行の有無を問わない）。"
+  [s]
+  (let [s (text/replace (or s "") #"^﻿" "")
+        lines (remove text/blank? (text/split s #"\r\n|\n|\r"))]
+    (if (and (seq lines) (every? #(= 200 (count %)) lines))
+      (vec lines)
+      (let [flat (text/replace s #"\r|\n" "")]
+        (when (zero? (mod (count flat) 200))
+          (vec (for [i (range 0 (count flat) 200)] (subs flat i (+ i 200)))))))))
+
+(defn detect-text?
+  "固定長の全銀の明細（種別 03・01）か。"
+  [s]
+  (boolean (when-let [rs (fixed-records s)]
+             (and (seq rs) (text/re-find #"^1(03|01)[01]\d{18}" (first rs))))))
+
+(defn csv-detect?
+  "全銀 CSV（同じ項目をカンマで区切ったもの）か。"
+  [rows]
+  (let [r (first rows)]
+    (boolean (and (>= (count rows) 2)
+                  (= "1" (text/trim (str (first r))))
+                  (#{"03" "01"} (text/trim (str (second r))))
+                  (every? #(text/re-find record-start (text/trim (str (first %)))) rows)))))
+
+;; ───────── 値の読み ─────────
+
+(defn wareki-date
+  "和暦 YYMMDD → \"YYYY-MM-DD\"。令和として読む（31 で 4 月 30 日までは平成 31 年）。"
+  [s]
+  (when-let [[_ yy mm dd] (text/re-matches #"\s*(\d{2})(\d{2})(\d{2})\s*" (str s))]
+    (let [y (parse-long yy)
+          md (+ (* 100 (parse-long mm)) (parse-long dd))
+          year (if (and (= y 31) (<= md 430)) 2019 (+ 2018 y))]
+      (core/parse-date (str year "-" mm "-" dd)))))
+
+(defn- digits [s]
+  (let [t (text/trim (str s))]
+    (when (text/re-matches #"\d+" t) (parse-long t))))
+
+(defn- trim* [s] (some-> s str text/trim not-empty))
+
+(defn- tail [s n] (let [s (str s)] (if (> (count s) n) (subs s (- (count s) n)) s)))
+
+(def deposit-type-label {"1" "普通" "2" "当座" "4" "貯蓄" "5" "通知" "6" "定期" "7" "積立定期"})
+
+(defn- account-of [h type]
+  (let [number (text/trim (str (:account-number h)))]
+    {:key (str (if (= type "01") "zengin-01:" "zengin:") (text/trim (str (:bank-code h))) ":"
+               (text/trim (str (:branch-code h))) ":" (text/trim (str (:deposit-type h))) ":" (tail number 4))
+     :kind :bank
+     :name (str (or (trim* (:bank-name h)) (str "銀行 " (trim* (:bank-code h)))) " "
+                (or (trim* (:branch-name h)) "") " "
+                (deposit-type-label (text/trim (str (:deposit-type h))) "")
+                " ****" (tail number 4)
+                (when (= type "01") "（振込入金通知）"))
+     :ledger-account (if (= "2" (text/trim (str (:deposit-type h)))) "当座預金" "普通預金")
+     :currency "JPY"
+     :origin {:format :zengin :type type}}))
+
+(defn- signed [flag n] (if (= "2" (text/trim (str flag))) (- n) n))
+
+;; ───────── 読み ─────────
+
+(defn- read-03 [h ds t id where]
+  (let [opening (some->> (digits (:opening h)) (signed (:overdraft h)))
+        parts (map-indexed
+               (fn [i d]
+                 (let [w (str where " の明細 " (inc i))
+                       date (wareki-date (:date d))
+                       amount (digits (:amount d))
+                       dir (text/trim (str (:direction d)))
+                       payer (trim* (:payer-name d))
+                       summary (trim* (:summary d))]
+                   (cond
+                     (nil? date) {:problem (str w ": 勘定日 \"" (:date d) "\" を読めません")}
+                     (nil? amount) {:problem (str w ": 取引金額 \"" (:amount d) "\" を読めません")}
+                     (not (#{"1" "2"} dir)) {:problem (str w ": 入払区分 \"" dir "\" を読めません")}
+                     :else
+                     {:line (cond-> {:account-id id :date date
+                                     :amount (if (= dir "2") (- amount) amount)
+                                     :description (text/join " " (remove nil? [summary (when (= dir "1") payer)]))
+                                     :reference (text/trim (str (:inquiry d)))
+                                     :uid (str (:date d) "-" (text/trim (str (:inquiry d))))
+                                     :origin {:format :zengin :type "03"}
+                                     :hints (cond-> {:transaction-type (text/trim (str (:transaction-type d)))}
+                                              (some-> (digits (:payer-code d)) pos?) (assoc :payer-code (text/trim (str (:payer-code d))))
+                                              (trim* (:edi d)) (assoc :edi (trim* (:edi d))))}
+                              (and (= dir "1") payer) (assoc :counterparty payer))})))
+               ds)
+        lines (vec (keep :line parts))
+        closing (when t (some->> (digits (:closing t)) (signed (:overdraft t))))
+        ins (filter #(pos? (:amount %)) lines)
+        outs (filter #(neg? (:amount %)) lines)
+        checks (when (and t (= (count lines) (count ds)))
+                 (remove nil?
+                         [(when (not= (digits (:in-count t)) (count ins)) "入金件数がトレーラと合いません")
+                          (when (not= (digits (:in-total t)) (reduce + 0 (map :amount ins))) "入金額合計がトレーラと合いません")
+                          (when (not= (digits (:out-count t)) (count outs)) "出金件数がトレーラと合いません")
+                          (when (not= (digits (:out-total t)) (- (reduce + 0 (map :amount outs)))) "出金額合計がトレーラと合いません")
+                          (when (and opening closing
+                                     (not (zero? (core/closing-gap (vec (mapcat (fn [l] [(:amount l) 0]) lines)) opening closing))))
+                            "取引前残高 + 明細の和 が取引後残高と合いません")]))
+        balanced? (and opening closing (empty? checks) (= (count lines) (count ds)))
+        lines (if balanced?
+                ;; 残高を足し上げて行に付ける（照合の続き具合に使う）
+                (second (reduce (fn [[b acc] l] (let [b (+ b (:amount l))] [b (conj acc (assoc l :balance b))]))
+                                [opening []] lines))
+                lines)]
+    {:lines lines
+     :statement-balance (when (and closing (wareki-date (:to h))) {:amount closing :date (wareki-date (:to h))})
+     :warnings (concat (keep :problem parts) (map #(str where ": " %) checks))
+     :rejected (count (filter :problem parts))}))
+
+(defn- read-01 [h ds t id where]
+  (let [parts (map-indexed
+               (fn [i d]
+                 (let [w (str where " の明細 " (inc i))
+                       date (wareki-date (:date d))
+                       amount (digits (:amount d))
+                       payer (trim* (:payer-name d))
+                       cancel? (= "1" (text/trim (str (:cancel d))))]
+                   (cond
+                     (nil? date) {:problem (str w ": 勘定日 \"" (:date d) "\" を読めません")}
+                     (nil? amount) {:problem (str w ": 金額 \"" (:amount d) "\" を読めません")}
+                     :else
+                     {:line (cond-> {:account-id id :date date :amount (if cancel? (- amount) amount)
+                                     :description (text/join " " (remove nil? [(if cancel? "振込取消" "振込") payer]))
+                                     :reference (text/trim (str (:inquiry d)))
+                                     :uid (str "01-" (:date d) "-" (text/trim (str (:inquiry d))))
+                                     :origin {:format :zengin :type "01"}
+                                     :hints (cond-> {}
+                                              (some-> (digits (:payer-code d)) pos?) (assoc :payer-code (text/trim (str (:payer-code d))))
+                                              (trim* (:edi d)) (assoc :edi (trim* (:edi d))))}
+                              payer (assoc :counterparty payer))})))
+               ds)
+        lines (vec (keep :line parts))
+        sum (fn [ls] (reduce + 0 (map :amount ls)))
+        checks (when (and t (= (count lines) (count ds)))
+                 (remove nil?
+                         [(when (not= (digits (:count t)) (count (filter pos? (map :amount lines)))) "振込合計件数がトレーラと合いません")
+                          (when (not= (digits (:total t)) (sum (filter #(pos? (:amount %)) lines))) "振込合計金額がトレーラと合いません")]))]
+    {:lines lines
+     :warnings (concat (keep :problem parts) (map #(str where ": " %) checks)
+                       [(str where ": 振込入金通知は、入出金取引明細と同じ入金を持ちます。同じ口座の入出金取引明細も取り込むなら、"
+                             "どちらか一方を計上してください（別の口座として入れました）")])
+     :rejected (count (filter :problem parts))}))
+
+(defn- group-accounts
+  "レコード（データ区分と項目）の列 → 口座ごとの [ヘッダ データの列 トレーラ]。"
+  [records]
+  (loop [rs records cur nil out []]
+    (if-let [[kind fields] (first rs)]
+      (case kind
+        "1" (recur (rest rs) {:header fields :data []} (if cur (conj out cur) out))
+        "2" (recur (rest rs) (when cur (update cur :data conj fields)) out)
+        "8" (recur (rest rs) (when cur (assoc cur :trailer fields)) out)
+        (recur (rest rs) cur out))
+      (if cur (conj out cur) out))))
+
+(defn- read-records
+  "fields-of: [仕様 元] → 項目の map。records: 元の列（固定長の文字列か CSV の行）。"
+  [raw kind-of fields-of]
+  (let [type (text/trim (str (:type (fields-of header-03 (first raw)))))
+        records (for [r raw
+                      :let [k (kind-of r)]]
+                  [k (case k
+                       "1" (fields-of (if (= type "01") header-01 header-03) r)
+                       "2" (if (= type "01")
+                             (let [a (fields-of data-01 r)]
+                               (if (and (= 0 (digits (:amount a))) (some-> (fields-of data-01-b r) :amount digits pos?))
+                                 (fields-of data-01-b r)
+                                 a))
+                             (fields-of data-03 r))
+                       "8" (fields-of (if (= type "01") trailer-01 trailer-03) r)
+                       {})])
+        accounts (group-accounts records)
+        results (map-indexed
+                 (fn [i {:keys [header data trailer]}]
+                   (let [id (str "s" (inc i))
+                         where (str "口座 " (inc i))
+                         code (text/trim (str (:code header)))
+                         dtype (text/trim (str (:deposit-type header)))]
+                     (cond
+                       (= code "1") {:warnings [(str where ": コード区分 1（EBCDIC）は読みません")] :rejected (count data)}
+                       (and (= type "03") (#{"5" "6" "7"} dtype))
+                       {:warnings [(str where ": 通知・定期の預金（預金種目 " dtype "）の明細は形が違うので読みません")]
+                        :rejected (count data)}
+                       :else
+                       (let [{:keys [lines statement-balance warnings rejected]}
+                             ((if (= type "01") read-01 read-03) header data trailer id where)]
+                         {:account (cond-> (assoc (account-of header type) :id id)
+                                     statement-balance (assoc :statement-balance statement-balance))
+                          :lines lines :warnings warnings :rejected rejected}))))
+                 accounts)]
+    (if (empty? accounts)
+      {:format :zengin :entries [] :accounts [] :rejected 0 :warnings ["全銀の明細のヘッダ（データ区分 1）がありません"]}
+      {:format :zengin
+       :currency "JPY"
+       :accounts []
+       :statement-accounts (vec (keep :account results))
+       :statement-lines (vec (mapcat :lines results))
+       :warnings (vec (mapcat :warnings results))
+       :rejected (reduce + 0 (map #(:rejected % 0) results))})))
+
+(defn read-text
+  "固定長の文字列 → 取り込み結果。"
+  [s]
+  (if-let [rs (fixed-records s)]
+    (read-records rs #(subs % 0 1) fixed-fields)
+    {:format :zengin :entries [] :accounts [] :rejected 0
+     :warnings ["全銀の固定長（1 レコード 200 文字）として読めません"]}))
+
+(defn read-csv
+  "全銀 CSV の行 → 取り込み結果。"
+  [rows]
+  (read-records (vec rows) #(text/trim (str (first %))) csv-fields))

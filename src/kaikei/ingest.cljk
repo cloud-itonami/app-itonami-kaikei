@@ -33,6 +33,8 @@
     mf-statement-csv     マネーフォワード クラウド会計の明細の取り込み
     xero-statement-csv   Xero の明細の CSV
     qbo-bank-csv         QuickBooks Online の明細の CSV（3 列・4 列）
+    zengin               全銀協の入出金取引明細・振込入金通知（固定長 200 バイト・全銀 CSV。読むだけ）
+    statement-csv        汎用の明細 CSV（列の割り当てか型。読むだけ。判断 3）
 
   :content は :journal（仕訳と勘定科目）・:invoices（請求書）・:statements（明細）・
   :all（kaikei-json）。明細の形式の書き出しは口座ごと（opts の :statement-account）。
@@ -58,6 +60,7 @@
             [kaikei.compat.mf :as mf]
             [kaikei.compat.freee :as freee]
             [kaikei.compat.ofx :as ofx]
+            [kaikei.compat.zengin :as zengin]
             [kaikei.compat.statement-csv :as statement-csv]))
 
 (def formats
@@ -108,7 +111,11 @@
    {:id "xero-statement-csv" :content :statements :label "Xero 明細 CSV（bank statement）" :kind :csv
     :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-xero-statement.csv" :mime "text/csv"}
    {:id "qbo-bank-csv" :content :statements :label "QuickBooks Online 明細 CSV（bank transactions）" :kind :csv
-    :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-quickbooks-bank.csv" :mime "text/csv"}])
+    :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-quickbooks-bank.csv" :mime "text/csv"}
+   {:id "zengin" :content :statements :read-only true
+    :label "全銀協 入出金取引明細・振込入金通知（固定長・全銀 CSV、読むだけ）" :kind :zengin :encoding "shift_jis"}
+   {:id "statement-csv" :content :statements :read-only true
+    :label "汎用の明細 CSV（列を割り当てる・銀行とカードの型、読むだけ）" :kind :csv :encoding "utf-8"}])
 
 (def format-ids (mapv :id formats))
 
@@ -161,6 +168,8 @@
     (statement-csv/mf-detect? rows) "mf-statement-csv"
     (statement-csv/qbo-detect? rows) "qbo-bank-csv"
     (statement-csv/xero-detect? rows) "xero-statement-csv"
+    (zengin/csv-detect? rows) "zengin"
+    (statement-csv/detect-preset rows) "statement-csv"
     (freee-invoices/csv-detect? rows) "freee-invoice-csv"
     (mf-invoices/csv-detect? rows) "mf-invoice-csv"
     (xero-invoices/csv-detect? rows) "xero-invoice-csv"
@@ -181,10 +190,13 @@
   "文字列 → 取り込み結果（kaikei.compat.common の形）。opts:
   :format   \"auto\"（既定）か format-ids のどれか
   :currency Xero／QBO の取り込みで、応答に通貨が無いときの帳簿の通貨（既定 JPY）
-  :date-order QBO・Xero の CSV の数だけの日付の並び（\"mdy\"・\"dmy\"。無ければ推す）"
-  [s {:keys [format currency date-order] :or {format "auto" currency "JPY"}}]
+  :date-order QBO・Xero の CSV の数だけの日付の並び（\"mdy\"・\"dmy\"。無ければ推す）
+  :mapping  汎用の明細 CSV の列の割り当て（kaikei.compat.statement-csv）"
+  [s {:keys [format currency date-order mapping] :or {format "auto" currency "JPY"}}]
   (let [opts (cond-> {:currency currency} date-order (assoc :date-order date-order))
         ofx? (or (= format "ofx") (and (= format "auto") (ofx/detect-text? s)))
+        zengin-fixed? (or (and (= format "zengin") (zengin/detect-text? s))
+                          (and (= format "auto") (zengin/detect-text? s)))
         json-format? (= :json (:kind (format-by-id format)))
         data (when (or json-format? (and (= format "auto") (json-text? s)))
                (try (json/parse s) (catch #?(:cljs :default :clj Exception) e ::bad)))
@@ -193,6 +205,7 @@
         json? (if (= format "auto") (and (some? data) (not= data ::bad)) json-format?)]
     (cond
       ofx? (ofx/read-text s)
+      zengin-fixed? (zengin/read-text s)
       json?
       (if (= data ::bad)
         (empty-result format "JSON として読めません")
@@ -230,9 +243,21 @@
           "mf-statement-csv" (statement-csv/read-mf rows)
           "xero-statement-csv" (statement-csv/read-xero rows opts)
           "qbo-bank-csv" (statement-csv/read-qbo rows opts)
+          "zengin" (zengin/read-csv rows)
+          "statement-csv" (if-let [m (or mapping (:mapping (statement-csv/detect-preset rows)))]
+                            (statement-csv/read-mapped rows
+                                                       (if mapping m (assoc m :preset (:id (statement-csv/detect-preset rows))))
+                                                       opts)
+                            (empty-result fmt "汎用の明細 CSV は、列を割り当ててから取り込んでください"))
           (empty-result fmt (if (nil? fmt)
                               "CSV の形を判定できません。形式を選んでから取り込んでください"
                               (str (:label (format-by-id fmt)) " は CSV ではありません"))))))))
+
+(defn decode-csv
+  "バイト列 → {:rows CSV の行 :encoding}（画面の列の割り当てに見出しを出すため）。"
+  [b encoding]
+  (let [{:keys [text] :as decoded} (enc/decode b (when-not (= encoding "auto") encoding))]
+    {:rows (csv/parse text) :encoding (:encoding decoded)}))
 
 (defn ingest-bytes
   "バイト列（Uint8Array）→ 取り込み結果 + :encoding。opts は ingest-text と同じに

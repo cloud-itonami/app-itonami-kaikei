@@ -248,3 +248,153 @@
                     [(common/format-ordered-date (:date l) order) (:description l "") (plain-amount (:amount l) exp)])))
      :notes (cond-> [lossy "QuickBooks の 3 列の形（入金が正、支払が負）で書きます"]
               (some :balance ls) (conj "残高は QuickBooks の明細の CSV に入りません"))}))
+
+;; ───────── 汎用の CSV（列の割り当て、判断 3） ─────────
+;;
+;; 一次資料の無い銀行・カードの CSV は、利用者が列を割り当てて読む。割り当ては口座に
+;; 残し（:mapping）、次の取り込みで使う。型（preset）は「確かめた」（銀行の公開した
+;; 仕様）と「未確認」（第三者のパーサから読んだ列）を分けて出し、未確認の型で読んだ
+;; ときは警告する。
+;;
+;;   {:preset "…" :skip-rows 0 :header? true
+;;    :date "列" | :date-parts ["年" "月" "日"]
+;;    :date-order "auto" | "ymd" | "mdy" | "dmy" | "wareki"   ; wareki = 和暦 YYMMDD
+;;    :amount "列" | :out "列" :in "列"
+;;    :direction {:column "列" :in "1" :out "2"}           ; :amount と組で使う
+;;    :invert? false                                      ; カード: 利用が正の CSV
+;;    :description ["列" …] :counterparty "列" :balance "列" :reference "列"
+;;    :kind :bank | :card}
+;;
+;; 列は見出しの名前（揃えたもの）。見出しの無い CSV は "#1" "#2" …（1 始まり）。
+
+(def presets
+  [{:id "mufg-biz" :verified? true :label "三菱UFJ銀行 BizSTATION 入出金明細 CSV"
+    :source "三菱UFJ銀行「入出金明細（CSV形式）出力フォーマット」（nyuushukkin_csv.pdf、2022-12-08）"
+    :signature ["金融機関コード" "取引日" "入払区分" "取引金額" "振込依頼人名" "摘要"]
+    :mapping {:date "取引日" :date-order "wareki" :amount "取引金額"
+              :direction {:column "入払区分" :in "1" :out "2"}
+              :description ["摘要" "振込依頼人名"] :counterparty "振込依頼人名" :kind :bank}}
+   {:id "mufg-personal" :verified? false :label "三菱UFJ銀行（個人）入出金明細 CSV"
+    :source "felica2money CsvRules.xml @a8a136e（第三者）"
+    :signature ["日付" "摘要" "摘要内容" "支払い金額" "預かり金額" "差引残高"]
+    :mapping {:date "日付" :out "支払い金額" :in "預かり金額" :balance "差引残高"
+              :description ["摘要" "摘要内容"] :kind :bank}}
+   {:id "smbc-personal" :verified? false :label "三井住友銀行（個人）入出金明細 CSV"
+    :source "MoneyRabbit docs/design/csv-import.md @db6e248（第三者。別の資料と見出しが食い違う）"
+    :signature ["年月日" "お引出し" "お預入れ" "お取り扱い内容" "残高"]
+    :mapping {:date "年月日" :out "お引出し" :in "お預入れ" :balance "残高"
+              :description ["お取り扱い内容"] :kind :bank}}
+   {:id "rakuten-bank" :verified? false :label "楽天銀行 入出金明細 CSV"
+    :source "felica2money（2020、第三者。別のパーサは 取引後残高(円) とする）"
+    :signature ["取引日" "入出金(円)" "入出金先内容"]
+    :mapping {:date "取引日" :amount "入出金(円)" :balance "残高(円)"
+              :description ["入出金先内容"] :kind :bank}}
+   {:id "sbi-sumishin" :verified? false :label "住信SBIネット銀行 入出金明細 CSV"
+    :source "felica2money（2020、第三者）"
+    :signature ["日付" "内容" "出金金額(円)" "入金金額(円)" "残高(円)"]
+    :mapping {:date "日付" :out "出金金額(円)" :in "入金金額(円)" :balance "残高(円)"
+              :description ["内容"] :kind :bank}}
+   {:id "paypay-bank" :verified? false :label "PayPay銀行 入出金明細 CSV"
+    :source "Hyuaran paypay-parser.ts @0f90ed5（第三者）"
+    :signature ["操作日(年)" "操作日(月)" "操作日(日)" "摘要" "お支払金額" "お預り金額" "残高"]
+    :mapping {:date-parts ["操作日(年)" "操作日(月)" "操作日(日)"] :out "お支払金額" :in "お預り金額"
+              :balance "残高" :reference "取引順番号" :description ["摘要"] :kind :bank}}
+   {:id "yucho-biz" :verified? false :label "ゆうちょBizダイレクト 入出金明細 CSV"
+    :source "ゆうちょ銀行 bizdirect_18.pdf §18.4（列の名前だけ。文字コードと日付の形は未確認）"
+    :signature ["取引日" "入出金区分" "取引内容" "取引金額"]
+    :mapping {:date "取引日" :amount "取引金額" :direction {:column "入出金区分" :in "受入" :out "払出"}
+              :balance "現在（貸付）高" :description ["取引内容" "送金人名等"] :counterparty "送金人名等" :kind :bank}}
+   {:id "rakuten-card" :verified? false :label "楽天カード 利用明細 CSV"
+    :source "beancount-multitool @d135cdb のテスト用 CSV（第三者）"
+    :signature ["利用日" "利用店名・商品名" "利用金額"]
+    :mapping {:date "利用日" :amount "利用金額" :invert? true :description ["利用店名・商品名"] :kind :card}}
+   {:id "vpass" :verified? false :label "三井住友カード Vpass 利用明細 CSV（見出しなし）"
+    :source "vpass-csv-converter @ff6d7d1・MoneyRabbit @db6e248（第三者）"
+    :mapping {:header? false :date "#1" :amount "#3" :invert? true :description ["#2"] :kind :card}}])
+
+(defn preset-by-id [id] (first (filter #(= id (:id %)) presets)))
+
+(defn- column-names [rows {:keys [header? skip-rows] :or {header? true skip-rows 0}}]
+  (let [rows (drop skip-rows rows)]
+    (if header?
+      (mapv #(text/trim (text/replace (str %) #"^﻿" "")) (first rows))
+      (mapv #(str "#" (inc %)) (range (reduce max 0 (map count rows)))))))
+
+(defn headers
+  "画面の列の割り当てに出す列の名前（見出しが無ければ #1 #2 …）。"
+  [rows mapping]
+  (column-names rows (or mapping {})))
+
+(defn detect-preset
+  "見出しが型の印（:signature）をすべて含む型。見出しの無い型は自動では選ばない。"
+  [rows]
+  (let [h (set (map #(text/trim (str %)) (first rows)))]
+    (first (filter #(and (:signature %) (every? h (:signature %))) presets))))
+
+(defn- cell [rec col] (when col (some-> (get rec col) str text/trim not-empty)))
+
+(defn- mapped-date [rec {:keys [date date-parts date-order]} order]
+  (cond
+    date-parts (let [[y m d] (map #(cell rec %) date-parts)]
+                 (when (and y m d) (core/parse-date (str y "-" m "-" d))))
+    (= date-order "wareki") (some-> (cell rec date) (text/replace #"\D" "")
+                                    (as-> v (when (= 6 (count v))
+                                              (let [y (parse-long (subs v 0 2))
+                                                    md (parse-long (subs v 2))]
+                                                (core/parse-date (str (if (and (= y 31) (<= md 430)) 2019 (+ 2018 y))
+                                                                      "-" (subs v 2 4) "-" (subs v 4 6)))))))
+    :else (common/parse-ordered-date (cell rec date) order)))
+
+(defn read-mapped
+  "割り当て（mapping）で CSV の行を読む。opts の :currency は帳簿の通貨。"
+  [rows mapping {:keys [currency] :or {currency "JPY"}}]
+  (let [{:keys [skip-rows header? amount out in direction invert? description counterparty balance reference kind preset]
+         :or {skip-rows 0 header? true kind :bank}} mapping
+        exp (core/exponent currency)
+        names (column-names rows mapping)
+        body (drop (+ skip-rows (if header? 1 0)) rows)
+        recs (map-indexed (fn [i r] (assoc (zipmap names (concat r (repeat ""))) ::row (+ i 1 skip-rows (if header? 1 0)))) body)
+        order (or (#{"ymd" "mdy" "dmy"} (:date-order mapping))
+                  (common/detect-date-order (keep #(cell % (:date mapping)) recs))
+                  "ymd")
+        p (preset-by-id preset)
+        candidates
+        (for [r recs
+              :let [where (str "行 " (::row r))
+                    date (mapped-date r mapping order)
+                    raw-amount (when amount (cell r amount))
+                    a (when amount (amount-of raw-amount exp where amount))
+                    o (when out (amount-of (cell r out) exp where out))
+                    i (when in (amount-of (cell r in) exp where in))
+                    b (when (cell r balance) (amount-of (cell r balance) exp where balance))
+                    dir (when direction (cell r (:column direction)))]
+              ;; 日付が読めず、金額の欄も数でない行（カードの会員の行・合計の行）は黙って飛ばす
+              :when (or date (some #(and (cell r %) (not (:error (core/parse-amount (cell r %) exp)))) [amount out in]))]
+          (let [p* (common/first-problem (remove nil? [a o i b]))
+                v (cond
+                    amount (let [n (:amount a)]
+                             (cond
+                               direction (cond (= dir (:in direction)) n (= dir (:out direction)) (- n) :else nil)
+                               :else n))
+                    :else (- (:amount i 0) (:amount o 0)))
+                v (when v (if invert? (- v) v))]
+            (cond
+              p* {:problem (:problem p*)}
+              (nil? date) {:problem (str where ": 日付が読めません")}
+              (nil? v) {:problem (str where ": 入出金の区分 \"" dir "\" を読めません")}
+              :else
+              {:line (cond-> {:date date :amount v
+                              :description (text/join " " (remove nil? (map #(cell r %) description)))
+                              :origin {:format :statement-csv :row (::row r)}}
+                       (cell r counterparty) (assoc :counterparty (cell r counterparty))
+                       (cell r reference) (assoc :reference (cell r reference))
+                       b (assoc :balance (:amount b)))})))
+        acct {:id "s1" :key (str "statement-csv:" (or preset "custom") ":" (name kind)) :kind kind
+              :name (or (:label p) (str "CSV 明細（" (if (= kind :card) "カード" "預金") "）"))
+              :ledger-account (if (= kind :card) "未払金" "普通預金")
+              :currency currency :mapping mapping :origin {:format :statement-csv}}]
+    (update (finish "statement-csv" acct candidates currency) :warnings
+            (fn [ws] (cond->> ws
+                       (and p (not (:verified? p)))
+                       (cons (str "型「" (:label p) "」の列は一次資料で確かめていません（" (:source p) "）。"
+                                  "取り込んだ日付・金額・向きを確かめてください")))))))

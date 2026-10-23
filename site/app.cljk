@@ -22,6 +22,7 @@
             [kaikei.export :as export]
             [kaikei.invoice :as invoice]
             [kaikei.statement :as statement]
+            [kaikei.compat.statement-csv :as statement-csv]
             [kaikei.view :as view]))
 
 (def storage-key "itonami.kaikei.v1")
@@ -30,28 +31,37 @@
 
 (def ^:private idb-name "itonami.kaikei")
 (def ^:private idb-store "state")
+;; 取り込んだ元のファイルのバイト列（第 4 スライス、判断 5）。帳簿（state）とは別の store
+;; に置き、帳簿にはファイルの名前・SHA-256・大きさ・時刻だけを持つ
+(def ^:private files-store "files")
 
 (defn- idb-open
-  "IndexedDB を開く Promise（使えなければ reject）。"
+  "IndexedDB を開く Promise（使えなければ reject）。版 2 で files の store を足した。"
   []
   (js/Promise.
    (fn [resolve reject]
      (try
-       (let [req (.open js/indexedDB idb-name 1)]
-         (set! (.-onupgradeneeded req) (fn [_] (.createObjectStore (.-result req) idb-store)))
+       (let [req (.open js/indexedDB idb-name 2)]
+         (set! (.-onupgradeneeded req)
+               (fn [_]
+                 (let [idb (.-result req)]
+                   (when-not (.contains (.-objectStoreNames idb) idb-store) (.createObjectStore idb idb-store))
+                   (when-not (.contains (.-objectStoreNames idb) files-store) (.createObjectStore idb files-store)))))
          (set! (.-onsuccess req) (fn [_] (resolve (.-result req))))
          (set! (.-onerror req) (fn [_] (reject (.-error req)))))
        (catch :default e (reject e))))))
 
-(defn- idb-request [mode f]
-  (-> (idb-open)
-      (.then (fn [idb]
-               (js/Promise.
-                (fn [resolve reject]
-                  (let [tx (.transaction idb idb-store mode)
-                        req (f (.objectStore tx idb-store))]
-                    (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve (.-result req))))
-                    (set! (.-onerror tx) (fn [_] (.close idb) (reject (.-error tx)))))))))))
+(defn- idb-request
+  ([mode f] (idb-request idb-store mode f))
+  ([store mode f]
+   (-> (idb-open)
+       (.then (fn [idb]
+                (js/Promise.
+                 (fn [resolve reject]
+                   (let [tx (.transaction idb store mode)
+                         req (f (.objectStore tx store))]
+                     (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve (.-result req))))
+                     (set! (.-onerror tx) (fn [_] (.close idb) (reject (.-error tx))))))))))))
 
 (defn- local-get [] (try (.getItem js/localStorage storage-key) (catch :default _ nil)))
 
@@ -100,8 +110,44 @@
    (when file
      ;; バイト列のまま読む —— Shift_JIS の CSV を UTF-8 として読み壊さないため。
      ;; 文字コードの判定は kaikei.encoding が持つ。
+     ;; SHA-256 は WebCrypto で（この端末の中で計算し、送らない）
      (-> (.arrayBuffer file)
-         (.then (fn [buf] (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file)])))))))
+         (.then (fn [buf]
+                  (-> (.digest (.-subtle js/crypto) "SHA-256" buf)
+                      (.then (fn [d]
+                               (let [hex (apply str (map #(text/pad-left (.toString % 16) 2 "0") (array-seq (js/Uint8Array. d))))]
+                                 (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file) hex]))))
+                      (.catch (fn [_] (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file) nil]))))))))))
+
+(rf/reg-fx
+ ::store-file
+ (fn [{:keys [id bytes]}]
+   (-> (idb-request files-store "readwrite" #(.put % bytes id))
+       (.catch (fn [e] (rf/dispatch [::store-failed (str "元のファイル: " (.-message e))]))))))
+
+(rf/reg-fx
+ ::download-file
+ (fn [{:keys [id name]}]
+   (-> (idb-request files-store "readonly" #(.get % id))
+       (.then (fn [bytes]
+                (if bytes
+                  (let [blob (js/Blob. #js [bytes] #js {:type "application/octet-stream"})
+                        url (.createObjectURL js/URL blob)
+                        a (.createElement js/document "a")]
+                    (set! (.-href a) url)
+                    (set! (.-download a) name)
+                    (.click a)
+                    (js/setTimeout #(.revokeObjectURL js/URL url) 1000))
+                  (rf/dispatch [::store-failed "元のファイルがこの端末にありません（別の端末で取り込んだか、消えています）"]))))
+       (.catch (fn [e] (rf/dispatch [::store-failed (.-message e)]))))))
+
+(rf/reg-fx
+ ::delete-file
+ (fn [id] (-> (idb-request files-store "readwrite" #(.delete % id)) (.catch (fn [_] nil)))))
+
+(rf/reg-fx
+ ::clear-files
+ (fn [_] (-> (idb-request files-store "readwrite" #(.clear %)) (.catch (fn [_] nil)))))
 
 (rf/reg-fx
  ::print
@@ -137,6 +183,18 @@
       :backend backend
       :ui (merge (:ui db) {:booting? false} (select-keys (:settings stored) [:fy-start :pl-style]))})))
 
+(defn- with-store
+  "db → db' の effect に、変えた data を保存する ::store を足す（data が空なら保存を消す）。"
+  [db db' fx]
+  (cond-> (assoc fx :db db')
+    (or (not= (:data db) (:data db'))
+        (not= (saved-state db) (saved-state db')))
+    (assoc ::store {:backend (:backend db')
+                    :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db')))
+                                     (seq (:invoices (:data db'))) (seq (:business (:data db')))
+                                     (seq (:statement-lines (:data db'))) (seq (:rules (:data db'))))
+                             (saved-state db'))})))
+
 (defn- reg-data-event
   "data を変える event。handler は (fn [db event] db')。変えた data を ::store
   effect で保存する（handler 自身は純関数のまま）。"
@@ -144,15 +202,7 @@
   (rf/reg-event-fx
    id
    (fn [{:keys [db]} event]
-     (let [db' (f db event)]
-       (cond-> {:db db'}
-         (or (not= (:data db) (:data db'))
-             (not= (saved-state db) (saved-state db')))
-         (assoc ::store {:backend (:backend db')
-                         :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db')))
-                                          (seq (:invoices (:data db'))) (seq (:business (:data db')))
-                                          (seq (:statement-lines (:data db'))) (seq (:rules (:data db'))))
-                                  (saved-state db'))}))))))
+     (with-store db (f db event) {}))))
 
 (defn- reg-ui-event [id f]
   (rf/reg-event-db id (fn [db event] (f db event))))
@@ -193,10 +243,11 @@
 
 (rf/reg-event-fx :import-file (fn [_ [_ file]] {::read-file file}))
 
-(defn- import-into [db result]
+(defn- import-into [db result & [file]]
   (let [mode (if (= "replace" (get-in db [:ui :import-mode])) :replace :append)
         {data :db :keys [added duplicates error] :as merged}
-        (core/merge-import (:data db) result mode {:statement-account (get-in db [:ui :import-account] "auto")})]
+        (core/merge-import (:data db) result mode (cond-> {:statement-account (get-in db [:ui :import-account] "auto")}
+                                                    file (assoc :file file)))]
     (-> db
         (assoc :data data)
         (update :ui assoc
@@ -207,15 +258,97 @@
                                                            :lines-added :lines-duplicates :lines-corrected :lines-dropped]))
                 :import-open? (zero? (+ (or added 0) (or (:invoices-added merged) 0) (or (:lines-added merged) 0)))
                 :period nil
-                :journal-page 0))))
+                :journal-page 0)
+        (cond-> (:file-id merged) (assoc ::stored-file (:file-id merged))))))
+
+(defn- now-iso
+  "この端末の今の時刻（ISO 8601、時差つき）。取り込んだ元のファイルの記録に使う。"
+  []
+  (let [d (js/Date.)
+        off (- (.getTimezoneOffset d))
+        p2 #(text/pad-left (str %) 2 "0")]
+    (str (.getFullYear d) "-" (p2 (inc (.getMonth d))) "-" (p2 (.getDate d)) "T" (p2 (.getHours d)) ":" (p2 (.getMinutes d))
+         ":" (p2 (.getSeconds d)) (if (neg? off) "-" "+") (p2 (quot (js/Math.abs off) 60)) ":" (p2 (mod (js/Math.abs off) 60)))))
 
 (defn- import-opts [ui]
   {:format (:import-format ui) :currency (:import-currency ui) :encoding (:import-encoding ui)})
 
-(reg-data-event
+(defn- account-mapping
+  "明細を入れる口座に残した列の割り当て（あれば）。"
+  [db]
+  (some->> (get-in db [:ui :import-account]) (statement/account-by-id (:data db)) :mapping))
+
+(defn- unrecognized-csv?
+  "形式を判定できなかった CSV か、割り当ての無い汎用の明細 CSV か。"
+  [result]
+  (or (and (nil? (:format result)) (empty? (:entries result)))
+      (and (= :statement-csv (:format result)) (empty? (:statement-lines result)) (empty? (:statement-accounts result)))))
+
+(defn- file-meta [bytes filename sha256 result]
+  (when (and sha256 (seq (:statement-lines result)))
+    {:name filename :sha256 sha256 :size (.-length bytes) :imported-at (now-iso)
+     :format (some-> (:format result) name)}))
+
+(defn- store-file-fx
+  "取り込みで行を足したときだけ、元のバイト列を IndexedDB に置く effect。"
+  [db bytes]
+  (let [id (::stored-file db)
+        db (dissoc db ::stored-file)]
+    (cond-> {:db db} id (assoc ::store-file {:id id :bytes bytes}))))
+
+(rf/reg-event-fx
  :run-import-bytes
- (fn [db [_ bytes _filename]]
-   (import-into db (ingest/ingest-bytes bytes (import-opts (:ui db))))))
+ (fn [{:keys [db]} [_ bytes filename sha256]]
+   (let [opts (import-opts (:ui db))
+         result (ingest/ingest-bytes bytes opts)
+         mapping (account-mapping db)
+         result (if (and (unrecognized-csv? result) mapping)
+                  (ingest/ingest-bytes bytes (assoc opts :format "statement-csv" :mapping mapping))
+                  result)]
+     (if (unrecognized-csv? result)
+       ;; 形式を判定できなかった CSV: 列の割り当てを出す（判断 3）
+       (let [{:keys [rows encoding]} (ingest/decode-csv bytes (:encoding opts))]
+         {:db (update db :ui assoc
+                      :import-pending {:bytes bytes :name filename :sha256 sha256 :encoding encoding :rows (vec (take 30 rows))}
+                      :import-mapping (view/mapping->ui (or mapping {}))
+                      :import-result nil)})
+       (let [fx (store-file-fx (import-into db result (file-meta bytes filename sha256 result)) bytes)]
+         (with-store db (:db fx) fx))))))
+
+(reg-ui-event :set-import-mapping (fn [db [_ k v]] (assoc-in db [:ui :import-mapping k] v)))
+(reg-ui-event :cancel-import-mapping (fn [db _] (update db :ui assoc :import-pending nil :import-mapping nil)))
+(reg-ui-event :apply-preset
+              (fn [db [_ id]]
+                (if-let [p (statement-csv/preset-by-id id)]
+                  (assoc-in db [:ui :import-mapping] (view/mapping->ui (assoc (:mapping p) :preset id)))
+                  (assoc-in db [:ui :import-mapping :preset] ""))))
+
+(rf/reg-event-fx
+ :run-import-mapped
+ (fn [{:keys [db]} _]
+   (let [{:keys [bytes name sha256 encoding]} (get-in db [:ui :import-pending])
+         mapping (view/ui->mapping (get-in db [:ui :import-mapping]))
+         result (ingest/ingest-bytes bytes (assoc (import-opts (:ui db)) :format "statement-csv" :mapping mapping :encoding encoding))
+         db' (-> (import-into db result (file-meta bytes name sha256 result))
+                 (update :ui assoc :import-pending nil :import-mapping nil))
+         fx (store-file-fx db' bytes)]
+     (with-store db (:db fx) fx))))
+
+(rf/reg-event-fx
+ :download-original
+ (fn [{:keys [db]} [_ id]]
+   (when-let [f (first (filter #(= id (:id %)) (get-in db [:data :files])))]
+     {::download-file {:id id :name (:name f)}})))
+
+(rf/reg-event-fx
+ :delete-original
+ (fn [{:keys [db]} [_ id]]
+   ;; 記録とバイト列の両方を消す（明細の行は帳簿に残る）
+   (with-store db
+     (-> db
+         (update-in [:data :files] (fn [fs] (vec (remove #(= id (:id %)) fs))))
+         (assoc-in [:ui :confirm-delete-file] nil))
+     {::delete-file id})))
 
 (reg-data-event
  :run-import-text
@@ -236,10 +369,10 @@
  (fn [db [_ account v]]
    (update db :data core/set-class account (keyword v))))
 
-(reg-data-event
+(rf/reg-event-fx
  :clear-all
- (fn [db _]
-   (assoc db :data core/empty-db :ui view/initial-ui)))
+ (fn [{:keys [db]} _]
+   (with-store db (assoc db :data core/empty-db :ui view/initial-ui) {::clear-files true})))
 
 (rf/reg-event-fx
  :export
