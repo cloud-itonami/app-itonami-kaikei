@@ -17,7 +17,8 @@
   (:require [kotoba.lang.text :as text]
             [kaikei.core :as core]
             [kaikei.ingest :as ingest]
-            [kaikei.invoice :as invoice]))
+            [kaikei.invoice :as invoice]
+            [kaikei.statement :as statement]))
 
 ;; ───────── 小部品（dandori.view と同じ形） ─────────
 
@@ -78,7 +79,14 @@
    :confirm-clear? false
    :invoice-kind :sales :invoice-filter "all" :invoice nil :invoice-draft nil
    :invoice-errors nil :invoice-settings-open? false :invoice-result nil
-   :confirm-delete-invoice nil})
+   :confirm-delete-invoice nil
+   :import-account "auto"
+   :statement-account nil :statement-filter "open" :statement-page 0 :statement-line nil
+   :statement-selected #{} :statement-result nil :statement-fee-rate ""
+   :statement-form {:account "" :tax "taxable-0" :partner "" :qualified? false :make-rule? false}
+   :rule-draft {:text "" :op "contains" :direction "out" :account "" :tax "taxable-0"}
+   :statement-settings-open? false :rules-open? false
+   :statement-export-format "freee-statement-csv" :statement-export-encoding nil})
 
 (def page-size 100)
 
@@ -109,6 +117,7 @@
    [:p {:class "kk-lead"}
     "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をこのブラウザの中だけで作ります。"
     "請求書を作って適格請求書の記載事項を確かめ、売掛金・買掛金の仕訳として計上できます。"
+    "自分で落とした銀行・カードの明細を取り込み、請求書の消込と仕訳の候補を確かめてから計上できます（口座には接続しません）。"
     "マネーフォワード クラウド会計・freee 会計・弥生会計・QuickBooks Online・Xero の形式を読み書きします。"
     "データはどこにも送信されず、この端末のブラウザの中（IndexedDB）にだけ保存されます。"]])
 
@@ -120,6 +129,9 @@
    [:p "この道具は帳簿の確認と移行のためのものです。電子帳簿保存法への適合を主張せず、申告書の作成・提出もしません。"]
    [:p "請求書の検査は適格請求書の記載事項の欠けを知らせるだけで、適格請求書であることを保証しません。"
     "登録番号は形（T＋数字 13 桁）だけを見て、国税庁の公表サイトには照会しません。請求書を送付する機能はありません。"]
+   [:p "明細は利用者が自分で落としたファイルを読むだけで、銀行・カード会社には接続せず、支払もしません。"
+    "仕訳の候補はこの端末の決まった規則（過去の仕訳と利用者の規則）による提案で、承認するまで計上しません。"
+    "電子帳簿保存法の要件を満たすことは保証しません。"]
    [:p "マネーフォワード、freee、弥生、QuickBooks、Xero はそれぞれの権利者の商標です。"
     "kaikei は形式の互換を名乗るだけで、各社との提携も同一性も主張しません。"]
    [:p "ソース: cloud-itonami/kaikei（Apache License 2.0 + etzhayyim Charter Compliance Rider v3.1。NOTICE を参照）"]])
@@ -128,10 +140,13 @@
 
 (def ^:private modes
   [[:trial-balance "試算表"] [:profit-and-loss "損益計算書"] [:balance-sheet "貸借対照表"]
-   [:journal "仕訳帳"] [:accounts "勘定科目"] [:invoices "請求書"]])
+   [:journal "仕訳帳"] [:accounts "勘定科目"] [:invoices "請求書"] [:statements "明細"]])
+
+(defn- empty-book? [data]
+  (and (empty? (:entries data)) (empty? (:invoices data)) (empty? (:statement-lines data))))
 
 (defn toolbar [{:keys [data ui]} h]
-  (let [empty? (and (empty? (:entries data)) (empty? (:invoices data)))]
+  (let [empty? (empty-book? data)]
     [:div {:class "kk-toolbar" :role "toolbar" :aria-label "操作"}
      [:div {:class "kk-toolbar-group"}
       (btn h [:toggle-import] (if (:import-open? ui) "取り込みを閉じる" "取り込む") {:type "solid-fill"})
@@ -139,7 +154,7 @@
      [:div {:class "kk-toolbar-group"}
       [:label {:class "kk-inline-label" :for "kk-export-format"} "書き出す形式"]
       (select-el h [:set-export-format] (:export-format ui)
-                 (map (juxt :id :label) ingest/export-formats) {:id "kk-export-format"})
+                 (map (juxt :id :label) ingest/ledger-export-formats) {:id "kk-export-format"})
       (let [fmt (ingest/format-by-id (:export-format ui))]
         (when (:encodings fmt)
           (select-el h [:set-export-encoding] (or (:export-encoding ui) (:encoding fmt))
@@ -166,7 +181,7 @@
 
 (defn import-panel [{:keys [ui data]} h]
   [:section {:class "kk-panel" :aria-labelledby "kk-import-heading"}
-   [:h2 {:id "kk-import-heading" :class "kk-h2"} "仕訳・請求書を取り込む"]
+   [:h2 {:id "kk-import-heading" :class "kk-h2"} "仕訳・請求書・明細を取り込む"]
    [:p {:class "kk-help"}
     "会計ソフトから書き出したファイルを選ぶか、テキストを貼り付けてください。"
     "読み込みはこのブラウザの中で行い、何も送信しません。Shift_JIS のファイルはファイル選択で読み込んでください（貼り付けは UTF-8 だけです）。"]
@@ -188,10 +203,16 @@
     (field "kk-import-mode" "取り込み方"
            (select-el h [:set-import :import-mode] (:import-mode ui)
                       [["append" "追加する（同じ仕訳は飛ばす）"] ["replace" "入れ替える"]]
-                      {:id "kk-import-mode"}))]
-   (field "kk-import-file" "ファイル（.csv / .txt / .json）"
+                      {:id "kk-import-mode"}))
+    (field "kk-import-account" "明細を入れる口座"
+           (select-el h [:set-import :import-account] (:import-account ui "auto")
+                      (concat [["auto" "自動（OFX は口座ごと、CSV は形式ごと）"] ["new" "新しい口座"]]
+                              (map (fn [a] [(:id a) (:name a)]) (:statement-accounts data)))
+                      {:id "kk-import-account"})
+           "明細の形式（OFX・各社の明細 CSV）のときだけ使います")]
+   (field "kk-import-file" "ファイル（.csv / .txt / .json / .ofx / .qfx / .qbo）"
           [:input (with-handler {:id "kk-import-file" :type "file"
-                                 :accept ".csv,.txt,.json,text/csv,text/plain,application/json"}
+                                 :accept ".csv,.txt,.json,.ofx,.qfx,.qbo,text/csv,text/plain,application/json"}
                     :on-change (h :file [:import-file]))])
    (field "kk-import-text" "貼り付け（UTF-8）"
           (text-area h [:set-import :import-text] (:import-text ui)
@@ -202,23 +223,30 @@
          {:type "solid-fill" :disabled (text/blank? (or (:import-text ui) ""))})]])
 
 (defn import-result [{:keys [format encoding added duplicates rejected warnings error
-                             invoices-added invoices-duplicates invoices-rejected invoices-dropped]} h]
+                             invoices-added invoices-duplicates invoices-rejected invoices-dropped
+                             lines-added lines-duplicates lines-corrected lines-dropped]} h]
   [:div {:class (str "kk-result" (when error " kk-result--error")) :role "status"}
    (if error
      [:p {:class "kk-warnings"} error]
      [:p (str (or (:label (ingest/format-by-id (some-> format name))) "入力")
               (when encoding (str "（" (ingest/encoding-label encoding) "）"))
               " から "
-              (text/join "、" (remove nil? [(when (or (pos? (or added 0)) (zero? (or invoices-added 0)))
+              (text/join "、" (remove nil? [(when (or (pos? (or added 0))
+                                                      (and (zero? (or invoices-added 0)) (zero? (or lines-added 0))))
                                               (str added " 件の仕訳"))
-                                            (when (pos? (or invoices-added 0)) (str invoices-added " 件の請求書"))]))
+                                            (when (pos? (or invoices-added 0)) (str invoices-added " 件の請求書"))
+                                            (when (pos? (or lines-added 0)) (str lines-added " 行の明細"))]))
               "を取り込みました。"
               (when (pos? (or duplicates 0)) (str "同じ仕訳 " duplicates " 件は飛ばしました。"))
               (when (pos? (or invoices-duplicates 0)) (str "同じ請求書 " invoices-duplicates " 件は飛ばしました。"))
               (when (pos? (or rejected 0)) (str "読めなかった仕訳 " rejected " 件は取り込んでいません。"))
               (when (pos? (or invoices-rejected 0)) (str "読めなかった請求書 " invoices-rejected " 件は取り込んでいません。"))
               (when (pos? (or invoices-dropped 0))
-                (str "通貨が変わったので、帳簿にあった請求書 " invoices-dropped " 件は残せませんでした。")))])
+                (str "通貨が変わったので、帳簿にあった請求書 " invoices-dropped " 件は残せませんでした。"))
+              (when (pos? (or lines-duplicates 0)) (str "同じ明細の行 " lines-duplicates " 行は飛ばしました。"))
+              (when (pos? (or lines-corrected 0)) (str "訂正された明細の行 " lines-corrected " 行を消しました。"))
+              (when (pos? (or lines-dropped 0))
+                (str "通貨が変わったので、帳簿にあった明細 " lines-dropped " 行は残せませんでした。")))])
    (when (seq warnings)
      (into [:ul {:class "kk-warnings"}]
            (concat (map (fn [w] [:li w]) (take 20 warnings))
@@ -261,7 +289,17 @@
   (let [{:keys [unclassified-accounts unclassified-lines invalid-entries bs-difference balanced?]} checks
         exp (core/exponent (:currency data))
         {:keys [unposted missing]} (invoice-counts data)
+        st (statement/counts data)
         invoice-items (concat
+                       (when (pos? (:open st))
+                         [[:li (chip "未処理" "orange") " 計上も照合もしていない明細の行が " (:open st) " 行あります。"
+                           (btn h [:show-statements "open"] "明細で見る" {:type "text"})]])
+                       (when (pos? (:unbalanced st))
+                         [[:li (chip "不一致" "orange") " 明細の残高と帳簿の残高が合わない口座（または残高の切れ目のある口座）が " (:unbalanced st) " つあります。"
+                           (btn h [:show-statements "all"] "明細で見る" {:type "text"})]])
+                       (when (pos? (:unconfirmed st))
+                         [[:li (chip "要確認" "orange") " 適格請求書の有無を確かめていない課税仕入の仕訳が " (:unconfirmed st)
+                           " 件あります（明細から起こした仕訳。仕訳帳の税区分の欄に「未確認」）。"]])
                        (when (pos? unposted)
                          [[:li (chip "未計上" "orange") " 計上していない請求書が " unposted " 件あります。"
                            (btn h [:show-invoices "unposted"] "請求書で見る" {:type "text"})]])
@@ -523,6 +561,8 @@
 
 ;; ───────── 請求書（第 3 スライス、JUN-321） ─────────
 
+(declare aging-table)
+
 (defn- yen [data n] (money data n))
 
 (defn- issuer-and-recipient
@@ -625,8 +665,11 @@
                                     "）。表示だけで、仕訳は請求書の消費税額のまま起こします。")])
       (when (or (:amount-paid inv) (:amount-due inv))
         [:p {:class "kk-help"} (str "取り込み元の値: 入金・支払済み " (yen data (or (:amount-paid inv) 0))
-                                    "、未回収・未払い " (yen data (or (:amount-due inv) 0))
-                                    "（消込は今後の版で扱います）")])
+                                    "、未回収・未払い " (yen data (or (:amount-due inv) 0)))])
+      (when (#{:issued :paid} (:status inv))
+        [:p {:class "kk-help"} (str "残額 " (yen data (statement/open-amount data inv))
+                                    (let [a (statement/allocated data (:id inv))]
+                                      (when (pos? a) (str "（明細の消込で " (yen data a) " を割り当て済み）"))))])
       (invoice-problem-list data inv)]
      (invoice-document data inv)]))
 
@@ -776,6 +819,7 @@
           [:thead [:tr [:th {:scope "col"} "番号"] [:th {:scope "col"} "日付"] [:th {:scope "col"} "期日"]
                    [:th {:scope "col"} "取引先"] [:th {:scope "col" :class "kk-num"} "税抜"]
                    [:th {:scope "col" :class "kk-num"} "消費税"] [:th {:scope "col" :class "kk-num"} "合計"]
+                   [:th {:scope "col" :class "kk-num"} "残額"]
                    [:th {:scope "col"} "状態"] [:th {:scope "col"} "計上"] [:th {:scope "col"} "検査"]]]
           (into [:tbody]
                 (map (fn [inv]
@@ -790,14 +834,368 @@
                           [:td {:class "kk-num"} (yen data (:net t))]
                           [:td {:class "kk-num"} (yen data (:tax t))]
                           [:td {:class "kk-num"} (yen data (:total t))]
+                          [:td {:class "kk-num"} (if (#{:issued :paid} (:status inv))
+                                                   (let [o (statement/open-amount data inv)] (if (zero? o) "消込済み" (yen data o)))
+                                                   "")]
                           [:td (invoice/status-label (:kind inv) (:status inv))]
                           [:td (if (invoice/posted-entry data (:id inv)) "済" "")]
                           [:td (if missing? (chip "要確認" "orange") "")]]))
                      invs))]])]
+     [:section {:class "kk-report kk-no-print"} (aging-table data kind)]
      (when (:invoice-settings-open? ui) (invoice-settings-panel state h))
      (cond
        (:invoice-draft ui) (invoice-editor state h)
        selected (invoice-detail state selected h))]))
+
+;; ───────── 明細（第 4 スライス、JUN-327） ─────────
+
+(def statement-page-size 100)
+
+(def ^:private statement-filters
+  [["open" "未処理"] ["all" "すべて"] ["posted" "計上済み"] ["matched" "照合済み"] ["excluded" "計上しない"]])
+
+(def tax-choices
+  "画面の税の選択肢（値は \"区分-種類\"）。"
+  [["taxable-0" "課税 10%（標準）"] ["taxable-1" "課税 8%（軽減・飲食料品）"] ["taxable-2" "課税 8%（軽減・新聞）"]
+   ["exempt" "非課税"] ["out-of-scope" "不課税・対象外"] ["zero-rated" "免税"]])
+
+(defn tax-choice->tax [v]
+  (let [[c k] (text/split (str v) #"-(?=\d$)")]
+    (cond-> {:category (keyword c)} (= c "taxable") (assoc :kind (or (some-> k parse-long) 0)))))
+
+(defn tax->choice [t]
+  (if (= :taxable (:category t)) (str "taxable-" (:kind t 0)) (name (:category t :out-of-scope))))
+
+(defn derive-statements
+  "明細のタブが描く値（重い計算はここだけ）: 選んだ口座、口座ごとの照合、学んだ
+  規則、表示する行（1 ページ）とその候補。"
+  [data ui]
+  (let [accounts (statement/accounts data)
+        acct (or (statement/account-by-id data (:statement-account ui)) (first accounts))
+        learned (statement/learn data)
+        status (statement/status-fn data)
+        lines (when acct (statement/lines-of data (:id acct)))
+        f (:statement-filter ui "open")
+        rows (vec (for [l (reverse lines)
+                        :let [st (status l)]
+                        :when (or (= f "all") (= f (name st)))]
+                    {:line l :status st}))
+        pages (max 1 (quot (+ (count rows) (dec statement-page-size)) statement-page-size))
+        page (min (:statement-page ui 0) (dec pages))
+        shown (mapv (fn [{:keys [line status] :as r}]
+                      (if (= :open status) (assoc r :candidates (statement/candidates data learned line)) r))
+                    (take statement-page-size (drop (* page statement-page-size) rows)))]
+    {:account acct
+     :summaries (mapv #(statement/account-summary data %) accounts)
+     :learned learned
+     :rows shown :count (count rows) :page page :pages pages}))
+
+(defn- candidate-label [data c]
+  (case (:type c)
+    :invoice (let [invs (keep #(invoice/invoice-by-id data %) (:invoices c))]
+               (str "請求書 " (text/join "・" (map :number invs))
+                    "（" (text/join "・" (distinct (keep #(get-in % [:partner :name]) invs))) "）"
+                    (when (pos? (:fee c 0)) (str " 差額 " (money data (:fee c))))))
+    :entry (let [e (first (filter #(= (:entry-id c) (:id %)) (:entries data)))]
+             (str "帳簿の仕訳 " (:date e) " " (or (:memo e) "")))
+    :transfer (let [o (statement/line-by-id data (:line-id c))]
+                (str "振替: " (:name (statement/account-by-id data (:account-id o))) " " (:date o)))
+    :account (str "科目 " (:account c)
+                  (when-let [t (:tax c)] (str "（" (second (first (filter #(= (tax->choice t) (first %)) tax-choices))) "）"))
+                  (if (= :user (:source c)) "（規則）" "（過去の仕訳）"))
+    ""))
+
+(defn- level-chip [level]
+  (chip (statement/level-label level "") (case level 3 "green" 2 "blue" "gray")))
+
+(defn- statement-summary [data {:keys [account lines counts closing ledger difference break]} selected? h]
+  [:tr {:class (when (or break (and difference (not (zero? difference)))) "kk-row--warn")}
+   [:th {:scope "row"}
+    [:button (with-handler {:type "button" :class "kk-link" :aria-pressed (str selected?)}
+               :on-click (h :click [:select-statement-account (:id account)]))
+     (:name account)]]
+   [:td (statement/kind-label (:kind account))]
+   [:td (:ledger-account account)]
+   [:td {:class "kk-num"} lines]
+   [:td {:class "kk-num"} (get counts :open 0)]
+   [:td {:class "kk-num"} (if closing (str (money data (:amount closing)) "（" (:date closing) "）") "—")]
+   [:td {:class "kk-num"} (if ledger (money data ledger) "—")]
+   [:td {:class "kk-num"} (cond (nil? difference) "—" (zero? difference) (chip "一致" "green") :else (money data difference))]
+   [:td (if break (chip "残高の切れ目" "orange") "")]])
+
+(defn- statement-row [data {:keys [line status candidates]} selected ui h]
+  (let [best (or (:preselected candidates) (first (:candidates candidates)))
+        amount (:amount line)]
+    [:tr {:class (when (= (:id line) (:statement-line ui)) "kk-row--selected")}
+     [:td (when (= :open status)
+            [:input (with-handler {:type "checkbox" :checked (contains? selected (:id line))
+                                   :aria-label (str (:date line) " " (:description line) " を選ぶ")}
+                      :on-change (h :checked [:toggle-statement-select (:id line)]))])]
+     [:td (:date line)]
+     [:th {:scope "row"}
+      [:button (with-handler {:type "button" :class "kk-link"} :on-click (h :click [:select-statement-line (:id line)]))
+       (if (text/blank? (str (:description line))) "（摘要なし）" (:description line))]]
+     [:td {:class "kk-num"} (when (pos? amount) (money data amount))]
+     [:td {:class "kk-num"} (when (neg? amount) (money data (- amount)))]
+     [:td {:class "kk-num"} (some->> (:balance line) (money data))]
+     [:td (statement/status-label status)]
+     [:td (when best [:span (level-chip (:level best)) " " (candidate-label data best)])]]))
+
+(defn- entry-preview [data entry]
+  [:div {:class "kk-table-wrap"}
+   [:table {:class "kk-table"}
+    [:thead [:tr [:th {:scope "col"} "科目"] [:th {:scope "col" :class "kk-num"} "借方"]
+             [:th {:scope "col" :class "kk-num"} "貸方"] [:th {:scope "col"} "税区分"]]]
+    (into [:tbody]
+          (map (fn [l] [:tr [:td (:account l)]
+                        [:td {:class "kk-num"} (when (pos? (:debit l 0)) (money data (:debit l)))]
+                        [:td {:class "kk-num"} (when (pos? (:credit l 0)) (money data (:credit l)))]
+                        [:td (text/join " / " (remove nil? [(get-in l [:tax :code]) (get-in l [:invoice :code])]))]])
+               (:lines entry)))]])
+
+(defn- candidate-item [data line c i ui h]
+  (let [mixed? (and (= :invoice (:type c)) (pos? (:fee c 0)) (pos? (:amount line)))]
+    [:li {:class "kk-candidate"}
+     [:p (level-chip (:level c)) " " [:strong (candidate-label data c)]]
+     (when (seq (:reasons c)) [:p {:class "kk-help"} (text/join "・" (:reasons c))])
+     (when (seq (:unposted c))
+       [:p {:class "kk-help"} (str "請求書 " (text/join "・" (keep #(:number (invoice/invoice-by-id data %)) (:unposted c)))
+                                   " はまだ計上していないので、消込と一緒に計上します。")])
+     (when mixed?
+       [:p {:class "kk-help"} (str "差額は振込手数料として扱います（"
+                                   (statement/fee-treatment-label (:fee-treatment (statement/settings data))) "）。"
+                                   "8% と 10% の混ざった請求書では、差額の税率を選んでください。")])
+     (when mixed?
+       (field (str "kk-fee-rate-" i) "差額の税率（混ざった請求書のとき）"
+              (select-el h [:set-ui :statement-fee-rate] (:statement-fee-rate ui "")
+                         [["" "請求書の税率（1 つのとき）"] ["1000" "10%"] ["800" "8%（軽減）"]]
+                         {:id (str "kk-fee-rate-" i)})))
+     [:div {:class "kk-actions"}
+      (btn h [:post-statement-candidate (:id line) i]
+           (case (:type c) :entry "照合する" :transfer "振替で計上" "この候補で計上")
+           {:type (if (= 3 (:level c)) "solid-fill" "outline") :disabled (= 4 (:kind c))})]]))
+
+(defn- statement-line-detail [data ui line status candidates h]
+  (let [form (:statement-form ui)
+        posted (statement/posted-entry data (:id line))
+        matched (statement/matched-entry data line)]
+    [:section {:class "kk-panel" :aria-labelledby "kk-statement-line-heading"}
+     [:div {:class "kk-report-head"}
+      [:h2 {:id "kk-statement-line-heading" :class "kk-h2"}
+       (str (:date line) " " (if (pos? (:amount line)) "入金 " "出金 ") (money data (let [a (:amount line)] (if (neg? a) (- a) a))))]
+      (btn h [:close-statement-line] "閉じる" {:type "text"})]
+     [:p (or (not-empty (:description line)) "（摘要なし）")
+      (when (:reference line) (str "（参照 " (:reference line) "）"))]
+     [:p (chip (statement/status-label status) (case status :open "orange" :excluded "gray" "green"))]
+     (when-let [r (:statement-line-result ui)]
+       [:div {:class "kk-result" :role "status"}
+        (if (:skipped r)
+          [:p {:class "kk-warnings"} (statement/skip-label (:skipped r) (str (:skipped r)))]
+          [:p (str "計上しました。"
+                   (when (seq (:invoices-posted r))
+                     (str "請求書 " (text/join "・" (keep #(:number (invoice/invoice-by-id data %)) (:invoices-posted r)))
+                          " も計上しました。")))])
+        (when (seq (:warnings r))
+          (into [:ul {:class "kk-warnings"}] (map (fn [w] [:li (statement/warning-label w)]) (:warnings r))))])
+     (case status
+       :posted [:div [:h3 {:class "kk-h3"} "起こした仕訳"] (entry-preview data posted)
+                [:div {:class "kk-actions"} (btn h [:unpost-statement-line (:id line)] "計上を取り消す" {:type "text"})]]
+       :matched [:div [:h3 {:class "kk-h3"} (str "照合した帳簿の仕訳（" (:date matched) " " (or (:memo matched) "") "）")]
+                 (entry-preview data matched)
+                 [:div {:class "kk-actions"} (btn h [:unpost-statement-line (:id line)] "照合を外す" {:type "text"})]]
+       :excluded [:div {:class "kk-actions"} (btn h [:unpost-statement-line (:id line)] "「計上しない」を戻す")]
+       [:div
+        (if (seq (:candidates candidates))
+          [:div
+           [:h3 {:class "kk-h3"} "候補"]
+           [:p {:class "kk-help"} "候補は提案です。確かめてから計上してください（承認するまで帳簿は変わりません）。"]
+           (into [:ul {:class "kk-candidates"}]
+                 (map-indexed (fn [i c] (candidate-item data line c i ui h)) (:candidates candidates)))]
+          [:p {:class "kk-help"} "候補がありません。科目を選んで計上するか、「計上しない」にしてください。"])
+        [:h3 {:class "kk-h3"} "科目を選んで計上する"]
+        [:div {:class "kk-settings"}
+         (field "kk-st-account" "相手の科目" (text-input h [:set-statement-form :account] (:account form) {:id "kk-st-account" :placeholder "消耗品費"}))
+         (field "kk-st-tax" "税区分" (select-el h [:set-statement-form :tax] (:tax form) tax-choices {:id "kk-st-tax"})
+                "税率は日付から決めます（明細の額は税込）")
+         (field "kk-st-partner" "取引先（任意）" (text-input h [:set-statement-form :partner] (:partner form) {:id "kk-st-partner"}))]
+        [:div {:class "kk-settings"}
+         (when (neg? (:amount line))
+           [:label {:class "kk-check"}
+            [:input (with-handler {:type "checkbox" :checked (boolean (:qualified? form))}
+                      :on-change (h :checked [:set-statement-form :qualified?]))]
+            " 適格請求書がある（無ければ「未確認」と記録します）"])
+         [:label {:class "kk-check"}
+          [:input (with-handler {:type "checkbox" :checked (boolean (:make-rule? form))}
+                    :on-change (h :checked [:set-statement-form :make-rule?]))]
+          " この摘要は次から同じにする（規則にする）"]]
+        [:div {:class "kk-actions"}
+         (btn h [:post-statement-form (:id line)] "計上する" {:type "solid-fill" :disabled (text/blank? (str (:account form)))})
+         (btn h [:exclude-statement-line (:id line)] "計上しない" {:type "text"})]])]))
+
+(defn- rules-panel [data {:keys [learned]} ui h]
+  (let [draft (:rule-draft ui)]
+    [:section {:class "kk-panel" :aria-labelledby "kk-rules-heading"}
+     [:div {:class "kk-report-head"}
+      [:h2 {:id "kk-rules-heading" :class "kk-h2"} "仕訳の規則"]
+      (btn h [:toggle-ui :rules-open?] "閉じる" {:type "text"})]
+     [:p {:class "kk-help"}
+      "利用者の規則を並べた順に当て、当たらなければ過去の仕訳から学んだ規則を使います。"
+      "学んだ規則は保存せず、帳簿から毎回作り直します（税率は学ばず、日付から決めます）。"]
+     [:h3 {:class "kk-h3"} "利用者の規則"]
+     (if (empty? (:rules data))
+       [:p "まだありません。"]
+       [:div {:class "kk-table-wrap"}
+        [:table {:class "kk-table"}
+         [:thead [:tr [:th {:scope "col"} "摘要"] [:th {:scope "col"} "向き"] [:th {:scope "col"} "科目"]
+                  [:th {:scope "col" :class "kk-num"} "提案／承認"] [:th {:scope "col"} [:span {:class "kk-visually-hidden"} "操作"]]]]
+         (into [:tbody]
+               (map (fn [r]
+                      [:tr [:td (str "「" (get-in r [:when :text]) "」に" (statement/op-label (get-in r [:when :op] :contains)))]
+                       [:td (case (get-in r [:when :direction]) :in "入金" :out "出金" "両方")]
+                       [:td (get-in r [:then :account])]
+                       [:td {:class "kk-num"} (str (get-in r [:stats :suggested] 0) "／" (get-in r [:stats :accepted] 0))]
+                       [:td (btn h [:move-rule (:id r) -1] "↑" {:type "text"}) (btn h [:move-rule (:id r) 1] "↓" {:type "text"})
+                        (btn h [:delete-rule (:id r)] "削除" {:type "text"})]])
+                    (:rules data)))]])
+     [:h3 {:class "kk-h3"} "規則を足す"]
+     [:div {:class "kk-settings"}
+      (field "kk-rule-text" "摘要" (text-input h [:set-rule-draft :text] (:text draft) {:id "kk-rule-text"}))
+      (field "kk-rule-op" "一致" (select-el h [:set-rule-draft :op] (:op draft) (map (fn [o] [(name o) (statement/op-label o)]) statement/ops) {:id "kk-rule-op"}))
+      (field "kk-rule-direction" "向き" (select-el h [:set-rule-draft :direction] (:direction draft) [["out" "出金"] ["in" "入金"] ["" "両方"]] {:id "kk-rule-direction"}))
+      (field "kk-rule-account" "科目" (text-input h [:set-rule-draft :account] (:account draft) {:id "kk-rule-account"}))
+      (field "kk-rule-tax" "税区分" (select-el h [:set-rule-draft :tax] (:tax draft) tax-choices {:id "kk-rule-tax"}))]
+     (when-let [conflicts (seq (:rule-conflicts ui))]
+       (into [:ul {:class "kk-warnings"}]
+             (map (fn [{:keys [key account]}] [:li (str "この規則は、過去に " account " に記帳した摘要「" key "」にも当たります")]) (take 5 conflicts))))
+     [:div {:class "kk-actions"}
+      (btn h [:add-rule] "規則を足す" {:disabled (or (text/blank? (str (:text draft))) (text/blank? (str (:account draft))))})]
+     [:h3 {:class "kk-h3"} "過去の仕訳から学んだ規則"]
+     (let [rows (take 30 (sort-by (juxt #(- (:total (val %))) key) learned))]
+       (if (empty? rows)
+         [:p "まだありません（明細の口座の科目に 1 行だけある仕訳から学びます）。"]
+         [:div {:class "kk-table-wrap"}
+          [:table {:class "kk-table"}
+           [:thead [:tr [:th {:scope "col"} "摘要（正規化）"] [:th {:scope "col"} "向き"] [:th {:scope "col"} "科目"]
+                    [:th {:scope "col" :class "kk-num"} "回数"]]]
+           (into [:tbody]
+                 (for [[[_ direction k] r] rows
+                       :let [[account {:keys [hits]}] (first (sort-by (juxt #(- (:hits (val %))) key) (:accounts r)))]]
+                   [:tr [:td k] [:td (if (= direction :in) "入金" "出金")] [:td account]
+                    [:td {:class "kk-num"} (str hits "／" (:total r))]]))]]))]))
+
+(defn- statement-settings-panel [data h]
+  (let [st (statement/settings data)]
+    [:section {:class "kk-panel" :aria-labelledby "kk-statement-settings-heading"}
+     [:div {:class "kk-report-head"}
+      [:h2 {:id "kk-statement-settings-heading" :class "kk-h2"} "明細の設定"]
+      (btn h [:toggle-ui :statement-settings-open?] "閉じる" {:type "text"})]
+     [:div {:class "kk-settings"}
+      (field "kk-fee-treatment" "入金が手数料の分だけ少ないとき（売手負担の振込手数料）"
+             (select-el h [:set-statement-setting :fee-treatment] (name (:fee-treatment st))
+                        (map (fn [t] [(name t) (statement/fee-treatment-label t)]) statement/fee-treatments)
+                        {:id "kk-fee-treatment"})
+             "国税庁インボイス Q&A 問 29・30。1 万円未満の対価の返還は返還インボイスが要りません")
+      (field "kk-max-fee" "手数料として扱う差額の上限" (text-input h [:set-statement-setting :max-fee] (str (:max-fee st)) {:id "kk-max-fee" :input-mode "numeric"}))
+      (field "kk-fee-account" "手数料の科目" (text-input h [:set-statement-setting :fee-account] (get-in st [:accounts :fee]) {:id "kk-fee-account"}))
+      (field "kk-discount-account" "売上値引の科目" (text-input h [:set-statement-setting :discount-account] (get-in st [:accounts :discount]) {:id "kk-discount-account"}))]
+     [:h3 {:class "kk-h3"} "振込名義（確かめた消込から覚えたもの）"]
+     (if (empty? (:aliases st))
+       [:p "まだありません。"]
+       (into [:ul {:class "kk-notes"}]
+             (for [[partner ks] (sort-by key (:aliases st)) k ks]
+               [:li (str partner " ← " k " ") (btn h [:delete-alias partner k] "削除" {:type "text"})])))]))
+
+(defn statements-view [{:keys [data ui] :as state} h]
+  (let [{:keys [account summaries rows count page pages] :as sd} (or (:statements state) (derive-statements data ui))
+        selected (:statement-selected ui #{})
+        line (some->> (:statement-line ui) (statement/line-by-id data))
+        line-row (when line (first (filter #(= (:id line) (:id (:line %))) rows)))
+        status (when line (statement/line-status data line))
+        candidates (when (and line (= :open status))
+                     (or (:candidates line-row) (statement/candidates data line)))]
+    [:div
+     [:section {:class "kk-report" :aria-labelledby "kk-statements-heading"}
+      [:div {:class "kk-report-head"}
+       [:h2 {:id "kk-statements-heading" :class "kk-h2"} "明細"]
+       [:div {:class "kk-actions"}
+        (btn h [:toggle-ui :rules-open?] "仕訳の規則")
+        (btn h [:toggle-ui :statement-settings-open?] "設定")]]
+      [:p {:class "kk-help"}
+       "自分で落とした銀行・カードの明細（OFX、各社の明細 CSV）を取り込み、請求書の消込・帳簿の仕訳との照合・仕訳の候補を確かめてから計上します。"
+       "銀行・カード会社には接続しません。"]
+      (if (empty? summaries)
+        [:p "明細がまだありません。「取り込む」から明細のファイルを選ぶか、サンプルを読み込んでください。"]
+        [:div {:class "kk-table-wrap"}
+         [:table {:class "kk-table"}
+          [:thead [:tr [:th {:scope "col"} "口座"] [:th {:scope "col"} "種類"] [:th {:scope "col"} "帳簿の科目"]
+                   [:th {:scope "col" :class "kk-num"} "行"] [:th {:scope "col" :class "kk-num"} "未処理"]
+                   [:th {:scope "col" :class "kk-num"} "明細の残高"] [:th {:scope "col" :class "kk-num"} "帳簿の残高"]
+                   [:th {:scope "col" :class "kk-num"} "差"] [:th {:scope "col"} "続き具合"]]]
+          (into [:tbody] (map #(statement-summary data % (= (:id (:account %)) (:id account)) h) summaries))]])]
+     (when (:statement-settings-open? ui) (statement-settings-panel data h))
+     (when (:rules-open? ui) (rules-panel data sd ui h))
+     (when account
+       [:section {:class "kk-report" :aria-labelledby "kk-statement-lines-heading"}
+        [:div {:class "kk-report-head"}
+         [:h2 {:id "kk-statement-lines-heading" :class "kk-h2"} (:name account)]]
+        [:div {:class "kk-settings"}
+         (field "kk-st-name" "口座の名前" (text-input h [:set-statement-account-field (:id account) :name] (:name account) {:id "kk-st-name"}))
+         (field "kk-st-ledger" "帳簿の科目" (text-input h [:set-statement-account-field (:id account) :ledger-account] (:ledger-account account) {:id "kk-st-ledger"}))
+         (field "kk-st-kind" "種類" (select-el h [:set-statement-account-field (:id account) :kind] (name (:kind account))
+                                              (map (fn [k] [(name k) (statement/kind-label k)]) statement/kinds) {:id "kk-st-kind"}))]
+        [:div {:class "kk-settings"}
+         (field "kk-st-filter" "表示" (select-el h [:set-statement-filter] (:statement-filter ui "open") statement-filters {:id "kk-st-filter"}))
+         [:div {:class "kk-actions"}
+          (btn h [:select-strong-statements] "有力の候補のある行を選ぶ")
+          (btn h [:post-selected-statements] (str "選んだ行を計上する（" (clojure.core/count selected) " 行）")
+               {:type "solid-fill" :disabled (empty? selected)})]
+         [:div {:class "kk-actions"}
+          (select-el h [:set-ui :statement-export-format] (:statement-export-format ui)
+                     (map (juxt :id :label) ingest/statement-export-formats) {:aria-label "明細を書き出す形式"})
+          (btn h [:export-statements (:id account)] "この口座の明細を書き出す")]]
+        (when-let [{:keys [posted skipped]} (:statement-result ui)]
+          [:div {:class "kk-result" :role "status"}
+           [:p (str (clojure.core/count posted) " 行を計上しました。"
+                    (when (seq skipped) (str "計上しなかった行 " (clojure.core/count skipped) " 行（有力の候補が 1 つでない行、税率や差額の確認が要る行）。")))]
+           (btn h [:dismiss-statement-result] "閉じる" {:type "text"})])
+        [:p {:class "kk-help"} (str count " 行"
+                                    (when (> pages 1) (str "（" (inc page) "／" pages " ページ）")))]
+        (if (empty? rows)
+          [:p "この表示に当たる行はありません。"]
+          [:div {:class "kk-table-wrap"}
+           [:table {:class "kk-table"}
+            [:thead [:tr [:th {:scope "col"} [:span {:class "kk-visually-hidden"} "選ぶ"]] [:th {:scope "col"} "日付"]
+                     [:th {:scope "col"} "摘要"] [:th {:scope "col" :class "kk-num"} "入金"] [:th {:scope "col" :class "kk-num"} "出金"]
+                     [:th {:scope "col" :class "kk-num"} "残高"] [:th {:scope "col"} "状態"] [:th {:scope "col"} "候補"]]]
+            (into [:tbody] (map #(statement-row data % selected ui h) rows))]])
+        (when (> pages 1)
+          [:div {:class "kk-actions"}
+           (btn h [:set-ui :statement-page (dec page)] "前へ" {:disabled (zero? page)})
+           (btn h [:set-ui :statement-page (inc page)] "次へ" {:disabled (>= (inc page) pages)})])])
+     (when line (statement-line-detail data ui line status candidates h))]))
+
+;; ───────── 年齢表（請求書タブ） ─────────
+
+(defn- aging-table [data kind]
+  (let [as-of (or (second (core/date-range data)) "2026-12-31")
+        {:keys [rows totals total]} (statement/aging data kind as-of)]
+    (when (seq rows)
+      [:div
+       [:h3 {:class "kk-h3"} (str (if (= kind :sales) "売掛金" "買掛金") "の年齢表（" as-of " 現在。期日から 30 日ごと）")]
+       [:div {:class "kk-table-wrap"}
+        [:table {:class "kk-table"}
+         [:thead (into [:tr [:th {:scope "col"} "取引先"]]
+                       (concat (map (fn [l] [:th {:scope "col" :class "kk-num"} l]) statement/bucket-labels)
+                               [[:th {:scope "col" :class "kk-num"} "合計"]]))]
+         (into [:tbody]
+               (concat (map (fn [{:keys [partner buckets total]}]
+                              (into [:tr [:th {:scope "row"} partner]]
+                                    (concat (map (fn [b] [:td {:class "kk-num"} (if (zero? b) "" (money data b))]) buckets)
+                                            [[:td {:class "kk-num"} (money data total)]])))
+                            rows)
+                       [(into [:tr [:th {:scope "row"} "合計"]]
+                              (concat (map (fn [b] [:td {:class "kk-num"} (money data b)]) totals)
+                                      [[:td {:class "kk-num"} (money data total)]]))]))]]])))
 
 ;; ───────── 空の状態・全体 ─────────
 
@@ -834,8 +1232,9 @@
    (tabs state h)
    (cond
      (= :invoices (:mode ui)) (invoices-view state h)
+     (= :statements (:mode ui)) (statements-view state h)
      (nil? derived) [:section {:class "kk-report"}
-                     [:p "仕訳がまだありません。請求書を計上するか、仕訳を取り込むと帳票が出ます。"]]
+                     [:p "仕訳がまだありません。請求書・明細を計上するか、仕訳を取り込むと帳票が出ます。"]]
      :else
      (case (:mode ui)
        :profit-and-loss (profit-and-loss-view state derived h)
@@ -856,8 +1255,7 @@
      (when-let [r (:export-result ui)] (export-result r h))
      (when (:import-open? ui) (import-panel state h))
      (when-let [r (:import-result ui)] (import-result r h))
-     (if (and (empty? (:entries data)) (empty? (:invoices data))
-              (not= :invoices (:mode ui)))
+     (if (and (empty-book? data) (not (#{:invoices :statements} (:mode ui))))
        (empty-state h)
        (workspace state derived h))
      (footer)]))

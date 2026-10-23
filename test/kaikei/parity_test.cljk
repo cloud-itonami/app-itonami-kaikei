@@ -37,7 +37,19 @@
    "tax-share" core/tax-share
    "invoice-buffer-valid?" core/invoice-buffer-valid?
    "registration-format?" core/registration-format?
-   "deduction-percent" core/deduction-percent})
+   "deduction-percent" core/deduction-percent
+   "days-between" core/days-between
+   "consumption-rate" core/consumption-rate
+   "aging-bucket" core/aging-bucket
+   "running-break" core/running-break
+   "closing-gap" core/closing-gap
+   "line-buffer-valid?" core/line-buffer-valid?
+   "payment-kind" core/payment-kind
+   "cover-count" core/cover-count
+   "allocate" core/allocate
+   "date-fit" core/date-fit
+   "match-level" core/match-level
+   "suggestion-level" core/suggestion-level})
 
 (deftest every-row-matches
   (doseq [{f :fn args :args expect :expect} (:rows fixture)]
@@ -52,9 +64,12 @@
             "statement-balanced?" 3 "statement-buffer-valid?" 6
             "rate-base" 3 "rate-tax" 15 "invoice-tax" 6 "invoice-total" 3 "rate-net" 3
             "tax-share" 10 "invoice-buffer-valid?" 6 "registration-format?" 4
-            "deduction-percent" 8}
+            "deduction-percent" 8
+            "days-between" 9 "consumption-rate" 11 "aging-bucket" 9 "running-break" 4
+            "closing-gap" 3 "line-buffer-valid?" 5 "payment-kind" 8 "cover-count" 7
+            "allocate" 5 "date-fit" 5 "match-level" 9 "suggestion-level" 7}
            (frequencies (map :fn (:rows fixture)))))
-    (is (= 110 (count (:rows fixture))))))
+    (is (= 192 (count (:rows fixture))))))
 
 (deftest every-function-is-exported-by-the-guest
   (let [src (str (fs/readFileSync "aiueos/kaikei_journal.cljk" "utf8"))

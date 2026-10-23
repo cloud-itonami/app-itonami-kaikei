@@ -19,14 +19,22 @@
 - マネーフォワード クラウド請求書 の CSV 一括追加と API v3 の Billing
 - Zoho Invoice の invoice、FreshBooks の invoices・bills（API の JSON）
 
-データは送信されない。保存はこの端末の IndexedDB だけ。
+利用者が自分で落とした銀行・カードの明細を取り込み、請求書の消込・帳簿の仕訳との照合・
+振替と、過去の仕訳と利用者の規則による仕訳の候補を出す。利用者が承認するまで計上しない
+（2026-10-23 から。Linear JUN-327）。明細は次の形式を読む（OFX は読むだけ）:
+
+- OFX 1.x（SGML）・2.x（XML）、QFX・QBO（Web Connect）
+- freee 会計・マネーフォワード クラウド会計・Xero・QuickBooks Online の明細の取り込み CSV
+
+銀行・カード会社には接続せず（口座連携をしない）、支払もしない。データは送信されない。
+保存はこの端末の IndexedDB だけ。
 
 | | 置き場所 |
 |---|---|
-| 判断コア（guest） | `aiueos/kaikei_journal.cljk`（仕訳の検証・試算表・段階利益・B/S の照合・請求書の税率ごとの税額。`:effects #{}`） |
-| adapter・形式・帳票・請求書 | `src/kaikei/`（`core` `invoice` `ingest` `export` `compat/*` `view` `mcp`） |
+| 判断コア（guest） | `aiueos/kaikei_journal.cljk`（仕訳の検証・試算表・段階利益・B/S の照合・請求書の税率ごとの税額・明細の残高と消込の強さ。`:effects #{}`） |
+| adapter・形式・帳票・請求書・明細 | `src/kaikei/`（`core` `invoice` `statement` `ingest` `export` `compat/*` `view` `mcp`） |
 | 画面 | `site/`（scittle + Re-frame／Reagent、DADS）。公開先は `https://itonami.cloud/sites/app/kaikei/` |
-| agent の tool | `bin/kaikei-mcp`（stdio MCP、tool 8 つ、pure） |
+| agent の tool | `bin/kaikei-mcp`（stdio MCP、tool 11、pure） |
 | 設計の正本 | `docs/aiueos-dapp.md` |
 | 旧来の入口（Cloudflare Worker、静的） | `appview/kaikei-core-kaikei01/`（下の歴史の節） |
 
@@ -45,6 +53,8 @@ npm test
 - 申告書を作らず、提出もしない。
 - 適格請求書の要件を満たすことは保証しない（記載事項の欠けを知らせるだけ）。登録番号は
   形だけを見て、国税庁の公表サイトには照会しない。請求書を送付しない。
+- 明細の候補は提案で、正しいことを主張しない。適格請求書の有無を知らないので、明細から
+  起こした課税仕入は「未確認」と記録する。
 
 各社の名前はそれぞれの権利者の商標で、kaikei は形式の互換を名乗るだけ。
 
@@ -170,6 +180,7 @@ kaikei を aiueos アプリ（分散型 dapp、itonami agent 前提）として�
 - 第 1 スライス（JUN-115）: 判断コア guest。
 - 第 2 スライス（JUN-304）: 5 社の形式・帳票・画面・MCP。
 - 第 3 スライス（JUN-321）: 請求書（適格請求書の検査・計上・各社の請求書の形）。
+- 第 4 スライス（JUN-327）: 明細（OFX・各社の明細 CSV）、入金・支払の消込、仕訳の候補。
 
 adapter の正本は `src/kaikei/core.cljk`。`appview/.../cljs/src/kaikei/journal.cljk` は
 第 1 スライスの adapter で、旧 SPA のビルドの再配線を決めるまで残してある。

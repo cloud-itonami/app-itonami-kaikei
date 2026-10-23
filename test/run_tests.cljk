@@ -16,6 +16,8 @@
             [kaikei.mcp-test]
             [kaikei.invoice-test]
             [kaikei.invoice-formats-test]
+            [kaikei.statement-test]
+            [kaikei.statement-formats-test]
             [mcp-stdio-test]))
 
 (let [{:keys [fail error]} (run-tests 'kaikei.parity-test
@@ -28,6 +30,8 @@
                                       'kaikei.mcp-test
                                       'kaikei.invoice-test
                                       'kaikei.invoice-formats-test
+                                      'kaikei.statement-test
+                                      'kaikei.statement-formats-test
                                       'mcp-stdio-test)]
   (when (pos? (+ fail error))
     (set! (.-exitCode js/process) 1)))
