@@ -787,7 +787,7 @@
 
   訂正: OFX の CORRECTFITID（:correct {:uid :action}）は、訂正される行を消す
   （計上・照合した行は消さずに警告する）。:replace なら新しい行を足す。"
-  [db parsed {:keys [statement-account]}]
+  [db parsed {:keys [statement-account file]}]
   (let [existing (vec (:statement-accounts db))
         target (first (filter #(= statement-account (:id %)) existing))
         counter (atom (reduce max 0 (map #(prefixed-number "a" (:id %)) (concat existing (:statement-accounts parsed)))))
@@ -858,10 +858,24 @@
                       :else [(filterv #(not= (:id victim) (:id %)) ls) (inc n) ws])))
                 [lines 0 []]
                 corrections)]
-    [(assoc db :statement-accounts accounts :statement-lines lines)
-     lmap
-     {:lines-added added :lines-duplicates dup :lines-corrected corrected}
-     warnings]))
+    (let [;; 元のファイル（判断 5）: 行を足したときだけ、ファイルの id を振って行に付ける。
+          ;; 帳簿にはファイルの名前・SHA-256・大きさ・取り込みの時刻だけを持つ（バイト列は
+          ;; 画面が IndexedDB の別の store に持つ）
+          file-id (when (and file (pos? added))
+                    (str "f" (inc (reduce max 0 (map #(prefixed-number "f" (:id %)) (:files db))))))
+          before (set (map :id (:statement-lines db)))
+          lines (if file-id
+                  (mapv #(if (before (:id %)) % (assoc % :file-id file-id)) lines)
+                  lines)]
+      [(cond-> (assoc db :statement-accounts accounts :statement-lines lines)
+         file-id (update :files (fnil conj [])
+                         (merge (select-keys file [:name :sha256 :size :imported-at :format])
+                                {:id file-id
+                                 :account-ids (vec (distinct (keep #(when (= file-id (:file-id %)) (:account-id %)) lines)))})))
+       lmap
+       (cond-> {:lines-added added :lines-duplicates dup :lines-corrected corrected}
+         file-id (assoc :file-id file-id))
+       warnings])))
 
 (defn- merge-rules
   "利用者の規則と明細の設定を合流する（同じ条件と同じ結果の規則は足さない）。"
@@ -1011,8 +1025,26 @@
                               (inc added) dup (assoc seen fp id) (remember emap id)]))))
                      [with-accounts 0 0 seen {}]
                      parsed-entries)
+             ;; 元のファイルの記録（kaikei-json が運ぶ）: 同じ SHA-256 は 1 つに、id は空いていれば保つ
+             [db' file-ids]
+             (reduce (fn [[d m] f]
+                       (if-let [same (first (filter #(= (:sha256 f) (:sha256 %)) (:files d)))]
+                         [d (assoc m (:id f) (:id same))]
+                         (let [taken (set (map :id (:files d)))
+                               id (if (taken (:id f))
+                                    (str "f" (inc (reduce max 0 (map #(prefixed-number "f" (:id %)) (:files d)))))
+                                    (:id f))]
+                           [(update d :files (fnil conj []) (assoc f :id id)) (assoc m (:id f) id)])))
+                     [(cond-> db' (and replace? (contains? parsed :files)) (assoc :files [])) {}]
+                     (:files parsed))
              ;; 取り込んだ明細の行の照合（:match）を、振り直した仕訳の id に合わせる
              new-lines (set (vals line-ids))
+             db' (update db' :statement-lines
+                         (fn [ls] (mapv (fn [l]
+                                          (if (and (new-lines (:id l)) (:file-id l) (contains? file-ids (:file-id l)))
+                                            (assoc l :file-id (get file-ids (:file-id l)))
+                                            l))
+                                        ls)))
              db' (update db' :statement-lines
                          (fn [ls] (mapv (fn [l]
                                           (if-let [m (and (new-lines (:id l)) (get-in l [:match :entry-id]))]

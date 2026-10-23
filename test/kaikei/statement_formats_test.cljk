@@ -7,7 +7,10 @@
             [kaikei.core :as core]
             [kaikei.encoding :as enc]
             [kaikei.export :as export]
-            [kaikei.ingest :as ingest]))
+            [kaikei.ingest :as ingest]
+            [kaikei.compat.zengin]
+            [kaikei.compat.statement-csv]
+            [kaikei.compat.native]))
 
 (defn- fixture [name] (str (fs/readFileSync (str "test/fixtures/" name) "utf8")))
 (defn- fixture-bytes [name] (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" name))))
@@ -125,3 +128,110 @@
     (testing "読むだけの OFX は書き出しの形式に無い"
       (is (not (some #{"ofx"} ingest/export-format-ids)))
       (is (not (some #{"freee-statement-csv"} (map :id ingest/ledger-export-formats)))))))
+
+;; ───────── 全銀（2 つ目の PR） ─────────
+
+(deftest zengin-03-fixed
+  (let [p (ingest/ingest-bytes (fixture-bytes "zengin-03-sjis.txt") {})
+        a (first (:statement-accounts p))]
+    (is (= [:zengin "shift_jis"] [(:format p) (:encoding p)]))
+    (testing "口座: 銀行コード・支店コード・預金種目・口座番号の下 4 桁。口座番号は下 4 桁だけ"
+      (is (= ["zengin:0005:123:1:4567" "ﾐﾂﾋﾞｼﾕ-ｴﾌｼﾞｴｲ ｻﾝﾌﾟﾙ 普通 ****4567" "普通預金"]
+             ((juxt :key :name :ledger-account) a)))
+      (is (not (re-find #"0001234567" (pr-str p)))))
+    (testing "和暦 YYMMDD（令和）、入払区分で向き、入金は振込依頼人名を摘要と取引先に"
+      (is (= [["2026-11-28" 59320 "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ"] ["2026-11-30" -3630 "ﾌﾘｺﾐ ﾔﾏﾀﾞﾌﾞﾝｸﾞ"] ["2026-11-30" -440 "ﾃｽｳﾘﾖｳ"]]
+             (rows p)))
+      (is (= "ｶ)ﾐﾅﾄ" (:counterparty (first (:statement-lines p)))))
+      (is (= {:transaction-type "18"} (:hints (last (:statement-lines p))))))
+    (testing "トレーラの件数・合計と 取引前残高 + 明細の和 = 取引後残高 が合うので、行ごとの残高を足し上げる"
+      (is (= [] (:warnings p)))
+      (is (= [1062820 1059190 1058750] (map :balance (:statement-lines p))))
+      (is (= {:amount 1058750 :date "2026-11-30"} (:statement-balance a))))
+    (testing "照会番号と勘定日で一意な id を作る（2 回目は重複）"
+      (let [{db :db} (core/merge-import core/empty-db p)]
+        (is (= [0 3] ((juxt :lines-added :lines-duplicates) (core/merge-import db p))))))
+    (testing "改行の無い 200 文字の続きも読む"
+      (let [text (:text (enc/decode (fixture-bytes "zengin-03-sjis.txt") "shift_jis"))
+            flat (.replace text (js/RegExp. "\r\n" "g") "")]
+        (is (= (rows p) (rows (ingest/ingest-text flat {}))))))))
+
+(deftest zengin-checks-and-rejections
+  (let [text (:text (enc/decode (fixture-bytes "zengin-03-sjis.txt") "shift_jis"))]
+    (testing "トレーラと合わなければ警告し、残高は付けない"
+      (let [bad (.replace text "000000004070" "000000004000")
+            p (ingest/ingest-text bad {})]
+        (is (some #(re-find #"出金額合計" %) (:warnings p)))
+        (is (every? nil? (map :balance (:statement-lines p))))))
+    (testing "コード区分 1（EBCDIC）は読まない"
+      (let [p (ingest/ingest-text (str (subs text 0 3) "1" (subs text 4)) {})]
+        (is (empty? (:statement-lines p)))
+        (is (re-find #"EBCDIC" (first (:warnings p))))))))
+
+(deftest zengin-01-and-csv
+  (testing "振込入金通知: 入金だけ、別の口座に入れて警告する"
+    (let [p (ingest/ingest-bytes (fixture-bytes "zengin-01-sjis.txt") {})]
+      (is (= [["2026-11-28" 59320 "振込 ｶ)ﾐﾅﾄ"]] (rows p)))
+      (is (re-find #"^zengin-01:" (:key (first (:statement-accounts p)))))
+      (is (some #(re-find #"同じ入金" %) (:warnings p)))))
+  (testing "全銀 CSV（GMO あおぞら・山梨中央の形）"
+    (let [p (ingest/ingest-bytes (fixture-bytes "zengin-03.csv") {})]
+      (is (= :zengin (:format p)))
+      (is (= [["2026-11-10" 110000 "ﾌﾘｺﾐ ﾄﾞ)ｶﾓﾒ"] ["2026-11-15" -20000 "ｶｰﾄﾞ"]] (rows p)))
+      (is (= [610000 590000] (map :balance (:statement-lines p))))))
+  (testing "和暦の 31 年 4 月 30 日までは平成 31 年（2019 年）、それ以外は令和"
+    (is (= "2019-04-30" (kaikei.compat.zengin/wareki-date "310430")))
+    (is (= "2049-05-01" (kaikei.compat.zengin/wareki-date "310501")))
+    (is (= "2026-11-28" (kaikei.compat.zengin/wareki-date "081128")))))
+
+;; ───────── 汎用の CSV（判断 3） ─────────
+
+(deftest mapped-csv-presets
+  (testing "確かめた型（三菱UFJ BizSTATION）: 見出しで選び、和暦・入払区分で読む。警告なし"
+    (let [p (ingest/ingest-bytes (fixture-bytes "mufg-biz-nyuushukkin.csv") {})]
+      (is (= :statement-csv (:format p)))
+      (is (= [["2026-11-28" 59320 "ﾌﾘｺﾐ ｶ)ﾐﾅﾄ"] ["2026-11-30" -3630 "ﾌﾘｺﾐ ﾔﾏﾀﾞﾌﾞﾝｸﾞ"]] (rows p)))
+      (is (= [] (:warnings p)))
+      (is (= "mufg-biz" (get-in (first (:statement-accounts p)) [:mapping :preset])))))
+  (testing "未確認の型（三菱UFJ 個人）: 読めるが、確かめていない旨を警告する"
+    (let [p (ingest/ingest-bytes (fixture-bytes "mufg-personal.csv") {})]
+      (is (= [["2026-11-28" 59320 "振込１ ｶ)ﾐﾅﾄ"] ["2026-11-30" -3630 "振込 ﾔﾏﾀﾞﾌﾞﾝｸﾞ"]] (rows p)))
+      (is (= [1062820 1059190] (map :balance (:statement-lines p))))
+      (is (re-find #"一次資料で確かめていません" (first (:warnings p))))))
+  (testing "日付が 3 つの列（PayPay 銀行）"
+    (is (= [["2026-12-01" 5000 "ｶ)ﾐﾅﾄ"] ["2026-12-02" -2200 "ﾃﾞﾝｷﾀﾞｲ"]]
+           (rows (ingest/ingest-bytes (fixture-bytes "paypay-bank.csv") {})))))
+  (testing "見出しの無いカード（Vpass）: 型を選んで読む。会員の行と合計の行は黙って飛ばす。利用は負"
+    (let [p (ingest/ingest-bytes (fixture-bytes "vpass.csv")
+                                 {:format "statement-csv" :mapping (assoc (:mapping (kaikei.compat.statement-csv/preset-by-id "vpass")) :preset "vpass")})]
+      (is (= [["2026-11-03" -1100 "ｱﾏｿﾞﾝ ﾏｰｹｯﾄﾌﾟﾚｲｽ"] ["2026-11-27" 3300 "ｺﾞｼﾞﾂｾｲｻﾝ 返品"]] (rows p)))
+      (is (= [:card "未払金"] ((juxt :kind :ledger-account) (first (:statement-accounts p)))))
+      (is (= 1 (count (:warnings p))))))
+  (testing "利用者の割り当て（1 列の符号つき金額、mdy、見出しの前の 2 行を読み飛ばす）"
+    (let [csv "口座 1234\n2026年11月分\nPosted,Memo,Value,Bal\n11/28/2026,Deposit,59320,1062820\n11/30/2026,Stationery,-3630,1059190\n"
+          p (ingest/ingest-text csv {:format "statement-csv"
+                                     :mapping {:skip-rows 2 :date "Posted" :date-order "mdy" :amount "Value"
+                                               :balance "Bal" :description ["Memo"]}})]
+      (is (= [["2026-11-28" 59320 "Deposit"] ["2026-11-30" -3630 "Stationery"]] (rows p)))
+      (is (= "statement-csv:custom:bank" (:key (first (:statement-accounts p)))))))
+  (testing "割り当ての無い汎用 CSV は取り込まない"
+    (is (re-find #"列を割り当てて" (first (:warnings (ingest/ingest-text "a,b\n1,2\n" {:format "statement-csv"}))))))
+  (testing "列の名前（画面の割り当てに出す）"
+    (is (= ["#1" "#2" "#3"] (kaikei.compat.statement-csv/headers [["a" "b" "c"]] {:header? false})))))
+
+(deftest original-file-metadata
+  (let [p (ingest/ingest-text (fixture "ofx-bank.ofx") {})
+        file {:name "meisai.ofx" :sha256 "abc123" :size 1234 :imported-at "2026-11-30T10:00:00+09:00" :format "ofx"}
+        {db :db :keys [file-id]} (core/merge-import core/empty-db p :append {:file file})]
+    (testing "行を足したときだけファイルの id を振り、行に付ける。帳簿は名前・SHA-256 などだけを持つ"
+      (is (= "f1" file-id))
+      (is (= [(merge file {:id "f1" :account-ids ["a1"]})] (:files db)))
+      (is (every? #(= "f1" (:file-id %)) (:statement-lines db))))
+    (testing "同じファイルをもう 1 度（行が増えない）: ファイルも増えない"
+      (let [r (core/merge-import db p :append {:file (assoc file :sha256 "abc123")})]
+        (is (nil? (:file-id r)))
+        (is (= 1 (count (:files (:db r)))))))
+    (testing "帳簿 JSON の往復で、ファイルの記録と行の結び付きが戻る"
+      (let [back (:db (core/merge-import core/empty-db (ingest/ingest-text (kaikei.compat.native/write db) {})))]
+        (is (= (:files db) (:files back)))
+        (is (= (map :file-id (:statement-lines db)) (map :file-id (:statement-lines back))))))))

@@ -30,12 +30,14 @@
                 \"stats\": {\"suggested\", \"accepted\"}}],
      \"statement_settings\": {\"max_fee\", \"fee_treatment\", \"fee_by_partner\": {…}, \"match_window\",
                             \"entry_window\", \"transfer_window\", \"min_hits\", \"min_share\",
-                            \"accounts\": {\"fee\", \"discount\"}, \"aliases\": {\"取引先\": […]}}}
+                            \"accounts\": {\"fee\", \"discount\"}, \"aliases\": {\"取引先\": […]}},
+     \"files\": [{\"id\", \"name\", \"sha256\", \"size\", \"imported_at\", \"format\", \"account_ids\"}]}
 
   金額は最小通貨単位の整数、税率は basis points（1000 = 10%）。invoices・
   business・invoice_settings は第 3 スライス（JUN-321）、statement_accounts・
   statement_lines・rules・statement_settings は第 4 スライス（JUN-327）で足した
-  任意のキーで、版は v1 のまま（無い JSON も読む）。"
+  任意のキーで、版は v1 のまま（無い JSON も読む）。files は取り込んだ元のファイルの
+  名前・SHA-256・大きさ・時刻だけ（バイト列は運ばない。画面がこの端末に持つ）。"
   (:require [kotoba.lang.text :as text]
             [kaikei.core :as core]
             [kaikei.json :as json]))
@@ -269,6 +271,15 @@
        (map? (get m "aliases")) (assoc :aliases (into {} (for [[k v] (get m "aliases") :when (sequential? v)]
                                                            [k (vec (filter string? v))])))))))
 
+(defn- file-in [m]
+  (when (and (map? m) (str-or-nil (get m "id")) (string? (get m "sha256")))
+    (cond-> {:id (get m "id") :sha256 (get m "sha256")}
+      (string? (get m "name")) (assoc :name (get m "name"))
+      (integer-value? (get m "size")) (assoc :size (get m "size"))
+      (string? (get m "imported_at")) (assoc :imported-at (get m "imported_at"))
+      (string? (get m "format")) (assoc :format (get m "format"))
+      (sequential? (get m "account_ids")) (assoc :account-ids (vec (filter string? (get m "account_ids")))))))
+
 (defn detect? [data] (and (map? data) (= format-id (get data "format"))))
 
 (defn read-data
@@ -303,7 +314,8 @@
                         (update :rejected + (count (filter :problem ls))))))
           (contains? data "rules") (assoc :rules (vec (keep rule-in (get data "rules" []))))
           (statement-settings-in (get data "statement_settings"))
-          (assoc :statement-settings (statement-settings-in (get data "statement_settings"))))))))
+          (assoc :statement-settings (statement-settings-in (get data "statement_settings")))
+          (contains? data "files") (assoc :files (vec (keep file-in (get data "files" [])))))))))
 
 (defn- line-out [l]
   (json/ordered
@@ -450,6 +462,11 @@
     ["statement_lines" (when (or (seq (:statement-accounts db)) (seq (:statement-lines db)))
                          (mapv statement-line-out (:statement-lines db)))]
     ["rules" (when (seq (:rules db)) (mapv rule-out (:rules db)))]
-    ["statement_settings" (when-let [st (not-empty (:statement-settings db))] (statement-settings-out st))]]))
+    ["statement_settings" (when-let [st (not-empty (:statement-settings db))] (statement-settings-out st))]
+    ["files" (when (seq (:files db))
+               (vec (for [f (:files db)]
+                      (json/ordered [["id" (:id f)] ["name" (:name f)] ["sha256" (:sha256 f)] ["size" (:size f)]
+                                     ["imported_at" (:imported-at f)] ["format" (:format f)]
+                                     ["account_ids" (:account-ids f)]]))))]]))
 
 (defn write [db] (str (json/write (data db)) "\n"))
