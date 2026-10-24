@@ -1,0 +1,27 @@
+;; First journal slice of aiueos/kaikei_journal.cljk in canonical Kotoba.
+;; Same integer-minor-unit encoding and error values. No tax, payment or
+;; distributed-state qualification. JUN-379.
+(ns kaikei.journal (:export [validate-entry entry-balanced? test-journal]))
+(defn journal-lines [buf :vector-i64 n :i64 i :i64 bad :i64 debit :i64 credit :i64] :i64
+  (if (< i n)
+    (let [d (vector-at buf i) c (vector-at buf (+ i 1))]
+      (journal-lines buf n (+ i 2)
+        (if (or (< d 0) (< c 0)) (+ bad 4)
+          (if (and (= d 0) (= c 0)) (+ bad 8)
+            (if (and (> d 0) (> c 0)) (+ bad 16) bad)))
+        (+ debit d) (+ credit c)))
+    (if (= debit credit) bad (+ bad 32))))
+(defn validate-entry [buf :vector-i64] :i64
+  (let [n (vector-count buf)]
+    (cond (= n 0) 1 (not= n (* 2 (quot n 2))) 2
+      :else (journal-lines buf n 0 0 0 0))))
+(defn entry-balanced? [buf :vector-i64] :i64 (if (= (validate-entry buf) 0) 1 0))
+(defn test-journal [] :i64
+  (if (and (= (validate-entry [100 0 0 100]) 0)
+           (= (validate-entry []) 1) (= (validate-entry [100 0 50]) 2)
+           (= (validate-entry [100 0 -100 0]) 4)
+           (= (validate-entry [100 0 0 100 0 0]) 8)
+           (= (validate-entry [100 0 50 100 0 50]) 16)
+           (= (validate-entry [100 0 0 90]) 32)
+           (= (entry-balanced? [300 0 0 200 0 100]) 1)
+           (= (entry-balanced? [100 0 0 90]) 0)) 511 0))
