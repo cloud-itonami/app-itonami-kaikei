@@ -820,18 +820,23 @@
         incoming (for [l (:statement-lines parsed)
                        :when (not= :delete (get-in l [:correct :action]))]
                    (assoc (dissoc l :correct) :account-id (get amap (:account-id l))))
-        uids (set (for [l lines :when (:uid l)] [(:account-id l) (:uid l)]))
+        uids (into {} (for [l lines :when (:uid l)] [[(:account-id l) (:uid l)] l]))
         existing-counts (frequencies (map line-content-key (remove :uid lines)))
         id-counter (atom (reduce max 0 (map #(prefixed-number "l" (:id %)) (concat lines (:statement-lines parsed)))))
         seq-counter (atom (reduce max 0 (map #(:seq % 0) lines)))
         line-taken (atom (set (map :id lines)))
-        [lines lmap added dup _ _]
-        (reduce (fn [[ls m added dup seen-uids seen] l]
+        [lines lmap added dup _ _ uid-warnings]
+        (reduce (fn [[ls m added dup seen-uids seen warnings] l]
                   (let [uid-key (when (:uid l) [(:account-id l) (:uid l)])
+                        prior (when uid-key (get seen-uids uid-key))
                         ck (line-content-key l)
                         n (get seen ck 0)]
-                    (if (if uid-key (seen-uids uid-key) (< n (get existing-counts ck 0)))
-                      [ls m added (inc dup) seen-uids (if uid-key seen (assoc seen ck (inc n)))]
+                    (if (if uid-key prior (< n (get existing-counts ck 0)))
+                      [ls m added (inc dup) seen-uids (if uid-key seen (assoc seen ck (inc n)))
+                       (cond-> warnings
+                         (and prior (not= (line-content-key prior) ck))
+                         (conj (str "同じ明細 ID の内容が変わっています。既存の行を保持しました（口座 "
+                                    (:account-id l) "、行 " (:id prior) "）。元の明細と照合してください")))]
                       (let [own (:id l)
                             id (if (and own (re-matches #"l\d+" (str own)) (not (@line-taken own)))
                                  own
@@ -840,9 +845,9 @@
                         [(conj ls (assoc l :id id :seq (swap! seq-counter inc)))
                          (cond-> m (:id l) (assoc (:id l) id))
                          (inc added) dup
-                         (cond-> seen-uids uid-key (conj uid-key))
-                         (if uid-key seen (assoc seen ck (inc n)))]))))
-                [lines {} 0 0 uids {}]
+                         (cond-> seen-uids uid-key (assoc uid-key (assoc l :id id)))
+                         (if uid-key seen (assoc seen ck (inc n))) warnings]))))
+                [lines {} 0 0 uids {} []]
                 incoming)
         ;; 訂正（同じファイルの中の行にも当てる）。訂正される行を消す。計上・照合した行は
         ;; 消さずに警告する。REPLACE の新しい行はもう足してある
@@ -856,7 +861,7 @@
                       (status-of victim) [ls n (conj ws (str "訂正された明細の行 " (:date victim) " " (:description victim "")
                                                             " は計上・照合済みなので消していません"))]
                       :else [(filterv #(not= (:id victim) (:id %)) ls) (inc n) ws])))
-                [lines 0 []]
+                [lines 0 uid-warnings]
                 corrections)]
     (let [;; 元のファイル（判断 5）: 行を足したときだけ、ファイルの id を振って行に付ける。
           ;; 帳簿にはファイルの名前・SHA-256・大きさ・取り込みの時刻だけを持つ（バイト列は

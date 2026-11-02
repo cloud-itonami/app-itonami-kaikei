@@ -351,6 +351,28 @@
       (is (= ["a1"] (distinct (map :account-id (:statement-lines db)))))
       (is (= 1 (count (:statement-accounts db)))))))
 
+(deftest changed-statement-id-is-not-silently-discarded
+  (let [parsed (ingest/ingest-text (fixture "ofx-bank.ofx") {})
+        {original :db} (core/merge-import core/empty-db parsed)
+        same (core/merge-import original parsed)
+        changed (update-in parsed [:statement-lines 0 :amount] + 1)
+        result (core/merge-import original changed)
+        warning (first (:warnings result))]
+    (is (empty? (:warnings same)))
+    (is (= 1 (count (:warnings result))))
+    (is (string? warning))
+    (is (re-find #"同じ明細 ID の内容が変わっています" warning))
+    (is (= (:statement-lines original) (:statement-lines (:db result))))
+    (is (= 0 (:lines-added result)))
+    (is (= 3 (:lines-duplicates result)))
+    (testing "同じ取り込み内で重複 ID の内容が異なる場合も警告"
+      (let [one (first (:statement-lines parsed))
+            p (assoc parsed :statement-lines [one (update one :amount + 1)])
+            r (core/merge-import core/empty-db p)]
+        (is (= 1 (:lines-added r)))
+        (is (= 1 (:lines-duplicates r)))
+        (is (= 1 (count (:warnings r))))))))
+
 (deftest ledger-json-round-trip
   (let [{db :db} (st/post-preselected sample-db ["l1" "l2" "l3"])
         db (:db (st/post-line db "l4" {:type :exclude}))
