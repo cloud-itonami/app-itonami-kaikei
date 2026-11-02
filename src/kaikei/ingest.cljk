@@ -127,7 +127,7 @@
    {:id "zengin" :content :statements :read-only true
     :label "全銀協 入出金取引明細・振込入金通知（固定長・全銀 CSV、読むだけ）" :kind :zengin :encoding "shift_jis"}
    {:id "paypay-merchant-csv" :content :statements :read-only true
-    :label "PayPay 加盟店 即時決済 recon CSV（売上・返金、読むだけ）" :kind :csv :encoding "shift_jis"}
+    :label "PayPay 加盟店 recon CSV（即時・後日確定の売上・返金、読むだけ）" :kind :csv :encoding "shift_jis"}
    {:id "statement-csv" :content :statements :read-only true
     :label "汎用の明細 CSV（列を割り当てる・銀行とカードの型、読むだけ）" :kind :csv :encoding "utf-8"}
    {:id "ramp-json" :content :statements :read-only true
