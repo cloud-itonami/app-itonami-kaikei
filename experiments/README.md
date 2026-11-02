@@ -106,6 +106,17 @@ demonstrate publisher admission, provider transport, full egress isolation or
 production consent. The separate canonical path mandated by the workspace
 contract, provider specifications and production host remain unresolved.
 
+With the builder's explicit `--http` option, a second fixture declares a
+single anonymous public GitHub metadata GET (no credentials or financial
+data). In one in-app browser, the guest requested it through the shared broker:
+denial left the browser resource-entry count at zero, approval of the next
+request returned HTTP 200 and count one, and a further denial left count one.
+The parent CSP included `frame-src 'none'` and the declared service origin in
+`connect-src`. A resource entry is browser-side evidence, not a server-side
+audit log; this does not test redirect, provider OAuth, production descriptor
+admission or all network paths. Running this optional fixture and approving
+the dialog makes an actual request to GitHub.
+
 Important limits before any production use:
 
 - The fixture's parent creates a raw iframe; it does not use the canonical
