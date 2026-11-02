@@ -49,6 +49,9 @@
                         refunded? (if capture? (= status "REFUNDED") (= status "返金完了"))]
                     (cond
                       (not (or completed? refunded?)) {:problem (str where ": 未確定・失敗または未知の状態は取り込みません（" status "）")}
+                      ;; Instant recon の返金欄が返金ごとに一意か、公開仕様では確認できない。
+                      ;; 同額・同日時の部分返金を重複として黙って消さないため、確認待ちにする。
+                      (and refunded? (not capture?)) {:problem (str where ": 即時決済の返金は識別子の一意性が未確認のため取り込みません。元ファイルと照合してください")}
                       (or (nil? merchant) (nil? payment) (nil? event-id)) {:problem (str where ": 加盟店・決済・取引 ID が必要です")}
                       (nil? date) {:problem (str where ": 取引日時を読めません")}
                       (nil? raw) {:problem (str where ": 金額がありません")}
