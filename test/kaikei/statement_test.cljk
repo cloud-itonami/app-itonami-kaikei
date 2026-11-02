@@ -531,3 +531,18 @@
     (is (true? (get-in reimported [:files 0 :review-required])))
     (is (= 1 (count (:files reimported))))
     (is (true? (get-in restored [:files 0 :review-required])))))
+
+(deftest rejected-statement-file-remains-reachable-for-each-source-account
+  (let [accounts [{:id "s1" :key "merchant-1" :kind :bank :name "one"}
+                  {:id "s2" :key "merchant-2" :kind :bank :name "two"}]
+        parsed {:currency "JPY" :statement-accounts accounts :statement-lines []
+                :rejected 2 :warnings ["2 行を拒否しました"]}
+        file {:name "rejected.csv" :sha256 "synthetic-rejected" :size 100 :format "csv"}
+        first-import (core/merge-import core/empty-db parsed :append {:file file})
+        db (:db first-import)
+        again (:db (core/merge-import db parsed :append {:file file}))]
+    (is (= 0 (:lines-added first-import)))
+    (is (= 2 (count (:statement-accounts db))))
+    (is (= #{"a1" "a2"} (set (get-in db [:files 0 :account-ids]))))
+    (is (true? (get-in db [:files 0 :review-required])))
+    (is (= 1 (count (:files again))))))

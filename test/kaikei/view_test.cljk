@@ -168,3 +168,9 @@
                              :account-ids ["a1"] :review-required true}])
         tree (render data (assoc view/initial-ui :mode :statements) view/ssr-handlers)]
     (is (has-text? tree "取込時に要確認"))))
+
+(deftest import-rejections-name-the-correct-record-type
+  (is (has-text? (view/import-result {:format :paypay-merchant-csv :rejected 5 :lines-added 0} view/ssr-handlers)
+                 "読めなかった明細 5 行"))
+  (is (has-text? (view/import-result {:format :yayoi :rejected 2 :added 0} view/ssr-handlers)
+                 "読めなかった仕訳 2 件")))
