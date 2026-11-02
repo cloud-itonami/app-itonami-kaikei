@@ -263,3 +263,32 @@
       (let [back (:db (core/merge-import core/empty-db (ingest/ingest-text (kaikei.compat.native/write db) {})))]
         (is (= (:files db) (:files back)))
         (is (= (map :file-id (:statement-lines db)) (map :file-id (:statement-lines back))))))))
+
+(deftest paypay-merchant-instant-reconciliation
+  (let [header "決済番号,加盟店ID,屋号,店舗ID,店舗名,端末番号/PosID,取引ステータス,取引日時,取引金額,レシート番号,支払い方法,マーチャント決済ID,支払い詳細\n"
+        data (str header "P1,M1,店舗,S1,店,1,取引完了,2020-01-30 23:58:30,150,,残高,A1,\n"
+                  "P1,M1,店舗,S1,店,1,返金完了,2020-01-31 01:00:00,-100,,残高,R1,\n"
+                  "P2,M1,店舗,S1,店,1,取引失敗,2020-01-31 02:00:00,200,,残高,A2,\n"
+                  "P3,M1,店舗,S1,店,1,取引完了,2020-01-31 02:00:00,-10,,残高,A3,\n")
+        p (ingest/ingest-bytes (:bytes (enc/encode data "shift_jis")) {})
+        merged (core/merge-import core/empty-db p :append)
+        repeated (core/merge-import (:db merged) p :append)]
+    (is (= :paypay-merchant-csv (:format p)))
+    (is (= [["2020-01-30" 150 "取引完了 A1"] ["2020-01-31" -100 "返金完了 R1"]] (rows p)))
+    (is (= 2 (:rejected p)))
+    (is (= 2 (count (get-in repeated [:db :statement-lines]))))
+    (is (= 2 (count (distinct (map :uid (:statement-lines p))))))
+    (is (some #(re-find #"個人の PayPay 支出" %) (:warnings p)))))
+
+(deftest paypay-merchant-separates-merchants-and-refuses-unknowns
+  (let [header "決済番号,加盟店ID,屋号,店舗ID,店舗名,端末番号/PosID,取引ステータス,取引日時,取引金額,レシート番号,支払い方法,マーチャント決済ID,支払い詳細\n"
+        data (str header "P,M1,店舗,S1,店,1,取引完了,2020-01-30 12:00:00,100,,残高,A,\n"
+                  "P,M2,店舗,S2,店,2,取引完了,2020-01-30 12:00:00,100,,残高,A,\n"
+                  "P,M2,店舗,S2,店,2,保留,2020-01-30 12:00:00,100,,残高,B,\n"
+                  "P,M2,店舗,S2,店,2,返金完了,2020-01-30 12:00:00,-100,,残高,,\n")
+        parsed (ingest/ingest-text data {})
+        merged (:db (core/merge-import core/empty-db parsed :append))]
+    (is (= 2 (count (:statement-accounts parsed))))
+    (is (= 2 (:rejected parsed)))
+    (is (= 2 (count (:statement-lines merged))))
+    (is (= 2 (count (distinct (map :account-id (:statement-lines merged))))))))

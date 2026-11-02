@@ -72,7 +72,8 @@
             [kaikei.compat.brex :as brex]
             [kaikei.compat.expensify :as expensify]
             [kaikei.compat.bill :as bill]
-            [kaikei.compat.statement-csv :as statement-csv]))
+            [kaikei.compat.statement-csv :as statement-csv]
+            [kaikei.compat.paypay-merchant :as paypay-merchant]))
 
 (def formats
   [{:id "kaikei-json" :label "kaikei 帳簿 JSON（すべての項目）" :kind :json :encoding "utf-8" :content :all
@@ -125,6 +126,8 @@
     :encoding "utf-8" :encodings ["utf-8" "utf-8-bom"] :file "kaikei-quickbooks-bank.csv" :mime "text/csv"}
    {:id "zengin" :content :statements :read-only true
     :label "全銀協 入出金取引明細・振込入金通知（固定長・全銀 CSV、読むだけ）" :kind :zengin :encoding "shift_jis"}
+   {:id "paypay-merchant-csv" :content :statements :read-only true
+    :label "PayPay 加盟店 即時決済 recon CSV（売上・返金、読むだけ）" :kind :csv :encoding "shift_jis"}
    {:id "statement-csv" :content :statements :read-only true
     :label "汎用の明細 CSV（列を割り当てる・銀行とカードの型、読むだけ）" :kind :csv :encoding "utf-8"}
    {:id "ramp-json" :content :statements :read-only true
@@ -187,6 +190,7 @@
     ;; 明細の CSV は見出しが短いので、仕訳・請求書の形（見出しに勘定科目や請求書番号が
     ;; ある）と重ならない条件だけで見る
     (expensify/csv-detect? rows) "expensify-csv"
+    (paypay-merchant/detect? rows) "paypay-merchant-csv"
     (statement-csv/freee-kind rows) "freee-statement-csv"
     (statement-csv/mf-detect? rows) "mf-statement-csv"
     (statement-csv/qbo-detect? rows) "qbo-bank-csv"
@@ -263,6 +267,7 @@
           "qbo-invoice-csv" (qbo-invoices/read-csv rows opts)
           "freee-invoice-csv" (freee-invoices/read-csv rows)
           "mf-invoice-csv" (mf-invoices/read-csv rows)
+          "paypay-merchant-csv" (paypay-merchant/read-rows rows)
           "freee-statement-csv" (if (statement-csv/freee-kind rows)
                                   (statement-csv/read-freee rows)
                                   (empty-result fmt "freee の明細のテンプレートの見出し（取引日・出金額・入金額・取引内容、カードは取引日・取引金額・取引内容）がありません"))

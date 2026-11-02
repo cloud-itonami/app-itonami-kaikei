@@ -44,6 +44,7 @@
            {:from "src/kaikei/compat/freee.cljk" :to "kaikei/compat/freee.cljs"}
            {:from "src/kaikei/compat/ofx.cljk" :to "kaikei/compat/ofx.cljs"}
            {:from "src/kaikei/compat/statement_csv.cljk" :to "kaikei/compat/statement_csv.cljs"}
+           {:from "src/kaikei/compat/paypay_merchant.cljk" :to "kaikei/compat/paypay_merchant.cljs"}
            {:from "src/kaikei/compat/zengin.cljk" :to "kaikei/compat/zengin.cljs"}
            {:from "src/kaikei/compat/ramp.cljk" :to "kaikei/compat/ramp.cljs"}
            {:from "src/kaikei/compat/brex.cljk" :to "kaikei/compat/brex.cljs"}
