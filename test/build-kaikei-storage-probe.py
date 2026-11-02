@@ -6,9 +6,9 @@ import re
 import sys
 from pathlib import Path
 
-if len(sys.argv) != 3:
-    raise SystemExit('usage: python3 test/build-kaikei-storage-probe.py PREVIEW EMPTY_OUTPUT_DIR')
-preview, out = map(Path, sys.argv[1:])
+if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] != '--corrupt-ledger'):
+    raise SystemExit('usage: python3 test/build-kaikei-storage-probe.py PREVIEW EMPTY_OUTPUT_DIR [--corrupt-ledger]')
+preview, out = map(Path, sys.argv[1:3])
 if out.exists() and any(out.iterdir()):
     raise SystemExit('output directory must be empty')
 out.mkdir(parents=True, exist_ok=True)
@@ -20,8 +20,13 @@ if hashlib.sha256(runtime).hexdigest() != expected:
 root = Path(__file__).resolve().parents[1]
 store = (root / 'experiments/local-ledger-fixture.mjs').read_text()
 assert store.count('kaikei-jun771-synthetic-fixture') == 1
-(out / 'store.mjs').write_text(store.replace('kaikei-jun771-synthetic-fixture',
-                                             'kaikei-jun771-actual-app-fixture'))
+store = store.replace('kaikei-jun771-synthetic-fixture', 'kaikei-jun771-actual-app-fixture')
+if len(sys.argv) == 4:
+    marker = 'export async function readFixture(signal) {'
+    if store.count(marker) != 1:
+        raise SystemExit('expected fixture read not found')
+    store = store.replace(marker, marker + ' return {revision: 1, value: JSON.stringify("{invalid-edn")};')
+(out / 'store.mjs').write_text(store)
 (out / 'port.mjs').write_bytes((root / 'experiments/local-ledger-port-fixture.mjs').read_bytes())
 
 # Only the generated test artifact is rewritten. Production source is unchanged.

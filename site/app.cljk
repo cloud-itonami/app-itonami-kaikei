@@ -178,11 +178,15 @@
 (rf/reg-event-db
  ::loaded
  (fn [db [_ text backend]]
-   (let [stored (try (some-> text edn/read-string) (catch :default _ nil))
-         data (if (map? (:data stored)) (merge core/empty-db (:data stored)) core/empty-db)]
-     {:data data
-      :backend backend
-      :ui (merge (:ui db) {:booting? false} (select-keys (:settings stored) [:fy-start :pl-style]))})))
+   (try
+     (let [stored (when (some? text) (edn/read-string text))]
+       (when (and (some? text) (not (and (map? stored) (map? (:data stored)))))
+         (throw (js/Error. "保存データの形式が正しくありません")))
+       {:data (if stored (merge core/empty-db (:data stored)) core/empty-db)
+        :backend backend
+        :ui (merge (:ui db) {:booting? false} (select-keys (:settings stored) [:fy-start :pl-style]))})
+     (catch :default _
+       (assoc-in db [:ui :load-error] "保存済みの帳簿を読み取れませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、復旧方法を確認してください。")))))
 
 (defn- with-store
   "db → db' の effect に、変えた data を保存する ::store を足す（data が空なら保存を消す）。"
@@ -632,12 +636,14 @@
         ui @(rf/subscribe [::ui])
         derived @(rf/subscribe [::derived])
         statements @(rf/subscribe [::statements])]
-    [:<>
+    (if-let [e (:load-error ui)]
+      [:div {:class "kk-app"} [:p {:class "kk-warnings" :role "alert"} e]]
+      [:<>
      (when-let [e (:store-error ui)]
        [:p {:class "kk-warnings kk-app" :role "alert"}
         (str "この端末に保存できませんでした（" e "）。書き出して手元に残してください。")])
      ;; :booting? の間は SSR と同じ「読み込んでいます」を描く（保存の読み出しは非同期）
-     (view/root (cond-> {:data data :ui ui} statements (assoc :statements statements)) derived handlers)]))
+       (view/root (cond-> {:data data :ui ui} statements (assoc :statements statements)) derived handlers)])))
 
 (rf/dispatch-sync [:init])
 (rdom/render [root] (.getElementById js/document "app"))

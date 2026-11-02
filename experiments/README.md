@@ -68,6 +68,17 @@ The initial-load localStorage fallback remains. Real quota failures, asynchronou
 save-result ordering, different competing edits and conflict recovery still need
 dedicated validation before release.
 
+If persisted ledger text is malformed or lacks a map-valued `:data`, the
+candidate `site/app.cljk` now stops the editor and displays a recovery warning
+instead of silently opening an empty ledger. In an in-app browser the
+`--corrupt-ledger` probe caused the warning and showed no editing controls;
+the earlier app candidate opened an empty editable ledger for the same
+synthetic input. A normal empty store and the built-in sample's save/reload
+also worked in the synthetic bridge. This is not comprehensive schema or
+corruption recovery, and it does not yet fix IndexedDB open/read failure
+falling back to an absent localStorage value. The injected corrupt value and
+all stores used in the probe are synthetic.
+
 The diagnostic host now adds `frame-src 'none'` before loading the guest.
 In a 2026-11-02 in-app browser test, an opaque synthetic guest's attempted
 cross-origin self-navigation reached the loopback destination without parent
