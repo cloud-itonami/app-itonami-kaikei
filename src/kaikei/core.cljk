@@ -878,13 +878,13 @@
                       :else [(filterv #(not= (:id victim) (:id %)) ls) (inc n) ws])))
                 [lines 0 uid-warnings]
                 corrections)]
-    (let [;; 元ファイルは行を足したとき、または訂正・ID 競合で警告したときに残す。
+    (let [;; 元ファイルは行を足したとき、削除訂正を適用したとき、または警告したときに残す。
           ;; 帳簿にはファイルの名前・SHA-256・大きさ・取り込みの時刻だけを持つ（バイト列は
           ;; 画面が IndexedDB の別の store に持つ）
-          warning-only? (and file (zero? added) (seq warnings))
-          existing-file (when (and warning-only? (:sha256 file))
+          source-only? (and file (zero? added) (or (pos? corrected) (seq warnings)))
+          existing-file (when (and source-only? (:sha256 file))
                           (first (filter #(= (:sha256 file) (:sha256 %)) (:files db))))
-          file-id (when (and file (or (pos? added) warning-only?))
+          file-id (when (and file (or (pos? added) source-only?))
                     (or (:id existing-file)
                         (str "f" (inc (reduce max 0 (map #(prefixed-number "f" (:id %)) (:files db)))))))
           before (set (map :id (:statement-lines db)))
@@ -892,7 +892,7 @@
                   (mapv #(if (before (:id %)) % (assoc % :file-id file-id)) lines)
                   lines)
           account-ids (vec (distinct (concat (keep #(when (= file-id (:file-id %)) (:account-id %)) lines)
-                                             (when warning-only? (keep #(get amap (:account-id %)) (:statement-lines parsed))))))]
+                                             (when source-only? (keep #(get amap (:account-id %)) (:statement-lines parsed))))))]
       [(cond-> (assoc db :statement-accounts accounts :statement-lines lines)
          (and file-id (not existing-file)) (update :files (fnil conj [])
                                                     (merge (select-keys file [:name :sha256 :size :imported-at :format])

@@ -473,3 +473,18 @@
 (deftest settlements-are-not-learned
   (let [{db :db} (st/post-preselected sample-db ["l1" "l2"])]
     (is (empty? (filter (fn [[[_ _ k] _]] (re-find #"消込" k)) (st/learn db))))))
+
+(deftest deletion-only-correction-retains-source-file
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        old {:account-id "a1" :uid "old" :date "2026-01-01" :amount -100 :description "original"}
+        delete-line {:account-id "a1" :uid "delete-op" :date "2026-01-02" :amount 0
+                     :correct {:uid "old" :action :delete}}
+        base {:currency "JPY" :statement-accounts [account]}
+        db (:db (core/merge-import core/empty-db (assoc base :statement-lines [old])))
+        file {:name "delete.ofx" :sha256 "synthetic-delete" :size 123 :format "ofx"}
+        result (core/merge-import db (assoc base :statement-lines [delete-line]) :append {:file file})]
+    (is (= 1 (:lines-corrected result)))
+    (is (= 0 (:lines-added result)))
+    (is (= "f1" (:file-id result)))
+    (is (= [(assoc file :id "f1" :account-ids ["a1"])] (get-in result [:db :files])))
+    (is (empty? (get-in result [:db :statement-lines])))))

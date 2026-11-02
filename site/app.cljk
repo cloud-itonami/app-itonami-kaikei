@@ -192,7 +192,8 @@
     (assoc ::store {:backend (:backend db')
                     :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db')))
                                      (seq (:invoices (:data db'))) (seq (:business (:data db')))
-                                     (seq (:statement-lines (:data db'))) (seq (:rules (:data db'))))
+                                     (seq (:statement-lines (:data db'))) (seq (:rules (:data db')))
+                                     (seq (:statement-accounts (:data db'))) (seq (:files (:data db'))))
                              (saved-state db'))})))
 
 (defn- reg-data-event
@@ -290,7 +291,7 @@
      :format (some-> (:format result) name)}))
 
 (defn- store-file-fx
-  "追加または訂正警告のある取り込みの元のバイト列を IndexedDB に置く effect。"
+  "追加・訂正または警告のある取り込みの元のバイト列を IndexedDB に置く effect。"
   [db bytes]
   (let [id (::stored-file db)
         db (dissoc db ::stored-file)]
