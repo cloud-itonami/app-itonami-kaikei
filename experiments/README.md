@@ -81,6 +81,19 @@ other navigation schemes, requests, browsers, redirects, consent flows and
 storage admission remain unqualified. No production host or live operation is
 enabled by this test. See KOTOBA-159 and JUN-765 for the boundary finding.
 
+`test/build-navigation-probe.py RUNTIME EMPTY_OUTPUT_DIR` generates ten
+loopback-only cases for the shared runtime with SHA-256 `4e6ef6ee…b693`.
+Serve the output at port 18777 and a separate loopback receiver at port 18778.
+The cases use synthetic fixed query values; filenames ending `-0` omit the
+parent frame policy and `-1` include it. In the in-app browser on 2026-11-02,
+without that policy the receiver saw one request each from `location.href`,
+`location.replace`, meta refresh and a script-clicked link; with the policy it
+saw none of those four. Form submission reached neither receiver in either
+configuration, so it is not a positive control for the parent policy. The
+receiver returned 404 for the four controls: the request arriving, not the
+response status, is the observation. Tests do not establish other browsers,
+redirects, host trust, or complete egress prevention.
+
 Important limits before any production use:
 
 - The fixture's parent creates a raw iframe; it does not use the canonical
