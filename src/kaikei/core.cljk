@@ -871,7 +871,7 @@
                     (cond
                       (and (= action :replace) (conflicted-uids [acc own-uid]))
                       [ls n (conj ws "置換先の明細 ID が競合しているため、訂正前の行を保持しました")]
-                      (nil? victim) [ls n ws]
+                      (nil? victim) [ls n (conj ws "訂正対象の明細が見つかりません。元の明細と取り込み順を確認してください")]
                       (status-of victim) [ls n (conj ws (str "訂正された明細の行 " (:date victim) " " (:description victim "")
                                                             " は計上・照合済みなので消していません"
                                                             (when (= action :replace) "。置換後の行は取り込まず保留しました。元の明細を確認してください")))]

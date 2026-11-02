@@ -488,3 +488,15 @@
     (is (= "f1" (:file-id result)))
     (is (= [(assoc file :id "f1" :account-ids ["a1"])] (get-in result [:db :files])))
     (is (empty? (get-in result [:db :statement-lines])))))
+
+(deftest unknown-correction-retains-source-and-warns
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        deletion {:account-id "a1" :uid "delete-op" :date "2026-01-02" :amount 0
+                  :correct {:uid "missing" :action :delete}}
+        parsed {:currency "JPY" :statement-accounts [account] :statement-lines [deletion]}
+        file {:name "unknown-delete.ofx" :sha256 "synthetic-unknown-delete" :size 123 :format "ofx"}
+        result (core/merge-import core/empty-db parsed :append {:file file})]
+    (is (= 0 (:lines-corrected result)))
+    (is (seq (:warnings result)))
+    (is (= "f1" (:file-id result)))
+    (is (= [(assoc file :id "f1" :account-ids ["a1"])] (get-in result [:db :files])))))
