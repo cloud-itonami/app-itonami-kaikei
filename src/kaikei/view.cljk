@@ -354,7 +354,10 @@
               "を取り込みました。"
               (when (pos? (or duplicates 0)) (str "同じ仕訳 " duplicates " 件は飛ばしました。"))
               (when (pos? (or invoices-duplicates 0)) (str "同じ請求書 " invoices-duplicates " 件は飛ばしました。"))
-              (when (pos? (or rejected 0)) (str "読めなかった仕訳 " rejected " 件は取り込んでいません。"))
+              (when (pos? (or rejected 0))
+                (if (= :statements (:content (ingest/format-by-id (some-> format name))))
+                  (str "読めなかった明細 " rejected " 行は取り込んでいません。")
+                  (str "読めなかった仕訳 " rejected " 件は取り込んでいません。")))
               (when (pos? (or invoices-rejected 0)) (str "読めなかった請求書 " invoices-rejected " 件は取り込んでいません。"))
               (when (pos? (or invoices-dropped 0))
                 (str "通貨が変わったので、帳簿にあった請求書 " invoices-dropped " 件は残せませんでした。"))

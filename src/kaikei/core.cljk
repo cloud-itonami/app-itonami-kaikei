@@ -893,7 +893,10 @@
                   (mapv #(if (before (:id %)) % (assoc % :file-id file-id)) lines)
                   lines)
           account-ids (vec (distinct (concat (keep #(when (= file-id (:file-id %)) (:account-id %)) lines)
-                                             (when source-only? (keep #(get amap (:account-id %)) (:statement-lines parsed))))))]
+                                             (when source-only? (keep #(get amap (:account-id %)) (:statement-lines parsed)))
+                                             ;; 受理された行が無くても、拒否されたファイルを元の口座から確認できる。
+                                             (when (and file-id (pos? (or (:rejected parsed) 0)))
+                                               (keep #(get amap (:id %)) (:statement-accounts parsed))))))]
       [(cond-> (assoc db :statement-accounts accounts :statement-lines lines)
          (and file-id (not existing-file)) (update :files (fnil conj [])
                                                     (merge (select-keys file [:name :sha256 :size :imported-at :format])

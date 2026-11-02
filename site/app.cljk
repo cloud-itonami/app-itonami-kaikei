@@ -286,7 +286,8 @@
       (and (= :statement-csv (:format result)) (empty? (:statement-lines result)) (empty? (:statement-accounts result)))))
 
 (defn- file-meta [bytes filename sha256 result]
-  (when (and sha256 (seq (:statement-lines result)))
+  (when (and sha256 (or (seq (:statement-lines result))
+                        (and (seq (:statement-accounts result)) (pos? (or (:rejected result) 0)))))
     {:name filename :sha256 sha256 :size (.-length bytes) :imported-at (now-iso)
      :format (some-> (:format result) name)}))
 
