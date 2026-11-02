@@ -31,6 +31,14 @@ adapter = '''(defn- idb-request
 app, n = re.subn(r'\(defn- idb-request\b.*?(?=\(defn- local-get\b)', lambda _: adapter, app, count=1, flags=re.S)
 if n != 1:
     raise SystemExit('expected storage adapter not found')
+writer = '''(defn- idb-write-with-file [text file-op clear-snapshot]
+  (if file-op (js/Promise.reject (js/Error. "fixture does not support original files"))
+    (idb-request "readwrite" #(if text (.put % text storage-key) (.delete % storage-key)))))
+
+'''
+app, n = re.subn(r'\(defn- idb-write-with-file\b.*?(?=\(rf/reg-fx\s+::store)', lambda _: writer, app, count=1, flags=re.S)
+if n != 1:
+    raise SystemExit('expected atomic writer not found')
 app += '''\n(rf/reg-event-fx :fixture-save (fn [_ [_ tag]] {::store {:saved {:data {:tag tag}} :backend :indexeddb}}))
 (rf/dispatch-sync [:fixture-save "older"])
 (rf/dispatch-sync [:fixture-save "newer"])

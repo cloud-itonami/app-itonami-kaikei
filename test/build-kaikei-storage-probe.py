@@ -57,9 +57,20 @@ def inline(match):
         raise ValueError('script escapes preview')
     body = path.read_text()
     if match.group('path') == 'app.cljs':
+        body = (root / 'site/app.cljk').read_text()
         body, n = re.subn(r'\(defn- idb-request\b.*?(?=\(defn- local-get\b)', replacement, body, count=1, flags=re.S)
         if n != 1:
             raise ValueError('expected kaikei state adapter not found')
+        # The opaque guest uses the fixture port's revision check, not the
+        # production IndexedDB transaction. It does not support file writes.
+        writer = '''(defn- idb-write-with-file [text file-op clear-snapshot]
+  (if file-op (js/Promise.reject (js/Error. "fixture does not support original files"))
+    (.request js/kaikeiFixtureLedger #js {:action "write" :key storage-key :value text})))
+
+'''
+        body, n = re.subn(r'\(defn- idb-write-with-file\b.*?(?=\(rf/reg-fx\s+::store)', lambda _: writer, body, count=1, flags=re.S)
+        if n != 1:
+            raise ValueError('expected atomic writer not found')
         if legacy_probe:
             old = '(defn- local-get [] (try (.getItem js/localStorage storage-key) (catch :default _ nil)))'
             if body.count(old) != 1:

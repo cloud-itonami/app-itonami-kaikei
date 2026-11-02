@@ -78,6 +78,8 @@
 ;; 起動時に IndexedDB が空で読み込んだ旧データだけが移行後の消去対象。
 ;; それ以外の旧データは別タブの編集かもしれないため残す。
 (def ^:private legacy-migration-source (atom nil))
+(def ^:private idb-expected (atom ::unloaded))
+(def ^:private idb-conflict? (atom false))
 
 (rf/reg-fx
  ::load
@@ -89,6 +91,7 @@
        ;; 既存 IndexedDB がある場合は旧領域を読む必要はない。
        (.then (fn [v]
                 (let [legacy (if (some? v) (local-get) (.getItem js/localStorage storage-key))]
+                  (reset! idb-expected (when (some? v) v))
                   (reset! legacy-migration-source (when (nil? v) legacy))
                   (rf/dispatch [::loaded (if (some? v) v legacy) :indexeddb (and (some? v) (some? legacy))]))))
        (.catch (fn [e] (rf/dispatch [::load-failed (and (some? e) (= (.-message e) "storage-upgrade-blocked"))]))))))
@@ -109,6 +112,7 @@
                           state (.objectStore tx idb-store)
                           files (.objectStore tx files-store)
                           changed? (atom false)
+                          conflict? (atom false)
                           cleanup (fn [] (when clear-snapshot (remove-watch rf-db/app-db ::clear-guard)) (.close idb))]
                       (when clear-snapshot
                         (add-watch rf-db/app-db ::clear-guard
@@ -116,16 +120,25 @@
                                      (when (not= clear-snapshot (:data next-db))
                                        (reset! changed? true)
                                        (try (.abort tx) (catch :default _ nil))))))
-                      (set! (.-oncomplete tx) (fn [_] (cleanup) (resolve nil)))
+                      (set! (.-oncomplete tx) (fn [_] (cleanup) (reset! idb-expected text) (resolve nil)))
                       (set! (.-onabort tx) (fn [_] (cleanup)
-                                              (reject (if @changed?
-                                                        (js/Error. "消去中に帳簿が変更されました。消去を中止しました")
-                                                        (or (.-error tx) (js/Error. "IndexedDB transaction aborted"))))))
+                                              (reject (cond @changed? (js/Error. "消去中に帳簿が変更されました。消去を中止しました")
+                                                            @conflict? (js/Error. "別のタブで帳簿が更新されました。控えを保存してから再読み込みしてください")
+                                                            :else (or (.-error tx) (js/Error. "IndexedDB transaction aborted"))))))
                       (try
-                        (if text (.put state text storage-key) (.delete state storage-key))
-                        (cond put (.put files (:bytes put) (:id put))
-                              delete (.delete files delete)
-                              clear? (.clear files))
+                        (let [read (.get state storage-key)]
+                          (set! (.-onsuccess read)
+                                (fn [_]
+                                  (let [current (.-result read)
+                                        current (when (some? current) current)]
+                                    (if (or (= @idb-expected ::unloaded) (not= current @idb-expected))
+                                      (do (reset! conflict? true) (reset! idb-conflict? true) (.abort tx))
+                                      (try
+                                        (if text (.put state text storage-key) (.delete state storage-key))
+                                        (cond put (.put files (:bytes put) (:id put))
+                                              delete (.delete files delete)
+                                              clear? (.clear files))
+                                        (catch :default _ (try (.abort tx) (catch :default _ nil)))))))))
                         (catch :default e (.abort tx) (reject e))))
                     (catch :default e (.close idb) (reject e)))))))))
 
@@ -145,13 +158,11 @@
      (reset! store-tail
              (-> @store-tail
                  (.then (fn [_]
-                          (when @file-write-failed?
+                          (when (or @file-write-failed? @idb-conflict?)
                             (throw (js/Error. "保存を続けられません。表示中の帳簿の控えを保存してから再読み込みしてください")))
                           (if (= backend :local-storage)
                             (if file-op (throw (js/Error. "元ファイルを含む帳簿は IndexedDB に保存する必要があります")) (local!))
-                            (-> (if file-op
-                                  (idb-write-with-file text file-op clear-snapshot)
-                                  (idb-request "readwrite" #(if text (.put % text storage-key) (.delete % storage-key))))
+                            (-> (idb-write-with-file text file-op clear-snapshot)
                                 (.then (fn [_]
                                          (when (some? @legacy-migration-source)
                                            (try
