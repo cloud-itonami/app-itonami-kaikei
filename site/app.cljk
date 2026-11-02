@@ -62,7 +62,9 @@
                    (let [tx (.transaction idb store mode)
                          req (f (.objectStore tx store))]
                      (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve (.-result req))))
-                     (set! (.-onerror tx) (fn [_] (.close idb) (reject (.-error tx))))))))))))
+                     (set! (.-onerror tx) (fn [_] (.close idb) (reject (.-error tx))))
+                     ;; 明示的な abort は error event を伴わない場合がある。
+                     (set! (.-onabort tx) (fn [_] (.close idb) (reject (or (.-error tx) (js/Error. "IndexedDB transaction aborted")))))))))))))
 
 (defn- local-get [] (try (.getItem js/localStorage storage-key) (catch :default _ nil)))
 
