@@ -9,7 +9,7 @@ const frame = document.createElement('iframe');
 frame.title = 'isolated synthetic guest';
 frame.sandbox = 'allow-scripts';
 frame.srcdoc = `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'">
-<h2>合成データ guest</h2><button id="save">合成データ保存</button><button id="read">合成データ復元</button><button id="probe">隔離を確認</button><button id="navigate">guest を移動</button><p id="status">接続待ち</p>
+<h2>合成データ guest</h2><button id="save">合成データ保存</button><button id="read">合成データ復元</button><button id="probe">隔離を確認</button><button id="interrupt">保存中に切断</button><button id="navigate">guest を移動</button><p id="status">接続待ち</p>
 <script>
 let port; let id = 0; const pending = new Map(); const status = document.getElementById('status');
 function request(action, expectedRevision, value) { return new Promise((resolve,reject) => {
@@ -24,10 +24,31 @@ addEventListener('message', event => {
 document.getElementById('save').onclick=async()=>{try{const before=await request('read',null,null); const result=await request('write',before.revision,'synthetic:guest'); if(!result.ok)throw Error('conflict'); status.textContent='PASS: 合成データ保存 '+result.revision;}catch(e){status.textContent='FAIL: '+e.message}};
 document.getElementById('read').onclick=async()=>{try{const result=await request('read',null,null); if(result.value!=='synthetic:guest')throw Error('not found'); status.textContent='PASS: 合成データ復元 '+result.revision;}catch(e){status.textContent='FAIL: '+e.message}};
 document.getElementById('probe').onclick=async()=>{let dom=false,storage=false,network=false;try{parent.document.body}catch{dom=true}try{localStorage.getItem('synthetic')}catch{storage=true}try{await fetch('https://fixture.invalid/')}catch{network=true}status.textContent=dom&&storage&&network?'PASS: 親 DOM・直接保存・直接通信を拒否':'FAIL: 隔離検査'};
+document.getElementById('interrupt').onclick=async()=>{const before=await request('read',null,null);request('write',before.revision,'synthetic:interrupt')};
 document.getElementById('navigate').onclick=()=>{location.href='about:blank'};
 <\/script>`;
 const channel = new MessageChannel();
-const bridge = bindFixturePort(channel.port1, {read: readFixture, write: compareAndSwapFixture});
+async function fixtureWrite(revision, value, signal) {
+  if (value !== 'synthetic:interrupt') return compareAndSwapFixture(revision, value, signal);
+  const before = await readFixture();
+  const originalPut = IDBObjectStore.prototype.put;
+  let didPut = false, aborted = false;
+  try {
+    IDBObjectStore.prototype.put = function(...args) {
+      const request = originalPut.apply(this, args);
+      didPut = true;
+      bridge.close();
+      return request;
+    };
+    try { await compareAndSwapFixture(revision, value, signal); }
+    catch (error) { aborted = error.name === 'AbortError'; }
+  } finally { IDBObjectStore.prototype.put = originalPut; }
+  const after = await readFixture();
+  const pass = didPut && aborted && after.revision === before.revision && after.value === before.value;
+  document.getElementById('host-status').textContent = pass
+    ? 'PASS: port 切断で進行中の合成書込を取消' : 'FAIL: 合成書込の取消';
+}
+const bridge = bindFixturePort(channel.port1, {read: readFixture, write: fixtureWrite});
 let loaded = false;
 frame.addEventListener('load', () => {
   if (loaded) { bridge.close(); document.getElementById('host-status').textContent = 'host 切断（フレーム移動）'; return; }

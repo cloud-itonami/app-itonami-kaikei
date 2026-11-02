@@ -27,6 +27,13 @@ out-of-order IDs, transferred ports, overly large strings and a flood of
 pending requests. `node --test test/local-ledger-port-fixture.test.mjs` covers
 these refusals. The fixture closes its port after a subsequent iframe load;
 an `about:blank` navigation showed the disconnected state in the browser.
+Closing the fixture port now signals cancellation to the IndexedDB adapter.
+In the in-app browser, a test hook closed the port immediately after a
+synthetic `put` was queued; the transaction aborted and the prior value and
+revision remained. A separate active-transaction abort test checked the same
+property without a port. The hook deliberately forces one timing and does not
+prove behavior for every race or crash. The corresponding Node port test
+fails against the previous version as a negative control.
 The local server supplied only static test files; no real provider or
 account was contacted. Browser-local synthetic test data may remain in the test
 database on the loopback origin.
@@ -37,8 +44,10 @@ Important limits before any production use:
   broker's verified-artifact mount, descriptor admission, or trusted consent.
   Its one-shot MessageChannel transfer is not a reviewed navigation-safe or
   multi-session protocol. The navigation check observes `load`, not the start
-  of navigation, and an already-running storage transaction may still commit
-  after the port closes. A sibling document on the same origin can access the
+  of navigation. Cancellation aborts an active IndexedDB transaction, but a
+  transaction already committed before cancellation cannot be undone, and a
+  crash or untested timing may leave the outcome ambiguous. A sibling document
+  on the same origin can access the
   fixture database. Do not treat the demonstration as a security boundary.
 - It does not store original files, bind storage to an authenticated owner,
   migrate old state, handle rollback, deletion, schema changes, corruption

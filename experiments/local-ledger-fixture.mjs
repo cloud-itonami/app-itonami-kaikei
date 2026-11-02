@@ -5,13 +5,27 @@ const STORE = 'ledger';
 const KEY = 'synthetic';
 const MAX_BYTES = 65536;
 
-function openDatabase() {
+const aborted = () => new DOMException('fixture-operation-aborted', 'AbortError');
+
+function openDatabase(signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(aborted()); return; }
+    let settled = false;
     const request = indexedDB.open(DATABASE, 1);
-    request.onupgradeneeded = () => request.result.createObjectStore(STORE);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(new Error('storage-open-failed'));
-    request.onblocked = () => reject(new Error('storage-open-blocked'));
+    const cleanup = () => signal?.removeEventListener('abort', onAbort);
+    const fail = error => { if (!settled) { settled = true; cleanup(); reject(error); } };
+    const onAbort = () => fail(aborted());
+    signal?.addEventListener('abort', onAbort, {once:true});
+    request.onupgradeneeded = () => {
+      if (settled || signal?.aborted) request.transaction.abort();
+      else request.result.createObjectStore(STORE);
+    };
+    request.onsuccess = () => {
+      if (settled) { request.result.close(); return; }
+      settled = true; cleanup(); resolve(request.result);
+    };
+    request.onerror = () => fail(new Error('storage-open-failed'));
+    request.onblocked = () => fail(new Error('storage-open-blocked'));
   });
 }
 
@@ -22,10 +36,14 @@ function validRecord(record) {
 }
 
 // All callers use the same fixed test key. No caller-supplied DB/store/key.
-export async function readFixture() {
-  const db = await openDatabase();
+export async function readFixture(signal) {
+  const db = await openDatabase(signal);
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { db.close(); reject(aborted()); return; }
     const tx = db.transaction(STORE, 'readonly');
+    const onAbort = () => { try { tx.abort(); } catch {} };
+    signal?.addEventListener('abort', onAbort, {once:true});
+    const finish = () => { signal?.removeEventListener('abort', onAbort); db.close(); };
     const request = tx.objectStore(STORE).get(KEY);
     let result;
     request.onsuccess = () => {
@@ -34,22 +52,26 @@ export async function readFixture() {
       else if (validRecord(record)) result = {revision: record.revision, value: record.value};
       else { tx.abort(); }
     };
-    tx.oncomplete = () => { db.close(); resolve(result); };
-    tx.onabort = tx.onerror = () => { db.close(); reject(new Error('storage-read-failed')); };
+    tx.oncomplete = () => { finish(); resolve(result); };
+    tx.onabort = () => { finish(); reject(signal?.aborted ? aborted() : new Error('storage-read-failed')); };
   });
 }
 
 // IndexedDB serializes readwrite transactions for this store. Compare and write
 // occur in the same transaction; success is returned only after commit.
-export async function compareAndSwapFixture(expectedRevision, value) {
+export async function compareAndSwapFixture(expectedRevision, value, signal) {
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0
       || expectedRevision >= Number.MAX_SAFE_INTEGER || typeof value !== 'string'
       || new TextEncoder().encode(value).byteLength > MAX_BYTES) {
     throw new TypeError('invalid-fixture-write');
   }
-  const db = await openDatabase();
+  const db = await openDatabase(signal);
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { db.close(); reject(aborted()); return; }
     const tx = db.transaction(STORE, 'readwrite');
+    const onAbort = () => { try { tx.abort(); } catch {} };
+    signal?.addEventListener('abort', onAbort, {once:true});
+    const finish = () => { signal?.removeEventListener('abort', onAbort); db.close(); };
     const store = tx.objectStore(STORE);
     const request = store.get(KEY);
     let result;
@@ -62,7 +84,7 @@ export async function compareAndSwapFixture(expectedRevision, value) {
       store.put({revision: next, value}, KEY);
       result = {ok: true, revision: next};
     };
-    tx.oncomplete = () => { db.close(); resolve(result); };
-    tx.onabort = tx.onerror = () => { db.close(); reject(new Error('storage-write-failed')); };
+    tx.oncomplete = () => { finish(); resolve(result); };
+    tx.onabort = () => { finish(); reject(signal?.aborted ? aborted() : new Error('storage-write-failed')); };
   });
 }

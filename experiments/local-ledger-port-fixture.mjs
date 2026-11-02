@@ -19,9 +19,11 @@ export function bindFixturePort(port, store) {
   if (!port || typeof port.postMessage !== 'function' || typeof port.addEventListener !== 'function'
       || typeof store?.read !== 'function' || typeof store?.write !== 'function') throw new TypeError('invalid-fixture-port');
   let closed = false, pending = 0, lastId = 0, tail = Promise.resolve();
+  const lifetime = new AbortController();
   function close() {
     if (closed) return;
     closed = true;
+    lifetime.abort();
     port.removeEventListener('message', onMessage);
     port.close();
   }
@@ -36,7 +38,9 @@ export function bindFixturePort(port, store) {
     tail = tail.then(async () => {
       if (closed) return;
       try {
-        const result = data.action === 'read' ? await store.read() : await store.write(data.expectedRevision, data.value);
+        const result = data.action === 'read'
+          ? await store.read(lifetime.signal)
+          : await store.write(data.expectedRevision, data.value, lifetime.signal);
         if (!closed) port.postMessage({protocol: PROTOCOL, id: data.id, ok: true, result});
       } catch {
         if (!closed) port.postMessage({protocol: PROTOCOL, id: data.id, ok: false, error: 'fixture-storage-failed'});

@@ -68,3 +68,22 @@ test('flood closes the port and queued calls do not start', async () => {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(calls, 1);
 });
+
+test('closing the port aborts the in-flight operation and suppresses queued work', async () => {
+  let started, calls = 0, wasAborted = false;
+  const startedPromise = new Promise(resolve => {started = resolve;});
+  const {guest, bridge} = pair({
+    read: signal => new Promise((resolve, reject) => {
+      calls++; started();
+      signal.addEventListener('abort', () => {wasAborted = true; reject(new Error('aborted'));}, {once:true});
+    }),
+    write: async () => {calls++;},
+  });
+  guest.postMessage(read(1)); guest.postMessage(write(2));
+  await startedPromise;
+  bridge.close();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(wasAborted, true);
+  assert.equal(calls, 1);
+  guest.close();
+});
