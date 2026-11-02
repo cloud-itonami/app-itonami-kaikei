@@ -74,6 +74,10 @@
 
 (defn- local-get [] (try (.getItem js/localStorage storage-key) (catch :default _ nil)))
 
+;; 起動時に IndexedDB が空で読み込んだ旧データだけが移行後の消去対象。
+;; それ以外の旧データは別タブの編集かもしれないため残す。
+(def ^:private legacy-migration-source (atom nil))
+
 (rf/reg-fx
  ::load
  (fn [_]
@@ -82,7 +86,10 @@
    (-> (idb-request "readonly" #(.get % storage-key))
        ;; 旧保存領域が読めない場合は「旧データなし」と判断しない。
        ;; 既存 IndexedDB がある場合は旧領域を読む必要はない。
-       (.then (fn [v] (rf/dispatch [::loaded (if (some? v) v (.getItem js/localStorage storage-key)) :indexeddb])))
+       (.then (fn [v]
+                (let [legacy (if (some? v) (local-get) (.getItem js/localStorage storage-key))]
+                  (reset! legacy-migration-source (when (nil? v) legacy))
+                  (rf/dispatch [::loaded (if (some? v) v legacy) :indexeddb (and (some? v) (some? legacy))]))))
        (.catch (fn [e] (rf/dispatch [::load-failed (and (some? e) (= (.-message e) "storage-upgrade-blocked"))]))))))
 
 (def ^:private store-tail (atom (js/Promise.resolve nil)))
@@ -107,7 +114,12 @@
                             (local!)
                             (-> (idb-request "readwrite" #(if text (.put % text storage-key) (.delete % storage-key)))
                                 (.then (fn [_]
-                                         (try (.removeItem js/localStorage storage-key) (catch :default _ nil))
+                                         (when (some? @legacy-migration-source)
+                                           (try
+                                             (when (= @legacy-migration-source (.getItem js/localStorage storage-key))
+                                               (.removeItem js/localStorage storage-key))
+                                             (catch :default _ nil))
+                                           (reset! legacy-migration-source nil))
                                          (rf/dispatch [::stored-ok])))))))
                  ;; 失敗後も次の snapshot を処理できるよう、拒否をここで解消する。
                  (.catch (fn [e] (rf/dispatch [::store-failed (or (.-message e) "IndexedDB への保存に失敗しました")]))))))))
@@ -226,14 +238,14 @@
 
 (rf/reg-event-db
  ::loaded
- (fn [db [_ text backend]]
+ (fn [db [_ text backend legacy-extra?]]
    (try
      (let [stored (when (some? text) (edn/read-string text))]
        (when (and (some? text) (not (and (map? stored) (map? (:data stored)))))
          (throw (js/Error. "保存データの形式が正しくありません")))
        {:data (if stored (merge core/empty-db (:data stored)) core/empty-db)
         :backend backend
-        :ui (merge (:ui db) {:booting? false} (select-keys (:settings stored) [:fy-start :pl-style]))})
+        :ui (merge (:ui db) {:booting? false :legacy-extra? legacy-extra?} (select-keys (:settings stored) [:fy-start :pl-style]))})
      (catch :default _
        (assoc-in db [:ui :load-error] "保存済みの帳簿を読み取れませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、復旧方法を確認してください。")))))
 
@@ -426,7 +438,9 @@
 (rf/reg-event-fx
  :clear-all
  (fn [{:keys [db]} _]
-   (with-store db (assoc db :data core/empty-db :ui view/initial-ui) {::clear-files true})))
+   (with-store db (assoc db :data core/empty-db
+                           :ui (assoc view/initial-ui :legacy-extra? (get-in db [:ui :legacy-extra?])))
+               {::clear-files true})))
 
 (rf/reg-event-fx
  :export
@@ -695,6 +709,10 @@
           [:button {:type "button" :on-click (fn [_] (rf/dispatch [:export-legacy-json]))} "旧帳簿を取り込み用 JSON として保存"]])
        (when-let [err (:legacy-backup-error ui)] [:p {:class "kk-warnings" :role "alert"} err])]
       [:<>
+     (when (:legacy-extra? ui)
+       [:div {:class "kk-warnings kk-app" :role "alert"}
+        [:p "別の旧保存データがこの端末に残っています。現在の帳簿とは異なる可能性があります。消去せず、控えを保存して内容を確認してください。"]
+        [:button {:type "button" :on-click (fn [_] (rf/dispatch [:export-legacy-backup]))} "旧保存データを控えとして保存（EDN）"]])
      (when-let [e (:store-error ui)]
        [:p {:class "kk-warnings kk-app" :role "alert"}
         (str "この端末に保存できませんでした（" e "）。書き出して手元に残してください。")])
