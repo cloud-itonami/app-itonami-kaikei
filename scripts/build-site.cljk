@@ -10,6 +10,8 @@
 (ns build-site
   (:require ["fs" :as fs]
             ["path" :as path]
+            ["child_process" :as cp]
+            ["crypto" :as crypto]
             [clojure.edn :as edn]
             [kotoba.lang.text :as text]
             [kaikei.page]))
@@ -35,6 +37,26 @@
     (copy! (str kotoba-lang "/" lib "/" from) (str out-dir "/" to))))
 (doseq [{:keys [from to]} (:sources site)]
   (copy! from (str out-dir "/" to)))
+
+;; Stage the pinned canonical broker only as an inert preview artifact. The
+;; publication generator and trusted host do not yet consume this candidate.
+(let [{:keys [repo sha from sha256]} (:client-runtime-candidate site)]
+  (when-not (and (= repo "kotoba-lang/wasm-webcomponent")
+                 (= from "src/kotoba-client-runtime.js")
+                 (re-matches #"[0-9a-f]{40}" (str sha))
+                 (re-matches #"[0-9a-f]{64}" (str sha256)))
+    (throw (js/Error. "invalid canonical client runtime pin")))
+  (let [source (cp/spawnSync "git" #js ["-C" (str kotoba-lang "/wasm-webcomponent")
+                                          "show" (str sha ":" from)]
+                             #js {:maxBuffer (* 4 1024 1024)})]
+    (when-not (zero? (.-status source))
+      (throw (js/Error. "pinned canonical client runtime is unavailable")))
+    (let [bytes (.-stdout source)
+          digest (-> (crypto/createHash "sha256") (.update bytes) (.digest "hex"))]
+      (when-not (= digest sha256)
+        (throw (js/Error. "canonical client runtime digest mismatch")))
+      (fs/mkdirSync (str out-dir "/runtime") #js {:recursive true})
+      (fs/writeFileSync (str out-dir "/runtime/kotoba-client-runtime.js") bytes))))
 
 (def dds-css
   (fs/readFileSync (or (aget js/process.env "DDS_CSS")
