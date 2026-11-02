@@ -187,6 +187,15 @@
 ;; ───────── 汎用の CSV（判断 3） ─────────
 
 (deftest mapped-csv-presets
+  (testing "PayPay の公開項目から作った合成 CSV（実ファイルの見出しは未確認）"
+    (let [csv "取引日,出金金額（円）,入金金額（円）,取引内容,取引先,取引番号\n2026/11/01 12:30,1200,,支払い,店舗,synthetic-1\n2026/11/02 09:00,,1200,返金,店舗,synthetic-2\n"
+          p (ingest/ingest-text csv {})
+          result (core/merge-import core/empty-db p :append)
+          again (core/merge-import (:db result) p :append)]
+      (is (= [["2026-11-01" -1200 "支払い 店舗"] ["2026-11-02" 1200 "返金 店舗"]] (rows p)))
+      (is (= ["synthetic-1" "synthetic-2"] (mapv :reference (:statement-lines p))))
+      (is (= 2 (count (get-in again [:db :statement-lines]))))
+      (is (some #(re-find #"一次資料で確かめていません" %) (:warnings p)))))
   (testing "確かめた型（三菱UFJ BizSTATION）: 見出しで選び、和暦・入払区分で読む。警告なし"
     (let [p (ingest/ingest-bytes (fixture-bytes "mufg-biz-nyuushukkin.csv") {})]
       (is (= :statement-csv (:format p)))

@@ -299,6 +299,11 @@
     :signature ["操作日(年)" "操作日(月)" "操作日(日)" "摘要" "お支払金額" "お預り金額" "残高"]
     :mapping {:date-parts ["操作日(年)" "操作日(月)" "操作日(日)"] :out "お支払金額" :in "お預り金額"
               :balance "残高" :reference "取引順番号" :description ["摘要"] :kind :bank}}
+   {:id "paypay-wallet" :verified? false :label "PayPay 取引履歴 CSV（個人・見出し未確認）"
+    :source "PayPay ヘルプ c0447 の項目一覧（実際の CSV の見出しは未確認）"
+    :signature ["取引日" "出金金額（円）" "入金金額（円）" "取引内容" "取引先" "取引番号"]
+    :mapping {:date "取引日" :out "出金金額（円）" :in "入金金額（円）"
+              :reference "取引番号" :description ["取引内容" "取引先"] :counterparty "取引先" :kind :bank}}
    {:id "yucho-biz" :verified? false :label "ゆうちょBizダイレクト 入出金明細 CSV"
     :source "ゆうちょ銀行 bizdirect_18.pdf §18.4（列の名前だけ。文字コードと日付の形は未確認）"
     :signature ["取引日" "入出金区分" "取引内容" "取引金額"]
