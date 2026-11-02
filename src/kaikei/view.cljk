@@ -184,7 +184,8 @@
    [:journal "仕訳帳"] [:accounts "勘定科目"] [:invoices "請求書"] [:statements "明細"]])
 
 (defn- empty-book? [data]
-  (and (empty? (:entries data)) (empty? (:invoices data)) (empty? (:statement-lines data))))
+  (and (empty? (:entries data)) (empty? (:invoices data)) (empty? (:statement-lines data))
+       (empty? (:statement-accounts data)) (empty? (:files data))))
 
 (defn toolbar [{:keys [data ui]} h]
   (let [empty? (empty-book? data)]
