@@ -117,6 +117,19 @@ audit log; this does not test redirect, provider OAuth, production descriptor
 admission or all network paths. Running this optional fixture and approving
 the dialog makes an actual request to GitHub.
 
+`test/build-guest-egress-fixture.py RUNTIME EMPTY_OUTPUT_DIR` builds a separate
+fixed loopback probe for the same monorepo runtime digest. Serve it at 18782
+with a receiver at 18783. In one in-app browser run, the receiver saw no
+requests from guest fetch, sendBeacon, image, WebSocket, or a blob Worker's
+fetch. For a negative control, `--negative-control` creates a deliberately
+weakened CSP runtime in the output directory; with that version the receiver
+saw all five requests. Never use the negative-control runtime outside this
+loopback test. Client-visible `blocked` errors and `sendBeacon` returning true
+did not distinguish these cases: the receiver logs were essential because
+CORS and HTTP errors occur after transmission. This comparison covers only
+these fixed probes, one browser and loopback destinations; it does not prove
+complete egress isolation or qualify a production host.
+
 Important limits before any production use:
 
 - The fixture's parent creates a raw iframe; it does not use the canonical
