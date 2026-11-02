@@ -373,6 +373,29 @@
         (is (= 1 (:lines-duplicates r)))
         (is (= 1 (count (:warnings r))))))))
 
+(deftest conflicting-replacement-must-not-delete-original
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        original {:account-id "a1" :uid "old" :date "2026-01-01" :amount -100 :description "original"}
+        replacement {:account-id "a1" :uid "new" :date "2026-01-02" :amount -200 :description "existing replacement"}
+        base {:currency "JPY" :statement-accounts [account]}
+        db (:db (core/merge-import core/empty-db (assoc base :statement-lines [original replacement])))
+        changed (assoc replacement :amount -250 :correct {:uid "old" :action :replace})
+        result (core/merge-import db (assoc base :statement-lines [changed]))]
+    (is (= (:statement-lines db) (:statement-lines (:db result))))
+    (is (= 0 (:lines-corrected result)))
+    (is (seq (:warnings result)))
+    (testing "同じ入力内で置換先の ID が衝突しても元の行を残す"
+      (let [db0 (:db (core/merge-import core/empty-db (assoc base :statement-lines [original])))
+            r (core/merge-import db0 (assoc base :statement-lines [(assoc replacement :correct {:uid "old" :action :replace}) changed]))]
+        (is (= #{"old" "new"} (set (map :uid (get-in r [:db :statement-lines])))))
+        (is (= 0 (:lines-corrected r)))
+        (is (seq (:warnings r)))))
+    (testing "衝突しない置換はこれまでどおり"
+      (let [db0 (:db (core/merge-import core/empty-db (assoc base :statement-lines [original])))
+            r (core/merge-import db0 (assoc base :statement-lines [(assoc replacement :correct {:uid "old" :action :replace})]))]
+        (is (= ["new"] (map :uid (get-in r [:db :statement-lines]))))
+        (is (= 1 (:lines-corrected r)))))))
+
 (deftest ledger-json-round-trip
   (let [{db :db} (st/post-preselected sample-db ["l1" "l2" "l3"])
         db (:db (st/post-line db "l4" {:type :exclude}))

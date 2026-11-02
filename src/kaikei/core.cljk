@@ -825,8 +825,8 @@
         id-counter (atom (reduce max 0 (map #(prefixed-number "l" (:id %)) (concat lines (:statement-lines parsed)))))
         seq-counter (atom (reduce max 0 (map #(:seq % 0) lines)))
         line-taken (atom (set (map :id lines)))
-        [lines lmap added dup _ _ uid-warnings]
-        (reduce (fn [[ls m added dup seen-uids seen warnings] l]
+        [lines lmap added dup _ _ uid-warnings conflicted-uids]
+        (reduce (fn [[ls m added dup seen-uids seen warnings conflicts] l]
                   (let [uid-key (when (:uid l) [(:account-id l) (:uid l)])
                         prior (when uid-key (get seen-uids uid-key))
                         ck (line-content-key l)
@@ -836,7 +836,8 @@
                        (cond-> warnings
                          (and prior (not= (line-content-key prior) ck))
                          (conj (str "同じ明細 ID の内容が変わっています。既存の行を保持しました（口座 "
-                                    (:account-id l) "、行 " (:id prior) "）。元の明細と照合してください")))]
+                                    (:account-id l) "、行 " (:id prior) "）。元の明細と照合してください")))
+                       (cond-> conflicts (and prior (not= (line-content-key prior) ck)) (conj uid-key))]
                       (let [own (:id l)
                             id (if (and own (re-matches #"l\d+" (str own)) (not (@line-taken own)))
                                  own
@@ -846,17 +847,19 @@
                          (cond-> m (:id l) (assoc (:id l) id))
                          (inc added) dup
                          (cond-> seen-uids uid-key (assoc uid-key (assoc l :id id)))
-                         (if uid-key seen (assoc seen ck (inc n))) warnings]))))
-                [lines {} 0 0 uids {} []]
+                         (if uid-key seen (assoc seen ck (inc n))) warnings conflicts]))))
+                [lines {} 0 0 uids {} [] #{}]
                 incoming)
         ;; 訂正（同じファイルの中の行にも当てる）。訂正される行を消す。計上・照合した行は
         ;; 消さずに警告する。REPLACE の新しい行はもう足してある
         corrections (for [l (:statement-lines parsed) :when (:correct l)]
                       [(get amap (:account-id l)) (:correct l) (:uid l)])
         [lines corrected warnings]
-        (reduce (fn [[ls n ws] [acc {:keys [uid]} own-uid]]
+        (reduce (fn [[ls n ws] [acc {:keys [uid action]} own-uid]]
                   (let [victim (first (filter #(and (= acc (:account-id %)) (= uid (:uid %)) (not= own-uid (:uid %))) ls))]
                     (cond
+                      (and (= action :replace) (conflicted-uids [acc own-uid]))
+                      [ls n (conj ws "置換先の明細 ID が競合しているため、訂正前の行を保持しました")]
                       (nil? victim) [ls n ws]
                       (status-of victim) [ls n (conj ws (str "訂正された明細の行 " (:date victim) " " (:description victim "")
                                                             " は計上・照合済みなので消していません"))]
