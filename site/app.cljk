@@ -17,6 +17,7 @@
   (:require [clojure.edn :as edn]
             [reagent.dom :as rdom]
             [re-frame.core :as rf]
+            [re-frame.db :as rf-db]
             [kotoba.lang.text :as text]
             [kaikei.core :as core]
             [kaikei.ingest :as ingest]
@@ -96,17 +97,30 @@
 ;; 元ファイルを含む保存が失敗した後は、欠けたデータを後続の帳簿だけの保存で確定しない。
 (def ^:private file-write-failed? (atom false))
 
-(defn- idb-write-with-file [text {:keys [put delete clear?]}]
+(defn- idb-write-with-file [text {:keys [put delete clear?]} clear-snapshot]
   (-> (idb-open)
       (.then (fn [idb]
                (js/Promise.
                 (fn [resolve reject]
                   (try
+                    (when (and clear-snapshot (not= clear-snapshot (:data @rf-db/app-db)))
+                      (throw (js/Error. "消去中に帳簿が変更されました。消去を中止しました")))
                     (let [tx (.transaction idb #js [idb-store files-store] "readwrite")
                           state (.objectStore tx idb-store)
-                          files (.objectStore tx files-store)]
-                      (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve nil)))
-                      (set! (.-onabort tx) (fn [_] (.close idb) (reject (or (.-error tx) (js/Error. "IndexedDB transaction aborted")))))
+                          files (.objectStore tx files-store)
+                          changed? (atom false)
+                          cleanup (fn [] (when clear-snapshot (remove-watch rf-db/app-db ::clear-guard)) (.close idb))]
+                      (when clear-snapshot
+                        (add-watch rf-db/app-db ::clear-guard
+                                   (fn [_ _ _ next-db]
+                                     (when (not= clear-snapshot (:data next-db))
+                                       (reset! changed? true)
+                                       (try (.abort tx) (catch :default _ nil))))))
+                      (set! (.-oncomplete tx) (fn [_] (cleanup) (resolve nil)))
+                      (set! (.-onabort tx) (fn [_] (cleanup)
+                                              (reject (if @changed?
+                                                        (js/Error. "消去中に帳簿が変更されました。消去を中止しました")
+                                                        (or (.-error tx) (js/Error. "IndexedDB transaction aborted"))))))
                       (try
                         (if text (.put state text storage-key) (.delete state storage-key))
                         (cond put (.put files (:bytes put) (:id put))
@@ -136,7 +150,7 @@
                           (if (= backend :local-storage)
                             (if file-op (throw (js/Error. "元ファイルを含む帳簿は IndexedDB に保存する必要があります")) (local!))
                             (-> (if file-op
-                                  (idb-write-with-file text file-op)
+                                  (idb-write-with-file text file-op clear-snapshot)
                                   (idb-request "readwrite" #(if text (.put % text storage-key) (.delete % storage-key))))
                                 (.then (fn [_]
                                          (when (some? @legacy-migration-source)
