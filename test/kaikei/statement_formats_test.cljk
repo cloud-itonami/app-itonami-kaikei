@@ -274,12 +274,24 @@
         merged (core/merge-import core/empty-db p :append)
         repeated (core/merge-import (:db merged) p :append)]
     (is (= :paypay-merchant-csv (:format p)))
-    (is (= [["2020-01-30" 150 "取引完了 A1"] ["2020-01-31" -100 "返金完了 R1"]] (rows p)))
-    (is (= 2 (:rejected p)))
-    (is (= 2 (count (get-in repeated [:db :statement-lines]))))
-    (is (= 2 (count (distinct (map :uid (:statement-lines p))))))
+    (is (= [["2020-01-30" 150 "取引完了 A1"]] (rows p)))
+    (is (= 3 (:rejected p)))
+    (is (= 1 (count (get-in repeated [:db :statement-lines]))))
+    (is (= 1 (count (distinct (map :uid (:statement-lines p))))))
     (is (= (pr-str ["P1" "取引完了" "A1"]) (:uid (first (:statement-lines p)))))
     (is (some #(re-find #"個人の PayPay 支出" %) (:warnings p)))))
+
+(deftest paypay-instant-refunds-with-ambiguous-identity-are-held
+  (let [header "決済番号,加盟店ID,屋号,店舗ID,店舗名,端末番号/PosID,取引ステータス,取引日時,取引金額,レシート番号,支払い方法,マーチャント決済ID,支払い詳細\n"
+        row "P,M,店,S,店,1,返金完了,2020-01-30 12:00:00,-100,,残高,R,\n"
+        p (ingest/ingest-text (str header row row) {})
+        first-db (:db (core/merge-import core/empty-db p :append))
+        repeated (core/merge-import first-db p :append)]
+    (is (= 2 (:rejected p)))
+    (is (empty? (:statement-lines p)))
+    (is (= 2 (count (filter #(re-find #"識別子の一意性が未確認" %) (:warnings p)))))
+    (is (empty? (get-in repeated [:db :statement-lines])))
+    (is (= 1 (count (get-in repeated [:db :statement-accounts]))))))
 
 (deftest paypay-merchant-separates-merchants-and-refuses-unknowns
   (let [header "決済番号,加盟店ID,屋号,店舗ID,店舗名,端末番号/PosID,取引ステータス,取引日時,取引金額,レシート番号,支払い方法,マーチャント決済ID,支払い詳細\n"
