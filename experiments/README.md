@@ -64,6 +64,12 @@ revision remained. A separate active-transaction abort test checked the same
 property without a port. The hook deliberately forces one timing and does not
 prove behavior for every race or crash. The corresponding Node port test
 fails against the previous version as a negative control.
+`test/sibling-port-fixture.html` separately sends a fake port from one sandboxed
+sibling to another. In one in-app browser, the target rejected it based on
+`event.source` and accepted the host's port; `?unsafe=1` disables that check as
+a test-only negative control, where the fake port received the read request.
+This tests a small synthetic guest, not the generated kaikei guest, publisher
+authentication, navigation races, cross-origin delivery or egress.
 The local server supplied only static test files; no real provider or
 account was contacted. Browser-local synthetic test data may remain in the test
 database on the loopback origin.
