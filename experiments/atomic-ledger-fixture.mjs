@@ -14,9 +14,13 @@ function open() {
 }
 
 // Fixed single synthetic file per run. The key is created internally, never guest supplied.
-function write(db, key, expected, ledger, file, abortAfterRequests = false) {
+function write(db, key, expected, ledger, file, abortAfterRequests = false, signal, afterQueue) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(Error('synthetic abort')); return; }
     const tx = db.transaction(STORES, 'readwrite');
+    const onAbort = () => { try { tx.abort(); } catch {} };
+    signal?.addEventListener('abort', onAbort, {once:true});
+    const finish = () => signal?.removeEventListener('abort', onAbort);
     const ledgers = tx.objectStore('ledgers');
     const files = tx.objectStore('files');
     let conflict = false;
@@ -30,9 +34,10 @@ function write(db, key, expected, ledger, file, abortAfterRequests = false) {
       ledgers.put({revision: revision + 1, value: ledger}, key);
       if (file === null) files.delete(key); else files.put(file, key);
       if (abortAfterRequests) tx.abort();
+      else if (afterQueue) afterQueue();
     };
-    tx.oncomplete = () => resolve('committed');
-    tx.onabort = () => conflict ? resolve('conflict') : reject(tx.error || Error('synthetic abort'));
+    tx.oncomplete = () => { finish(); resolve('committed'); };
+    tx.onabort = () => { finish(); conflict ? resolve('conflict') : reject(tx.error || Error('synthetic abort')); };
   });
 }
 
@@ -74,3 +79,6 @@ export async function runAtomicFixture() {
     return 'PASS: competing writes, rollback of both stores, and atomic file deletion';
   } finally { db.close(); }
 }
+
+// Fixture-only primitives for the guest-lifetime experiment.
+export {open as openAtomicFixture, write as writeAtomicFixture, read as readAtomicFixture};
