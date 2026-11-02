@@ -785,8 +785,8 @@
   line-content-key と、同じ内容の何番目かで判定する（同じファイルを 2 回取り込んでも
   増えない。同じ日に同じ額・同じ摘要の行が 2 つあっても両方残る）。
 
-  訂正: OFX の CORRECTFITID（:correct {:uid :action}）は、訂正される行を消す
-  （計上・照合した行は消さずに警告する）。:replace なら新しい行を足す。"
+  訂正: OFX の CORRECTFITID（:correct {:uid :action}）は、訂正される行を消す。
+  計上・照合した行は消さず、置換後の行も足さずに警告する。"
   [db parsed {:keys [statement-account file]}]
   (let [existing (vec (:statement-accounts db))
         target (first (filter #(= statement-account (:id %)) existing))
@@ -817,8 +817,19 @@
                                           id (remove nil? (cons (get-in e [:origin :line-id]) (get-in e [:origin :line-ids])))]
                                       id))]
                     (fn [l] (or (posted (:id l)) (get-in l [:match :entry-id]))))
+        protected-replacement? (fn [l]
+                                 (and (= :replace (get-in l [:correct :action]))
+                                      (some #(and (= (get amap (:account-id l)) (:account-id %))
+                                                  (= (get-in l [:correct :uid]) (:uid %))
+                                                  (not= (:uid l) (:uid %))
+                                                  (status-of %)) lines)))
+        protected-uids (set (for [l (:statement-lines parsed)
+                                  :when (and (:uid l) (protected-replacement? l))]
+                              [(get amap (:account-id l)) (:uid l)]))
         incoming (for [l (:statement-lines parsed)
-                       :when (not= :delete (get-in l [:correct :action]))]
+                       :when (and (not= :delete (get-in l [:correct :action]))
+                                  (not (protected-replacement? l))
+                                  (not (and (:uid l) (protected-uids [(get amap (:account-id l)) (:uid l)]))))]
                    (assoc (dissoc l :correct) :account-id (get amap (:account-id l))))
         uids (into {} (for [l lines :when (:uid l)] [[(:account-id l) (:uid l)] l]))
         existing-counts (frequencies (map line-content-key (remove :uid lines)))
@@ -851,7 +862,7 @@
                 [lines {} 0 0 uids {} [] #{}]
                 incoming)
         ;; 訂正（同じファイルの中の行にも当てる）。訂正される行を消す。計上・照合した行は
-        ;; 消さずに警告する。REPLACE の新しい行はもう足してある
+        ;; 消さずに警告する。計上・照合済みの置換先は上で保留している。
         corrections (for [l (:statement-lines parsed) :when (:correct l)]
                       [(get amap (:account-id l)) (:correct l) (:uid l)])
         [lines corrected warnings]
@@ -862,7 +873,8 @@
                       [ls n (conj ws "置換先の明細 ID が競合しているため、訂正前の行を保持しました")]
                       (nil? victim) [ls n ws]
                       (status-of victim) [ls n (conj ws (str "訂正された明細の行 " (:date victim) " " (:description victim "")
-                                                            " は計上・照合済みなので消していません"))]
+                                                            " は計上・照合済みなので消していません"
+                                                            (when (= action :replace) "。置換後の行は取り込まず保留しました。元の明細を確認してください")))]
                       :else [(filterv #(not= (:id victim) (:id %)) ls) (inc n) ws])))
                 [lines 0 uid-warnings]
                 corrections)]

@@ -396,6 +396,28 @@
         (is (= ["new"] (map :uid (get-in r [:db :statement-lines]))))
         (is (= 1 (:lines-corrected r)))))))
 
+(deftest replacement-of-handled-line-does-not-create-new-open-line
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        old {:account-id "a1" :uid "old" :date "2026-01-01" :amount -100 :description "original"}
+        new {:account-id "a1" :uid "new" :date "2026-01-02" :amount -110 :description "replacement"
+             :correct {:uid "old" :action :replace}}
+        base {:currency "JPY" :statement-accounts [account]}
+        db (:db (core/merge-import core/empty-db (assoc base :statement-lines [old])))
+        id (:id (first (:statement-lines db)))]
+    (doseq [[label handled] [["posted" (assoc db :entries [{:id "e1" :origin {:format :statement :line-id id}}])]
+                             ["matched" (assoc-in db [:statement-lines 0 :match] {:entry-id "e1"})]]]
+      (testing label
+        (let [r (core/merge-import handled (assoc base :statement-lines [new]))]
+          (is (= (:statement-lines handled) (get-in r [:db :statement-lines])))
+          (is (= 0 (:lines-added r)))
+          (is (= 0 (:lines-corrected r)))
+          (is (seq (:warnings r)))
+          (let [dup (dissoc new :correct)
+                repeated (core/merge-import handled (assoc base :statement-lines [dup new]))]
+            (is (= (:statement-lines handled) (get-in repeated [:db :statement-lines])))
+            (is (= 0 (:lines-added repeated)))
+            (is (seq (:warnings repeated)))))))))
+
 (deftest ledger-json-round-trip
   (let [{db :db} (st/post-preselected sample-db ["l1" "l2" "l3"])
         db (:db (st/post-line db "l4" {:type :exclude}))
