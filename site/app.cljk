@@ -189,6 +189,21 @@
      {::download {:filename "kaikei-legacy-backup.edn" :mime "text/plain;charset=utf-8" :bytes text}}
      {:db (assoc-in db [:ui :legacy-backup-error] "旧保存データを読み取れませんでした。ブラウザの保存データは消去しないでください。")})))
 
+(rf/reg-event-fx
+ :export-legacy-json
+ (fn [{:keys [db]} _]
+   (try
+     (let [text (local-get)
+           stored (when (some? text) (edn/read-string text))]
+       (when-not (and (map? stored) (map? (:data stored)))
+         (throw (js/Error. "invalid legacy ledger")))
+       (let [result (export/export (merge core/empty-db (:data stored)) "kaikei-json")]
+         (if (:bytes result)
+           {::download (assoc (select-keys result [:mime :bytes]) :filename "kaikei-legacy-recovery.json")}
+           (throw (js/Error. "legacy conversion failed")))))
+     (catch :default _
+       {:db (assoc-in db [:ui :legacy-backup-error] "旧保存データを JSON に変換できませんでした。EDN の控えを保存し、元のデータを消去しないでください。")}))))
+
 (rf/reg-event-db
  ::loaded
  (fn [db [_ text backend]]
@@ -655,8 +670,9 @@
        [:p {:class "kk-warnings" :role "alert"} e]
        (when (:legacy-backup? ui)
          [:div
-          [:p "旧保存データの控えを取り出せます。最新の帳簿とは限らず、復元用の元データも含みません。"]
-          [:button {:type "button" :on-click (fn [_] (rf/dispatch [:export-legacy-backup]))} "旧保存データを控えとして保存（EDN）"]])
+          [:p "旧保存データの控えを取り出せます。最新の帳簿とは限らず、元ファイルは含みません。JSON は帳簿として取り込めますが、一部の値や画面設定を保持できないことがあります。取り込み後に内容を確認し、EDN の控えも保管してください。"]
+          [:button {:type "button" :on-click (fn [_] (rf/dispatch [:export-legacy-backup]))} "旧保存データを控えとして保存（EDN）"]
+          [:button {:type "button" :on-click (fn [_] (rf/dispatch [:export-legacy-json]))} "旧帳簿を取り込み用 JSON として保存"]])
        (when-let [err (:legacy-backup-error ui)] [:p {:class "kk-warnings" :role "alert"} err])]
       [:<>
      (when-let [e (:store-error ui)]

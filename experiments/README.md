@@ -100,6 +100,20 @@ normal top-level page, not the restricted iframe, whose download permission and
 storage access still need a separately reviewed host solution. No real ledger,
 attachment restoration or automatic migration was tested.
 
+The candidate recovery screen additionally offers a user-triggered conversion
+to the existing kaikei JSON import format, preserving the raw EDN separately.
+Using `--sample`, the in-app browser produced a synthetic file with 10 journal
+entries, 3 invoices, 1 statement account, 5 statement lines and 1 rule; its
+bytes matched the existing native exporter for that sample. Re-import into the
+model preserved the sample's currency, accounts, entries, statement accounts,
+statement lines and rules, but exact invoice-map equality failed: a stored
+explicit `:reduced? false` was omitted by the existing JSON writer/reader.
+The screen warns that values and UI settings may be lost; this is not a
+lossless recovery or validation of all fields. `--invalid` confirmed malformed
+EDN reports an error and keeps the raw backup option. Original files are not
+included, and actual user data, recovery import UI, storage write and migration
+remain unqualified.
+
 The diagnostic host now adds `frame-src 'none'` before loading the guest.
 In a 2026-11-02 in-app browser test, an opaque synthetic guest's attempted
 cross-origin self-navigation reached the loopback destination without parent
