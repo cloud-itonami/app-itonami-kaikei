@@ -106,10 +106,14 @@ Using `--sample`, the in-app browser produced a synthetic file with 10 journal
 entries, 3 invoices, 1 statement account, 5 statement lines and 1 rule; its
 bytes matched the existing native exporter for that sample. Re-import into the
 model preserved the sample's currency, accounts, entries, statement accounts,
-statement lines and rules, but exact invoice-map equality failed: a stored
-explicit `:reduced? false` was omitted by the existing JSON writer/reader.
-The screen warns that values and UI settings may be lost; this is not a
-lossless recovery or validation of all fields. `--invalid` confirmed malformed
+statement lines and rules, but exact invoice-map equality initially failed: a
+stored explicit `:reduced? false` was omitted by the JSON writer/reader.
+The candidate now preserves boolean true, false and absence for invoice lines
+and stated tax rows. After that change the same sample exported by the browser
+and re-imported in the local adapter matched all seven tested model fields,
+including the invoices; the old implementation fails the new regression test.
+The screen still warns that other values and UI settings may be lost; this is
+not a lossless recovery or validation of all fields. `--invalid` confirmed malformed
 EDN reports an error and keeps the raw backup option. Original files are not
 included, and actual user data, recovery import UI, storage write and migration
 remain unqualified.

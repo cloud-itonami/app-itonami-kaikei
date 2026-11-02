@@ -43,6 +43,23 @@
     (testing "明細の項目も失わない"
       (is (= (mapv :lines (:invoices posted)) (mapv :lines (:invoices db)))))))
 
+(deftest kaikei-json-preserves-explicit-reduced-booleans
+  (let [db (-> sample-db
+               (assoc-in [:invoices 0 :lines 0 :reduced?] false)
+               (assoc-in [:invoices 0 :lines 1 :reduced?] true)
+               (update-in [:invoices 1 :lines 0] dissoc :reduced?)
+               (assoc-in [:invoices 2 :stated :tax-by-rate]
+                         [{:rate 1000 :tax 330 :reduced? false}
+                          {:rate 800 :tax 80 :reduced? true}
+                          {:rate 0 :tax 0}]))
+        restored (:db (round-trip db "kaikei-json"))]
+    (is (= (:invoices db) (:invoices restored)))
+    (is (false? (get-in restored [:invoices 0 :lines 0 :reduced?])))
+    (is (true? (get-in restored [:invoices 0 :lines 1 :reduced?])))
+    (is (not (contains? (get-in restored [:invoices 1 :lines 0]) :reduced?)))
+    (is (= [false true :missing]
+           (mapv #(get % :reduced? :missing) (get-in restored [:invoices 2 :stated :tax-by-rate]))))))
+
 ;; ───────── Xero ─────────
 
 (deftest xero-invoices-import
