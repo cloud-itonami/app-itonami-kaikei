@@ -1,0 +1,12 @@
+<!doctype html><meta charset="utf-8"><title>Legacy schema upgrade fixture</title>
+<h1>旧版との保存領域の共存試験</h1>
+<p>実帳簿を使わず、新規の合成試験データベースを作ります。</p>
+<button id="run">合成試験を実行</button><p id="result">未実行</p>
+<script type="module">
+import {runLegacyVersionFixture} from '../experiments/legacy-version-fixture.mjs';
+document.querySelector('#run').addEventListener('click', async () => {
+  const result = document.querySelector('#result'); result.textContent = '実行中';
+  try { result.textContent = await runLegacyVersionFixture(); }
+  catch (error) { result.textContent = `FAIL: ${error.message}`; }
+});
+</script>

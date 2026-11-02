@@ -15,6 +15,26 @@ guest authentication or a solution for older clients that write without a
 revision check. Multi-file operations, quota, process termination, cross-tab
 lifecycle and integration with the real kaikei model remain unqualified.
 
+`test/legacy-version-fixture.html` creates a fresh synthetic database per run.
+It holds a version-2 connection open, observes a version-3 upgrade blocked,
+closes the old connection, verifies the two original values after upgrade, and
+checks that reopening version 2 fails with `VersionError`. The test database is
+retained on the test origin. This is not sufficient to block legacy kaikei:
+the current main app falls back to localStorage when IndexedDB open or write
+fails, so an old tab can continue editing a different state after the upgrade.
+Application compatibility, existing connections and transactions, cross-tab
+notifications, recovery and downgrade remain unqualified.
+
+`test/build-legacy-version-probe.py PREVIEW NEW_OUTPUT_DIR` builds a second
+isolated probe with `site/app.cljk` from pinned main revision `767104e0` and
+the supplied preview's other assets, replacing the database and storage key.
+Serve the output directory on a fresh loopback port,
+open `seed.html`, then open `old-app/`. In one in-app browser, the old app
+opened an empty editable ledger despite the version-3 synthetic ledger;
+after loading the built-in sample, it showed the sample again after reload.
+The old source selects localStorage after the version-2 open fails. The probe
+does not establish production rollout behavior or safe reconciliation.
+
 The experiment performs a read and a revision-checked update in one IndexedDB
 transaction. The successful result is returned only on transaction completion;
 stale revisions return a conflict and a UTF-8 limit of 65,536 bytes is enforced.
