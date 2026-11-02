@@ -94,6 +94,18 @@ receiver returned 404 for the four controls: the request arriving, not the
 response status, is the observation. Tests do not establish other browsers,
 redirects, host trust, or complete egress prevention.
 
+`test/build-host-consent-fixture.py RUNTIME EMPTY_OUTPUT_DIR` generates a
+synthetic consent test using the monorepo runtime digest `4e6ef6ee…b693`, a
+parent `frame-src 'none'` policy, an opaque guest and a host-only in-memory
+counter adapter. In the in-app browser on 2026-11-02, a guest request showed
+the operation details; denial left the counter at zero, approval of the next
+request incremented it once, and another request displayed a fresh dialog;
+denial left the count at one. No provider request or browser permission API was
+used. The fixture's synthetic artifact digest is self-generated and does not
+demonstrate publisher admission, provider transport, full egress isolation or
+production consent. The separate canonical path mandated by the workspace
+contract, provider specifications and production host remain unresolved.
+
 Important limits before any production use:
 
 - The fixture's parent creates a raw iframe; it does not use the canonical
