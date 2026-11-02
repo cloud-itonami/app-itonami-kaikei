@@ -1,0 +1,52 @@
+(ns kaikei.compat.paypay-merchant
+  "PayPay 加盟店の即時決済 recon CSV。本人の PayPay 支出履歴ではない。"
+  (:require [kotoba.lang.text :as text]
+            [kaikei.core :as core]
+            [kaikei.csv :as csv]
+            [kaikei.compat.common :as common]))
+
+(def ^:private columns
+  ["決済番号" "加盟店ID" "屋号" "店舗ID" "店舗名" "端末番号/PosID" "取引ステータス"
+   "取引日時" "取引金額" "レシート番号" "支払い方法" "マーチャント決済ID" "支払い詳細"])
+
+(defn detect? [rows] (= columns (mapv text/trim (first rows))))
+
+(defn read-rows [rows]
+  (if-not (detect? rows)
+    {:format :paypay-merchant-csv :accounts [] :statement-accounts [] :statement-lines []
+     :rejected 0 :warnings ["PayPay 加盟店の即時決済 recon CSV の見出しが一致しません"]}
+    (let [records (csv/records rows)
+          merchants (vec (distinct (keep #(common/blank->nil (get % "加盟店ID")) records)))
+          ids (into {} (map-indexed (fn [i m] [m (str "s" (inc i))]) merchants))
+          accounts (mapv (fn [m] {:id (get ids m) :key (str "paypay-merchant:" m)
+                                   :kind :bank :name "PayPay 加盟店 売上明細"
+                                   :ledger-account "未収入金" :currency "JPY"
+                                   :origin {:format :paypay-merchant-csv}}) merchants)
+          candidates
+          (mapv (fn [r]
+                  (let [where (str "行 " (::csv/row r))
+                        merchant (common/blank->nil (get r "加盟店ID"))
+                        payment (common/blank->nil (get r "決済番号"))
+                        event-id (common/blank->nil (get r "マーチャント決済ID"))
+                        status (common/blank->nil (get r "取引ステータス"))
+                        date (core/parse-date (get r "取引日時"))
+                        raw (common/blank->nil (get r "取引金額"))
+                        amount (when raw (common/read-amount raw 0 (str where " の取引金額")))
+                        n (:amount amount)]
+                    (cond
+                      (not (#{"取引完了" "返金完了"} status)) {:problem (str where ": 未確定・失敗または未知の状態は取り込みません（" status "）")}
+                      (or (nil? merchant) (nil? payment) (nil? event-id)) {:problem (str where ": 加盟店・決済・取引 ID が必要です")}
+                      (nil? date) {:problem (str where ": 取引日時を読めません")}
+                      (nil? raw) {:problem (str where ": 金額がありません")}
+                      (:problem amount) {:problem (:problem amount)}
+                      (or (and (= status "取引完了") (not (pos? n)))
+                          (and (= status "返金完了") (not (neg? n)))) {:problem (str where ": 状態と金額の符号が一致しません")}
+                      :else {:line {:account-id (get ids merchant) :date date :amount n
+                                    :description (str status " " event-id)
+                                    :reference event-id
+                                    :uid (pr-str [payment status event-id])
+                                    :origin {:format :paypay-merchant-csv :row (::csv/row r)}}}))) records)]
+      {:format :paypay-merchant-csv :currency "JPY" :accounts []
+       :statement-accounts accounts :statement-lines (vec (keep :line candidates))
+       :rejected (count (filter :problem candidates))
+       :warnings (into ["加盟店の売上・返金です。個人の PayPay 支出や銀行への入金とは別に確認してください。提供元の履歴に欠落がないか確認してください。"] (keep :problem candidates))})))
