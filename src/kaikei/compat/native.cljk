@@ -278,6 +278,7 @@
       (integer-value? (get m "size")) (assoc :size (get m "size"))
       (string? (get m "imported_at")) (assoc :imported-at (get m "imported_at"))
       (string? (get m "format")) (assoc :format (get m "format"))
+      (true? (get m "review_required")) (assoc :review-required true)
       (sequential? (get m "account_ids")) (assoc :account-ids (vec (filter string? (get m "account_ids")))))))
 
 (defn detect? [data] (and (map? data) (= format-id (get data "format"))))
@@ -467,6 +468,6 @@
                (vec (for [f (:files db)]
                       (json/ordered [["id" (:id f)] ["name" (:name f)] ["sha256" (:sha256 f)] ["size" (:size f)]
                                      ["imported_at" (:imported-at f)] ["format" (:format f)]
-                                     ["account_ids" (:account-ids f)]]))))]]))
+                                     ["account_ids" (:account-ids f)] ["review_required" (:review-required f)]]))))]]))
 
 (defn write [db] (str (json/write (data db)) "\n"))
