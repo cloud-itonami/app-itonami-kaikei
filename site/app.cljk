@@ -42,13 +42,19 @@
   (js/Promise.
    (fn [resolve reject]
      (try
-       (let [req (.open js/indexedDB idb-name 2)]
+       (let [req (.open js/indexedDB idb-name 2)
+             blocked? (atom false)]
          (set! (.-onupgradeneeded req)
                (fn [_]
-                 (let [idb (.-result req)]
-                   (when-not (.contains (.-objectStoreNames idb) idb-store) (.createObjectStore idb idb-store))
-                   (when-not (.contains (.-objectStoreNames idb) files-store) (.createObjectStore idb files-store)))))
-         (set! (.-onsuccess req) (fn [_] (resolve (.-result req))))
+                 (if @blocked?
+                   (.abort (.-transaction req))
+                   (let [idb (.-result req)]
+                     (when-not (.contains (.-objectStoreNames idb) idb-store) (.createObjectStore idb idb-store))
+                     (when-not (.contains (.-objectStoreNames idb) files-store) (.createObjectStore idb files-store))))))
+         ;; blocked 後も要求はブラウザ内で待機する。後から成功した場合は接続を閉じ、
+         ;; 遅れて upgrade が始まった場合は上で取り消す。
+         (set! (.-onblocked req) (fn [_] (reset! blocked? true) (reject (js/Error. "storage-upgrade-blocked"))))
+         (set! (.-onsuccess req) (fn [_] (if @blocked? (.close (.-result req)) (resolve (.-result req)))))
          (set! (.-onerror req) (fn [_] (reject (.-error req)))))
        (catch :default e (reject e))))))
 
@@ -75,7 +81,7 @@
    ;; 次の保存で IndexedDB へ移り、localStorage の分は消える。
    (-> (idb-request "readonly" #(.get % storage-key))
        (.then (fn [v] (rf/dispatch [::loaded (or v (local-get)) :indexeddb])))
-       (.catch (fn [_] (rf/dispatch [::load-failed]))))))
+       (.catch (fn [e] (rf/dispatch [::load-failed (and (some? e) (= (.-message e) "storage-upgrade-blocked"))]))))))
 
 (rf/reg-fx
  ::store
@@ -179,10 +185,12 @@
 
 (rf/reg-event-db
  ::load-failed
- (fn [db _]
+ (fn [db [_ blocked?]]
    (-> db
        (assoc-in [:ui :legacy-backup?] (some? (local-get)))
-       (assoc-in [:ui :load-error] "端末の帳簿保存領域を開けませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、利用環境と復旧方法を確認してください。"))))
+       (assoc-in [:ui :load-error] (if blocked?
+                                    "別のタブが帳簿保存領域を使用しているため更新できません。データを保護するため編集を停止しました。他の kaikei タブを閉じてから再読み込みしてください。ブラウザの保存データは消去しないでください。"
+                                    "端末の帳簿保存領域を開けませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、利用環境と復旧方法を確認してください。")))))
 
 (rf/reg-event-fx
  :export-legacy-backup
