@@ -7,16 +7,24 @@ import subprocess
 import sys
 from pathlib import Path
 
-if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] != '--old'):
-    raise SystemExit('usage: python3 test/build-atomic-app-probe.py PREVIEW NEW_OUTPUT_DIR [--old]')
+if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in ('--old', '--preclear', '--allow-clear', '--race-clear')):
+    raise SystemExit('usage: python3 test/build-atomic-app-probe.py PREVIEW NEW_OUTPUT_DIR [--old|--preclear|--allow-clear|--race-clear]')
 preview, out = map(Path, sys.argv[1:3])
 if out.exists():
     raise SystemExit('output directory must not exist')
 root = Path(__file__).resolve().parents[1]
-app = (subprocess.check_output(['git', 'show', 'e1355bc:site/app.cljk'], cwd=root, text=True)
-       if len(sys.argv) == 4 else (root / 'site/app.cljk').read_text())
+revisions = {'--old': 'e1355bc', '--preclear': '6a795ba'}
+revision = revisions.get(sys.argv[3]) if len(sys.argv) == 4 else None
+app = (subprocess.check_output(['git', 'show', revision + ':site/app.cljk'], cwd=root, text=True)
+       if revision else (root / 'site/app.cljk').read_text())
 app = app.replace('"itonami.kaikei.v1"', '"kaikei.jun771.atomic-pair.v1"')
 app = app.replace('"itonami.kaikei"', '"kaikei-jun771-atomic-pair"')
+if len(sys.argv) == 4 and sys.argv[3] == '--race-clear':
+    old = '(defn- idb-write-with-file [text {:keys [put delete clear?]}]\n  (-> (idb-open)'
+    new = '(defn- idb-write-with-file [text {:keys [put delete clear?]}]\n  (-> (js/Promise. (fn [resolve _] (js/setTimeout #(resolve (idb-open)) 1000)))'
+    if app.count(old) != 1:
+        raise SystemExit('expected atomic writer not found')
+    app = app.replace(old, new)
 app += '''\n(rf/reg-event-fx :fixture-pair
  (fn [{:keys [db]} [_ label byte]]
    (let [db2 (assoc-in db [:data :business] {:name label})]
@@ -35,6 +43,11 @@ app += '''\n(rf/reg-event-fx :fixture-pair
  (set! (.-textContent b) "fixture clear")
  (set! (.-onclick b) (fn [] (rf/dispatch-sync [:clear-all])))
  (.appendChild (.-body js/document) b))
+(let [b (.createElement js/document "button")]
+ (set! (.-textContent b) "fixture race")
+ (set! (.-onclick b) (fn [] (rf/dispatch-sync [:clear-all])
+                         (js/setTimeout #(rf/dispatch-sync [:fixture-ledger-only]) 100)))
+ (.appendChild (.-body js/document) b))
 '''
 ofx = (root / 'test/fixtures/ofx-bank.ofx').read_bytes()
 app += ('\n(let [b (.createElement js/document "button")] (set! (.-textContent b) "fixture OFX") '
@@ -46,6 +59,8 @@ shutil.copytree(preview, out)
 index = out / 'index.html'
 html = index.read_text()
 hook = '''<script>const original=IDBObjectStore.prototype.put;IDBObjectStore.prototype.put=function(value,key){const r=original.call(this,value,key);if(this.name==='files' && value instanceof Uint8Array && value[0]===2)this.transaction.abort();return r;};const originalClear=IDBObjectStore.prototype.clear;IDBObjectStore.prototype.clear=function(){const r=originalClear.call(this);if(this.name==='files')this.transaction.abort();return r;};</script>'''
+if len(sys.argv) == 4 and sys.argv[3] in ('--allow-clear', '--race-clear'):
+    hook = hook.replace("const originalClear=IDBObjectStore.prototype.clear;IDBObjectStore.prototype.clear=function(){const r=originalClear.call(this);if(this.name==='files')this.transaction.abort();return r;};", '')
 if html.count('<head>') != 1:
     raise SystemExit('expected one head')
 index.write_text(html.replace('<head>', '<head>' + hook, 1))

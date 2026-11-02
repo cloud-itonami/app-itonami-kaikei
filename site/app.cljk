@@ -117,7 +117,7 @@
 
 (rf/reg-fx
  ::store
- (fn [{:keys [saved backend file-op]}]
+ (fn [{:keys [saved backend file-op clear-snapshot]}]
    (let [text (when saved (pr-str saved))
          local! (fn []
                   (try
@@ -132,7 +132,7 @@
              (-> @store-tail
                  (.then (fn [_]
                           (when @file-write-failed?
-                            (throw (js/Error. "元ファイルを含む保存に失敗したため、控えを保存してから再読み込みしてください")))
+                            (throw (js/Error. "保存を続けられません。表示中の帳簿の控えを保存してから再読み込みしてください")))
                           (if (= backend :local-storage)
                             (if file-op (throw (js/Error. "元ファイルを含む帳簿は IndexedDB に保存する必要があります")) (local!))
                             (-> (if file-op
@@ -145,10 +145,13 @@
                                                (.removeItem js/localStorage storage-key))
                                              (catch :default _ nil))
                                            (reset! legacy-migration-source nil))
-                                         (rf/dispatch [::stored-ok])))))))
+                                         (if clear-snapshot
+                                           (rf/dispatch-sync [::clear-committed clear-snapshot])
+                                           (rf/dispatch [::stored-ok]))))))))
                  ;; 失敗後も次の snapshot を処理できるよう、拒否をここで解消する。
                  (.catch (fn [e]
                            (when file-op (reset! file-write-failed? true))
+                           (when clear-snapshot (rf/dispatch [::clear-failed]))
                            (rf/dispatch [::store-failed (or (.-message e) "IndexedDB への保存に失敗しました")]))))))))
 
 (rf/reg-fx
@@ -461,9 +464,26 @@
 (rf/reg-event-fx
  :clear-all
  (fn [{:keys [db]} _]
-   (with-store db (assoc db :data core/empty-db
-                           :ui (assoc view/initial-ui :legacy-extra? (get-in db [:ui :legacy-extra?])))
-               {::clear-files true})))
+   (when-not (get-in db [:ui :clear-pending?])
+     {:db (assoc-in db [:ui :clear-pending?] true)
+      ::store {:backend (:backend db) :saved nil :file-op {:clear? true} :clear-snapshot (:data db)}})))
+
+(rf/reg-event-db
+ ::clear-failed
+ (fn [db _] (assoc-in db [:ui :clear-pending?] false)))
+
+(rf/reg-event-db
+ ::clear-committed
+ (fn [db [_ snapshot]]
+   (if (= snapshot (:data db))
+     (assoc db :data core/empty-db
+               :ui (assoc view/initial-ui :legacy-extra? (get-in db [:ui :legacy-extra?])))
+     (do
+       ;; 消去待ちの間に非同期処理が内容を変えた場合、画面の内容を消さない。
+       (reset! file-write-failed? true)
+       (-> db
+           (assoc-in [:ui :clear-pending?] false)
+           (assoc-in [:ui :store-error] "消去中に帳簿が変更されました。現在の内容を書き出してから再読み込みしてください"))))))
 
 (rf/reg-event-fx
  :export
@@ -722,7 +742,9 @@
         ui @(rf/subscribe [::ui])
         derived @(rf/subscribe [::derived])
         statements @(rf/subscribe [::statements])]
-    (if-let [e (:load-error ui)]
+    (if (:clear-pending? ui)
+      [:div {:class "kk-app"} [:p {:role "status"} "帳簿と元ファイルを消去しています…"]]
+      (if-let [e (:load-error ui)]
       [:div {:class "kk-app"}
        [:p {:class "kk-warnings" :role "alert"} e]
        (when (:legacy-backup? ui)
@@ -740,7 +762,7 @@
        [:p {:class "kk-warnings kk-app" :role "alert"}
         (str "この端末に保存できませんでした（" e "）。書き出して手元に残してください。")])
      ;; :booting? の間は SSR と同じ「読み込んでいます」を描く（保存の読み出しは非同期）
-       (view/root (cond-> {:data data :ui ui} statements (assoc :statements statements)) derived handlers)])))
+       (view/root (cond-> {:data data :ui ui} statements (assoc :statements statements)) derived handlers)]))))
 
 (rf/dispatch-sync [:init])
 (.addEventListener js/window "storage"
