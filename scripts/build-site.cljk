@@ -42,14 +42,14 @@
 ;; trusted host does not yet load this candidate.
 (let [{:keys [repo sha files]} (:client-runtime site)
       {:keys [from to sha256]} (first files)]
-  (when-not (and (= repo "kotoba-lang/wasm-webcomponent")
-                 (= from "src/kotoba-client-runtime.js")
+  (when-not (and (= repo "kotoba-lang/kotoba")
+                 (= from "lib/kotoba.wasmWebcomponent/src/kotoba-client-runtime.js")
                  (= to "runtime/kotoba-client-runtime.js")
                  (= 1 (count files))
                  (re-matches #"[0-9a-f]{40}" (str sha))
                  (re-matches #"[0-9a-f]{64}" (str sha256)))
     (throw (js/Error. "invalid canonical client runtime pin")))
-  (let [source (cp/spawnSync "git" #js ["-C" (str kotoba-lang "/wasm-webcomponent")
+  (let [source (cp/spawnSync "git" #js ["-C" (str kotoba-lang "/kotoba")
                                           "show" (str sha ":" from)]
                              #js {:maxBuffer (* 4 1024 1024)})]
     (when-not (zero? (.-status source))
