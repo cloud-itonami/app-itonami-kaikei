@@ -350,7 +350,7 @@
                                                                       "-" (subs v 2 4) "-" (subs v 4 6)))))))
     :else (common/parse-ordered-date (cell rec date) order)))
 
-(defn read-mapped
+(defn- read-mapped-valid
   "割り当て（mapping）で CSV の行を読む。opts の :currency は帳簿の通貨。"
   [rows mapping {:keys [currency] :or {currency "JPY"}}]
   (let [{:keys [skip-rows header? amount out in direction invert? description counterparty balance reference kind preset]
@@ -403,3 +403,19 @@
                        (and p (not (:verified? p)))
                        (cons (str "型「" (:label p) "」の列は一次資料で確かめていません（" (:source p) "）。"
                                   "取り込んだ日付・金額・向きを確かめてください")))))))
+
+(defn read-mapped
+  "存在しない列や必須の割り当てがあれば、金額 0 の明細を作らず拒否する。"
+  [rows mapping opts]
+  (let [names (set (column-names rows mapping))
+        date-cols (or (seq (:date-parts mapping)) (some-> (:date mapping) vector))
+        amount-cols (remove nil? [(:amount mapping) (:out mapping) (:in mapping)])
+        columns (remove nil? (concat date-cols amount-cols (:description mapping)
+                                     [(:counterparty mapping) (:balance mapping) (:reference mapping)
+                                      (get-in mapping [:direction :column])]))
+        missing (vec (remove names columns))]
+    (if (or (empty? date-cols) (empty? amount-cols) (seq missing))
+      {:format :statement-csv :accounts [] :statement-accounts [] :statement-lines []
+       :rejected 0 :warnings [(str "CSV の列の割り当てを確認してください"
+                                  (when (seq missing) (str "（見つからない列: " (text/join "、" missing) "）")))]}
+      (read-mapped-valid rows mapping opts))))

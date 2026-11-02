@@ -225,6 +225,17 @@
       (is (= "statement-csv:custom:bank" (:key (first (:statement-accounts p)))))))
   (testing "割り当ての無い汎用 CSV は取り込まない"
     (is (re-find #"列を割り当てて" (first (:warnings (ingest/ingest-text "a,b\n1,2\n" {:format "statement-csv"}))))))
+  (testing "保存された割り当ての金額列が別のカード明細に無い場合、0 円として取り込まない"
+    (let [p (ingest/ingest-text "日付,別の金額\n2026/11/01,1500\n"
+                                {:format "statement-csv" :mapping {:date "日付" :amount "金額" :kind :card}})]
+      (is (empty? (:statement-lines p)))
+      (is (empty? (:statement-accounts p)))
+      (is (re-find #"見つからない列.*金額" (first (:warnings p))))))
+  (testing "金額の割り当てが無ければ取り込まない"
+    (let [p (ingest/ingest-text "日付,内容\n2026/11/01,購入\n"
+                                {:format "statement-csv" :mapping {:date "日付" :description ["内容"]}})]
+      (is (empty? (:statement-lines p)))
+      (is (seq (:warnings p)))))
   (testing "列の名前（画面の割り当てに出す）"
     (is (= ["#1" "#2" "#3"] (kaikei.compat.statement-csv/headers [["a" "b" "c"]] {:header? false})))))
 
