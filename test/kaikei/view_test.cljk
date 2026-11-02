@@ -160,3 +160,11 @@
     (is (not (:disabled (second (button-for "すべて消去")))))
     (is (has-text? tree "明細"))
     (is (has-text? statements "unresolved.ofx"))))
+
+(deftest original-file-shows-persistent-review-notice
+  (let [data (assoc core/empty-db
+                    :statement-accounts [{:id "a1" :name "合成口座" :kind :bank}]
+                    :files [{:id "f1" :name "review.ofx" :sha256 "synthetic" :size 1
+                             :account-ids ["a1"] :review-required true}])
+        tree (render data (assoc view/initial-ui :mode :statements) view/ssr-handlers)]
+    (is (has-text? tree "取込時に要確認"))))

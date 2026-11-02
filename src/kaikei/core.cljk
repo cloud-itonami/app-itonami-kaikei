@@ -896,9 +896,11 @@
       [(cond-> (assoc db :statement-accounts accounts :statement-lines lines)
          (and file-id (not existing-file)) (update :files (fnil conj [])
                                                     (merge (select-keys file [:name :sha256 :size :imported-at :format])
-                                                           {:id file-id :account-ids account-ids}))
+                                                           (cond-> {:id file-id :account-ids account-ids}
+                                                             (seq warnings) (assoc :review-required true))))
          existing-file (update :files (fn [fs] (mapv #(if (= file-id (:id %))
-                                                        (update % :account-ids (fn [ids] (vec (distinct (concat ids account-ids)))))
+                                                        (cond-> (update % :account-ids (fn [ids] (vec (distinct (concat ids account-ids)))))
+                                                          (seq warnings) (assoc :review-required true))
                                                         %) fs))))
        lmap
        (cond-> {:lines-added added :lines-duplicates dup :lines-corrected corrected}
@@ -1057,7 +1059,9 @@
              [db' file-ids]
              (reduce (fn [[d m] f]
                        (if-let [same (first (filter #(= (:sha256 f) (:sha256 %)) (:files d)))]
-                         [d (assoc m (:id f) (:id same))]
+                         [(if (:review-required f)
+                            (update d :files (fn [fs] (mapv #(if (= (:id same) (:id %)) (assoc % :review-required true) %) fs)))
+                            d) (assoc m (:id f) (:id same))]
                          (let [taken (set (map :id (:files d)))
                                id (if (taken (:id f))
                                     (str "f" (inc (reduce max 0 (map #(prefixed-number "f" (:id %)) (:files d)))))

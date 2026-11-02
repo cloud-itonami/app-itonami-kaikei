@@ -434,7 +434,7 @@
         again (core/merge-import stored parsed :append {:file file})]
     (is (= 0 (:lines-added result)))
     (is (= "f1" (:file-id result)))
-    (is (= [(assoc file :id "f1" :account-ids ["a1"])] (:files stored)))
+    (is (= [(assoc file :id "f1" :account-ids ["a1"] :review-required true)] (:files stored)))
     (is (= (:statement-lines handled) (:statement-lines stored)))
     (is (= "f1" (:file-id again)))
     (is (= 1 (count (:files (:db again)))))
@@ -499,4 +499,21 @@
     (is (= 0 (:lines-corrected result)))
     (is (seq (:warnings result)))
     (is (= "f1" (:file-id result)))
-    (is (= [(assoc file :id "f1" :account-ids ["a1"])] (get-in result [:db :files])))))
+    (is (= [(assoc file :id "f1" :account-ids ["a1"] :review-required true)] (get-in result [:db :files])))))
+
+(deftest correction-warning-file-flag-survives-reimport-and-json
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        deletion {:account-id "a1" :uid "delete-op" :date "2026-01-02" :amount 0
+                  :correct {:uid "missing" :action :delete}}
+        parsed {:currency "JPY" :statement-accounts [account] :statement-lines [deletion]}
+        file {:name "review.ofx" :sha256 "synthetic-review" :size 123 :format "ofx"}
+        stored (:db (core/merge-import core/empty-db parsed :append {:file file}))
+        reimported (:db (core/merge-import stored parsed :append {:file file}))
+        restored (:db (core/merge-import core/empty-db (ingest/ingest-text (native/write stored) {})))]
+    (is (true? (get-in stored [:files 0 :review-required])))
+    (is (true? (get-in reimported [:files 0 :review-required])))
+    (is (= 1 (count (:files reimported))))
+    (is (true? (get-in restored [:files 0 :review-required])))
+    (let [older (update stored :files #(mapv (fn [f] (dissoc f :review-required)) %))
+          combined (:db (core/merge-import older (ingest/ingest-text (native/write stored) {})))]
+      (is (true? (get-in combined [:files 0 :review-required]))))))
