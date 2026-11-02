@@ -68,6 +68,19 @@ The initial-load localStorage fallback remains. Real quota failures, asynchronou
 save-result ordering, different competing edits and conflict recovery still need
 dedicated validation before release.
 
+The diagnostic host now adds `frame-src 'none'` before loading the guest.
+In a 2026-11-02 in-app browser test, an opaque synthetic guest's attempted
+cross-origin self-navigation reached the loopback destination without parent
+CSP; with parent `frame-src 'none'` as an HTTP header or early meta policy, the
+browser blocked that specific navigation and the receiving server observed no
+request. A separate scripted guest ran under the header, and the modified
+kaikei diagnostic loaded its built-in sample under the meta policy. These are
+limited tests in one browser, not proof that all egress is blocked. The parent
+must itself be trusted, the policy must be delivered before the guest, and
+other navigation schemes, requests, browsers, redirects, consent flows and
+storage admission remain unqualified. No production host or live operation is
+enabled by this test. See KOTOBA-159 and JUN-765 for the boundary finding.
+
 Important limits before any production use:
 
 - The fixture's parent creates a raw iframe; it does not use the canonical

@@ -84,7 +84,7 @@ html = html.replace('<head>', '<head>' + guest, 1)
 content = html.encode()
 (out / 'kaikei-inline.html').write_bytes(content)
 digest = hashlib.sha256(content).hexdigest()
-host = '''<!doctype html><meta charset="utf-8"><title>Kaikei synthetic storage probe</title>
+host = '''<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="frame-src 'none'"><title>Kaikei synthetic storage probe</title>
 <h1>kaikei 合成保存 probe</h1><p id="status">準備中</p><div id="app"></div>
 <script type="module">
 import {verifyClientArtifact,mountRestrictedClientApp} from './console.js';
