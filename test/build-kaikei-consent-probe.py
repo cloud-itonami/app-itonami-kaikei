@@ -7,9 +7,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-if len(sys.argv) != 4:
-    raise SystemExit('usage: python3 test/build-kaikei-consent-probe.py PREVIEW REVIEWED_RUNTIME NEW_OUTPUT_DIR')
-preview, runtime, out = map(Path, sys.argv[1:])
+if len(sys.argv) not in (4, 5) or (len(sys.argv) == 5 and sys.argv[4] != '--http'):
+    raise SystemExit('usage: python3 test/build-kaikei-consent-probe.py PREVIEW REVIEWED_RUNTIME NEW_OUTPUT_DIR [--http]')
+preview, runtime, out = map(Path, sys.argv[1:4])
+http = len(sys.argv) == 5
 data = runtime.read_bytes()
 if hashlib.sha256(data).hexdigest() != '4e6ef6eea88641b20c490692d271ce57891e53e01fcc5c303135a325b2f5b693':
     raise SystemExit('unexpected reviewed monorepo runtime digest')
@@ -36,6 +37,11 @@ guest = '''<script>
   });
 })();
 </script>'''
+if http:
+    guest = guest.replace("e.data.ok?'allowed':'denied'", "e.data.ok?'HTTP status '+e.data.status:'denied'")
+    guest = guest.replace('Request synthetic counter', 'Request public fixture')
+    guest = guest.replace("capability:'test/browser-counter',service:'local-fixture',operation:'increment'", "capability:'test/public-metadata',service:'github-public-fixture',operation:'read'")
+    guest = guest.replace('payload:{value:1}', "payload:{input:'https://api.github.com/repos/holochain/holochain'}")
 if html.count('<head>') != 1:
     raise SystemExit('expected one head')
 page.write_text(html.replace('<head>', '<head>' + guest, 1))
@@ -54,6 +60,18 @@ new = '''const op={capability:'test/browser-counter',service:'local-fixture',ope
   const consentHost=createClientConsentHost();
   const broker=createClientOperationBroker({runtime,requestedCapabilities:[op.capability],approvedOperations:[op],hostSupportedOperations:[[op.capability,op.service,op.operation]],consentHost,browserAdapters:{'local-fixture':{increment:()=>{counter.textContent='handler calls '+(++calls);return {value:1};}}}});
   await mountRestrictedClientApp({artifact,container,broker});'''
+if http:
+    new = '''const url='https://api.github.com/repos/holochain/holochain';
+  const op={capability:'test/public-metadata',service:'github-public-fixture',operation:'read',consent:'each-operation','data-categories':['public-repository-metadata'],endpoint:{origin:'https://api.github.com',method:'GET',path:'/repos/holochain/holochain'}};
+  const runtime={schema:'kotoba.app.client-runtime.v1',target:'browser',profile:'restricted-wasm-v1',entry:'app.html','local-state':{adapter:'localstorage',schema:'test.state.v1',version:1},workers:[],operations:[op]};
+  const counter=document.createElement('p');counter.id='counter';document.body.prepend(counter);
+  const count=()=>performance.getEntriesByType('resource').filter(e=>e.name===url).length;
+  counter.textContent='HTTP resource entries '+count();
+  new PerformanceObserver(()=>counter.textContent='HTTP resource entries '+count()).observe({type:'resource',buffered:true});
+  const consentHost=createClientConsentHost();
+  const broker=createClientOperationBroker({runtime,requestedCapabilities:[op.capability],approvedOperations:[op],hostSupportedOperations:[[op.capability,op.service,op.operation]],consentHost});
+  await mountRestrictedClientApp({artifact,container,broker});'''
+    text = text.replace("frame-src 'none'", "frame-src 'none'; connect-src 'self' https://api.github.com")
 if text.count(old) != 1:
     raise SystemExit('unexpected no-operation broker')
 text = text.replace(old, new)
@@ -61,4 +79,4 @@ text, n = re.subn(r"sha256:\s*\"[0-9a-f]{64}\"", 'sha256:' + json.dumps(digest),
 if n != 1:
     raise SystemExit('expected guest digest')
 host.write_text(text)
-print('synthetic kaikei consent fixture; no provider or network operation; self-digest is not publisher admission')
+print('synthetic kaikei consent fixture; ' + ('one public GET on approval' if http else 'no network operation') + '; self-digest is not publisher admission')
