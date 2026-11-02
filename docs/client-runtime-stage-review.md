@@ -7,8 +7,8 @@ The source is `kotoba-lang/wasm-webcomponent` commit
 `7f760128c3a58098123c31ec3dd34b9c871932e3933f2c952facc4ab0e647212`.
 The preview builder reads that exact path from Git and rejects a missing commit
 or a digest mismatch. It does not load the module, create a consent host or
-allow any external operation. `site.edn` records the candidate; the existing
-production generator does not consume it.
+allow any external operation. `site.edn` uses the production generator's
+`:client-runtime` asset declaration. Staging an asset is not host integration.
 
 ## Review boundary
 
@@ -41,8 +41,17 @@ CSP and refusal of a forged consent handle. A scratch copy with the expected
 digest replaced by zeros must fail the preview build before writing the asset.
 Neither check runs external requests or the interactive browser consent flow.
 
-Before any real connection, update and test the production generator, validate
-the actual app descriptor and publisher pins, isolate and qualify the trusted
+On 2026-11-02 the production generator at network-awai/cloud-itonami
+`a219a36ddd05d6331cc7b1fc90bb40e2526e586b` was run from an isolated scratch
+directory against this candidate. The output passed the same byte / inert-page
+check; a zero-digest negative control failed with a digest mismatch. An initial
+run from the generator checkout failed while resolving conflicting Git and
+local dependencies for `io.github.kotoba-lang/edn`; the scratch run used the
+same copied generator and an explicit source classpath. This is a local build,
+not production deployment or host qualification.
+
+Before any real connection, validate the actual app descriptor and publisher
+pins, isolate and qualify the trusted
 host, obtain service-specific API and authorization details, declare exact
 operations and CSP, and test deny/allow/replay and redirects in a real browser.
 Do not publish or cut over on the basis of this staging candidate.

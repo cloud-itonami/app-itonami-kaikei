@@ -39,10 +39,13 @@
   (copy! from (str out-dir "/" to)))
 
 ;; Stage the pinned canonical broker only as an inert preview artifact. The
-;; publication generator and trusted host do not yet consume this candidate.
-(let [{:keys [repo sha from sha256]} (:client-runtime-candidate site)]
+;; trusted host does not yet load this candidate.
+(let [{:keys [repo sha files]} (:client-runtime site)
+      {:keys [from to sha256]} (first files)]
   (when-not (and (= repo "kotoba-lang/wasm-webcomponent")
                  (= from "src/kotoba-client-runtime.js")
+                 (= to "runtime/kotoba-client-runtime.js")
+                 (= 1 (count files))
                  (re-matches #"[0-9a-f]{40}" (str sha))
                  (re-matches #"[0-9a-f]{64}" (str sha256)))
     (throw (js/Error. "invalid canonical client runtime pin")))
