@@ -80,7 +80,9 @@
    ;; IndexedDB に無く localStorage にだけあるもの（前の版の保存）は、そちらを読む。
    ;; 次の保存で IndexedDB へ移り、localStorage の分は消える。
    (-> (idb-request "readonly" #(.get % storage-key))
-       (.then (fn [v] (rf/dispatch [::loaded (or v (local-get)) :indexeddb])))
+       ;; 旧保存領域が読めない場合は「旧データなし」と判断しない。
+       ;; 既存 IndexedDB がある場合は旧領域を読む必要はない。
+       (.then (fn [v] (rf/dispatch [::loaded (if (some? v) v (.getItem js/localStorage storage-key)) :indexeddb])))
        (.catch (fn [e] (rf/dispatch [::load-failed (and (some? e) (= (.-message e) "storage-upgrade-blocked"))]))))))
 
 (rf/reg-fx
