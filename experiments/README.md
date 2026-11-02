@@ -84,10 +84,21 @@ The `--read-failure` synthetic bridge probe showed the warning and no editor;
 the earlier candidate opened an empty editor for the same failure, while a
 successful empty read still opened normally. This intentionally removes the
 previous ability to continue editing via localStorage when IndexedDB cannot be
-read, even for a browser that only ever used localStorage. No read-only legacy
-export or recovery UI is implemented yet. Legacy localStorage is still read if
+read, even for a browser that only ever used localStorage. If legacy
+localStorage is readable, the candidate now offers an explicit, read-only raw
+EDN backup without treating it as the current book. The file may be stale and
+does not contain original attachments. Legacy localStorage is still read if
 IndexedDB opens successfully and has no ledger. Real IndexedDB failures and
 legacy migration require further browser validation before release.
+
+`test/build-legacy-backup-fixture.py PREVIEW NEW_OUTPUT_DIR` makes a synthetic
+preview that seeds localStorage and forces the IndexedDB read to reject. Serve
+only on an isolated loopback origin: it writes a fixed test value there. On
+2026-11-02, the in-app browser displayed the recovery warning and backup button;
+the downloaded EDN exactly matched the synthetic source. The test used a
+normal top-level page, not the restricted iframe, whose download permission and
+storage access still need a separately reviewed host solution. No real ledger,
+attachment restoration or automatic migration was tested.
 
 The diagnostic host now adds `frame-src 'none'` before loading the guest.
 In a 2026-11-02 in-app browser test, an opaque synthetic guest's attempted

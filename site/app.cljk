@@ -178,7 +178,16 @@
 (rf/reg-event-db
  ::load-failed
  (fn [db _]
-   (assoc-in db [:ui :load-error] "端末の帳簿保存領域を開けませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、利用環境と復旧方法を確認してください。")))
+   (-> db
+       (assoc-in [:ui :legacy-backup?] (some? (local-get)))
+       (assoc-in [:ui :load-error] "端末の帳簿保存領域を開けませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、利用環境と復旧方法を確認してください。"))))
+
+(rf/reg-event-fx
+ :export-legacy-backup
+ (fn [{:keys [db]} _]
+   (if-some [text (local-get)]
+     {::download {:filename "kaikei-legacy-backup.edn" :mime "text/plain;charset=utf-8" :bytes text}}
+     {:db (assoc-in db [:ui :legacy-backup-error] "旧保存データを読み取れませんでした。ブラウザの保存データは消去しないでください。")})))
 
 (rf/reg-event-db
  ::loaded
@@ -642,7 +651,13 @@
         derived @(rf/subscribe [::derived])
         statements @(rf/subscribe [::statements])]
     (if-let [e (:load-error ui)]
-      [:div {:class "kk-app"} [:p {:class "kk-warnings" :role "alert"} e]]
+      [:div {:class "kk-app"}
+       [:p {:class "kk-warnings" :role "alert"} e]
+       (when (:legacy-backup? ui)
+         [:div
+          [:p "旧保存データの控えを取り出せます。最新の帳簿とは限らず、復元用の元データも含みません。"]
+          [:button {:type "button" :on-click (fn [_] (rf/dispatch [:export-legacy-backup]))} "旧保存データを控えとして保存（EDN）"]])
+       (when-let [err (:legacy-backup-error ui)] [:p {:class "kk-warnings" :role "alert"} err])]
       [:<>
      (when-let [e (:store-error ui)]
        [:p {:class "kk-warnings kk-app" :role "alert"}
