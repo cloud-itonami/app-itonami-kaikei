@@ -12,7 +12,7 @@ if len(sys.argv) not in (4, 5) or (len(sys.argv) == 5 and sys.argv[4] != '--http
 preview, runtime, out = map(Path, sys.argv[1:4])
 http = len(sys.argv) == 5
 data = runtime.read_bytes()
-if hashlib.sha256(data).hexdigest() != '4e6ef6eea88641b20c490692d271ce57891e53e01fcc5c303135a325b2f5b693':
+if hashlib.sha256(data).hexdigest() != '0d8ed12a795fdf46de32ac01c0675adec9f22df64f24769a4d4a960d6a345ac5':
     raise SystemExit('unexpected reviewed monorepo runtime digest')
 root = Path(__file__).resolve().parents[1]
 subprocess.run([sys.executable, str(root / 'test/build-kaikei-storage-probe.py'), str(preview), str(out)], check=True)
