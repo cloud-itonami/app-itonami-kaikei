@@ -418,6 +418,28 @@
             (is (= 0 (:lines-added repeated)))
             (is (seq (:warnings repeated)))))))))
 
+(deftest warning-only-import-retains-original-file-for-review
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        old {:account-id "a1" :uid "old" :date "2026-01-01" :amount -100 :description "original"}
+        new {:account-id "a1" :uid "new" :date "2026-01-02" :amount -110 :description "replacement"
+             :correct {:uid "old" :action :replace}}
+        base {:currency "JPY" :statement-accounts [account]}
+        db (:db (core/merge-import core/empty-db (assoc base :statement-lines [old])))
+        id (:id (first (:statement-lines db)))
+        handled (assoc db :entries [{:id "e1" :origin {:format :statement :line-id id}}])
+        file {:name "correction.ofx" :sha256 "synthetic-hash" :size 123 :format "ofx"}
+        parsed (assoc base :statement-lines [new])
+        result (core/merge-import handled parsed :append {:file file})
+        stored (:db result)
+        again (core/merge-import stored parsed :append {:file file})]
+    (is (= 0 (:lines-added result)))
+    (is (= "f1" (:file-id result)))
+    (is (= [(assoc file :id "f1" :account-ids ["a1"])] (:files stored)))
+    (is (= (:statement-lines handled) (:statement-lines stored)))
+    (is (= "f1" (:file-id again)))
+    (is (= 1 (count (:files (:db again)))))
+    (is (seq (:warnings result)))))
+
 (deftest ledger-json-round-trip
   (let [{db :db} (st/post-preselected sample-db ["l1" "l2" "l3"])
         db (:db (st/post-line db "l4" {:type :exclude}))
