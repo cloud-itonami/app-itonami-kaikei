@@ -1,0 +1,36 @@
+<!doctype html><meta charset="utf-8"><p id="result">RUNNING</p><div id="container"></div>
+<script type="module">
+import {bindFixturePort} from '../experiments/local-ledger-port-fixture.mjs';
+import {watchFixtureGuest} from '../experiments/guest-ledger-lifetime-fixture.mjs';
+import {readFixture,compareAndSwapFixture} from '../experiments/local-ledger-fixture.mjs';
+const out=document.querySelector('#result');
+try {
+ const negative=new URLSearchParams(location.search).has('negative');
+ const before=await readFixture();
+ const value='synthetic-transaction-'+crypto.randomUUID();
+ const frame=document.createElement('iframe'), container=document.querySelector('#container');
+ frame.sandbox='allow-scripts';frame.srcdoc='<p>synthetic</p>';container.append(frame);
+ let started=0,wasAborted=false,settled;
+ const done=new Promise(resolve=>{settled=resolve});
+ const {port1,port2}=new MessageChannel();
+ const bridge=bindFixturePort(port1,{read:readFixture,write:async (revision,data,signal)=>{
+   started++; signal.addEventListener('abort',()=>{wasAborted=true},{once:true});
+   try { return await compareAndSwapFixture(revision,data,signal,()=>{frame.remove();container.append(frame)}); }
+   finally { settled(); }
+ }});
+ if (!negative) watchFixtureGuest(frame,container,bridge);
+ port2.postMessage({protocol:'kaikei.fixture.local-ledger.v1',id:1,action:'write',expectedRevision:before.revision,value});
+ port2.postMessage({protocol:'kaikei.fixture.local-ledger.v1',id:2,action:'write',expectedRevision:before.revision,value});
+ await done;
+ await new Promise(resolve=>setTimeout(resolve,100));
+ const after=await readFixture();
+ if (negative) {
+   if (after.revision!==before.revision+1 || after.value!==value || wasAborted) throw Error('negative control did not commit');
+   out.textContent='PASS negative: unmonitored synthetic transaction committed';
+ } else {
+   if (after.revision!==before.revision || after.value!==before.value || !wasAborted || started!==1) throw Error('rollback or queue failed');
+   out.textContent='PASS: guest removal aborted real IndexedDB write; previous value preserved; queued write did not start';
+ }
+ bridge.close();port2.close();
+} catch(e) {out.textContent='FAIL: '+e.message;}
+</script>

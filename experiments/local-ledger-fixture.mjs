@@ -59,7 +59,7 @@ export async function readFixture(signal) {
 
 // IndexedDB serializes readwrite transactions for this store. Compare and write
 // occur in the same transaction; success is returned only after commit.
-export async function compareAndSwapFixture(expectedRevision, value, signal) {
+export async function compareAndSwapFixture(expectedRevision, value, signal, afterQueue) {
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0
       || expectedRevision >= Number.MAX_SAFE_INTEGER || typeof value !== 'string'
       || new TextEncoder().encode(value).byteLength > MAX_BYTES) {
@@ -82,6 +82,8 @@ export async function compareAndSwapFixture(expectedRevision, value, signal) {
       if (revision !== expectedRevision) { result = {ok: false, revision}; return; }
       const next = revision + 1;
       store.put({revision: next, value}, KEY);
+      // Test-only timing hook runs before the IDB transaction may commit.
+      if (afterQueue) afterQueue();
       result = {ok: true, revision: next};
     };
     tx.oncomplete = () => { finish(); resolve(result); };
