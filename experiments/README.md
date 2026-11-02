@@ -38,6 +38,26 @@ The local server supplied only static test files; no real provider or
 account was contacted. Browser-local synthetic test data may remain in the test
 database on the loopback origin.
 
+`test/build-kaikei-storage-probe.py PREVIEW EMPTY_OUTPUT_DIR` builds a separate
+diagnostic fixture from a prebuilt kaikei preview. It checks the staged runtime
+digest, inlines the preview scripts, and replaces only the generated guest's
+state-store adapter. The canonical runtime mounts the modified guest as an
+opaque iframe; a test-only parent MessageChannel connects it to a different,
+fixed synthetic IndexedDB database. The digest is calculated from the modified
+artifact by the fixture itself, and the revision is synthetic: neither proves
+publisher identity or release admission. Original-file storage is refused.
+
+On 2026-11-02, an in-app browser on loopback loaded the actual generated kaikei
+UI, saved its built-in sample, and recovered the sample trial balance after a
+page reload (767,500 on each side). With two tabs opened on the same sample,
+saving again in the first and then the second produced a visible save error in
+the second. The existing `site/app.cljk` localStorage fallback masked the
+underlying conflict with a sandbox localStorage error; the UI did not explain
+how to resolve it. The payloads were identical, so this observation alone does
+not prove that distinct competing edits are preserved. Same-guest concurrent
+requests and all navigation and crash races remain unqualified. The test
+used synthetic data only and did not exercise provider consent or access.
+
 Important limits before any production use:
 
 - The fixture's parent creates a raw iframe; it does not use the canonical
