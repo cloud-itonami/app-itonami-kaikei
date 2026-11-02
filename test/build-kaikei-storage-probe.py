@@ -33,6 +33,7 @@ if mode in ('--corrupt-ledger', '--read-failure'):
     store = store.replace(marker, marker + injection)
 (out / 'store.mjs').write_text(store)
 (out / 'port.mjs').write_bytes((root / 'experiments/local-ledger-port-fixture.mjs').read_bytes())
+(out / 'lifetime.mjs').write_bytes((root / 'experiments/guest-ledger-lifetime-fixture.mjs').read_bytes())
 
 # Only the generated test artifact is rewritten. Production source is unchanged.
 replacement = '''(defn- idb-request
@@ -122,6 +123,7 @@ host = '''<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Securit
 <script type="module">
 import {verifyClientArtifact,mountRestrictedClientApp} from './console.js';
 import {bindFixturePort} from './port.mjs';
+import {watchFixtureGuest} from './lifetime.mjs';
 import {readFixture,compareAndSwapFixture} from './store.mjs';
 try {
   const bytes=new Uint8Array(await (await fetch('./kaikei-inline.html')).arrayBuffer());
@@ -129,8 +131,9 @@ try {
   const container=document.querySelector('#app');
   await mountRestrictedClientApp({artifact,container,broker:{invoke:async()=>{throw Error('no eligible operations')}}});
   const frame=container.querySelector('iframe'), channel=new MessageChannel();
-  const bridge=bindFixturePort(channel.port1,{read:readFixture,write:compareAndSwapFixture}); let loaded=false;
-  frame.addEventListener('load',()=>{ if(loaded){bridge.close();document.querySelector('#status').textContent='切断';return;} loaded=true;frame.contentWindow.postMessage('fixture-storage-port','*',[channel.port2]);document.querySelector('#status').textContent='合成 probe 稼働中'; });
+  const bridge=bindFixturePort(channel.port1,{read:readFixture,write:compareAndSwapFixture});
+  const lifetime=watchFixtureGuest(frame,container,bridge); let loaded=false;
+  frame.addEventListener('load',()=>{ if(loaded){lifetime.close();document.querySelector('#status').textContent='切断';return;} loaded=true;frame.contentWindow.postMessage('fixture-storage-port','*',[channel.port2]);document.querySelector('#status').textContent='合成 probe 稼働中'; });
 } catch(error) {document.querySelector('#status').textContent='FAIL: '+error.message;}
 </script>'''.replace('DIGEST', json.dumps(digest))
 if legacy_probe:

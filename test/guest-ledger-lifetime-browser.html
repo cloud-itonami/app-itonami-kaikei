@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><p id="result">RUNNING</p><div id="container"></div>
+<script type="module">
+import {bindFixturePort} from '../experiments/local-ledger-port-fixture.mjs';
+import {watchFixtureGuest} from '../experiments/guest-ledger-lifetime-fixture.mjs';
+const result=document.querySelector('#result');
+try {
+ const frame=document.createElement('iframe'),container=document.querySelector('#container'); frame.sandbox='allow-scripts'; frame.srcdoc='<p>synthetic</p>'; container.append(frame);
+ const {port1,port2}=new MessageChannel();let calls=0,aborted=false,start;
+ const started=new Promise(r=>{start=r});
+ const bridge=bindFixturePort(port1,{read:signal=>new Promise((resolve,reject)=>{calls++;start();signal.addEventListener('abort',()=>{aborted=true;reject(Error('aborted'))},{once:true})}),write:async()=>{calls++}});
+ watchFixtureGuest(frame,container,bridge);
+ const msg=id=>({protocol:'kaikei.fixture.local-ledger.v1',id,action:'read',expectedRevision:null,value:null});
+ port2.postMessage(msg(1));port2.postMessage(msg(2));await started;
+ frame.remove();container.append(frame);
+ await new Promise(r=>setTimeout(r,100));
+ result.textContent=aborted&&calls===1?'PASS: real DOM remove/reinsert aborted active read; queued read not started':'FAIL: aborted='+aborted+' calls='+calls;
+ port2.close();
+}catch(e){result.textContent='FAIL: '+e.message}
+</script>
