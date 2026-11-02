@@ -22,7 +22,12 @@ value remains. Reload and press the second button to check recovery.
 that calls the same experiment. In an in-app browser on 2026-11-02 the guest
 saved and reloaded a synthetic value through that channel; a fixture probe
 also observed rejection of direct parent-DOM, localStorage and external fetch
-access. The local server supplied only static test files; no real provider or
+access. Its fixture protocol now rejects malformed or replayed messages,
+out-of-order IDs, transferred ports, overly large strings and a flood of
+pending requests. `node --test test/local-ledger-port-fixture.test.mjs` covers
+these refusals. The fixture closes its port after a subsequent iframe load;
+an `about:blank` navigation showed the disconnected state in the browser.
+The local server supplied only static test files; no real provider or
 account was contacted. Browser-local synthetic test data may remain in the test
 database on the loopback origin.
 
@@ -31,7 +36,9 @@ Important limits before any production use:
 - The fixture's parent creates a raw iframe; it does not use the canonical
   broker's verified-artifact mount, descriptor admission, or trusted consent.
   Its one-shot MessageChannel transfer is not a reviewed navigation-safe or
-  multi-session protocol. A sibling document on the same origin can access the
+  multi-session protocol. The navigation check observes `load`, not the start
+  of navigation, and an already-running storage transaction may still commit
+  after the port closes. A sibling document on the same origin can access the
   fixture database. Do not treat the demonstration as a security boundary.
 - It does not store original files, bind storage to an authenticated owner,
   migrate old state, handle rollback, deletion, schema changes, corruption
