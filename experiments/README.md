@@ -58,6 +58,16 @@ not prove that distinct competing edits are preserved. Same-guest concurrent
 requests and all navigation and crash races remain unqualified. The test
 used synthetic data only and did not exercise provider consent or access.
 
+The subsequent `site/app.cljk` change keeps the selected IndexedDB backend on
+write failure and surfaces that failure instead of silently reporting success
+from a fallback store that the next IndexedDB load would not read. A repeated
+two-tab synthetic test displayed `fixture write conflict` rather than the
+sandbox localStorage error. This diagnostic uses an injected test adapter; it
+does not add conflict detection to the existing production IndexedDB store.
+The initial-load localStorage fallback remains. Real quota failures, asynchronous
+save-result ordering, different competing edits and conflict recovery still need
+dedicated validation before release.
+
 Important limits before any production use:
 
 - The fixture's parent creates a raw iframe; it does not use the canonical

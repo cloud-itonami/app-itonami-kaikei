@@ -5,7 +5,8 @@
 ;; DOM を直接いじるのは effect（保存・ダウンロード・ファイル読み込み）の中だけ。
 ;;
 ;; ネットワークは使わない。fetch も XHR も無い。保存はこの端末の IndexedDB
-;; （itonami.kaikei の state ストア）で、使えなければ localStorage に落とす。
+;; （itonami.kaikei の state ストア）で、読み込み時に使えなければ localStorage を使う。
+;; IndexedDB を選んだ後の書き込み失敗は別の保存先に隠さず画面に出す。
 ;; 1 年分の仕訳帳は数 MB の文字列になり（実測: 5,000 仕訳・1 万行で約 270 万字）、
 ;; localStorage の上限（ブラウザごとに違い、同じオリジンの mihari・dandori と
 ;; 分け合う）では足りないことがあるため。読み書きの失敗は画面に出す。
@@ -91,7 +92,7 @@
            (.then (fn [_]
                     (try (.removeItem js/localStorage storage-key) (catch :default _ nil))
                     (rf/dispatch [::stored-ok])))
-           (.catch (fn [_] (local!))))))))
+           (.catch (fn [e] (rf/dispatch [::store-failed (or (.-message e) "IndexedDB への保存に失敗しました")]))))))))
 
 (rf/reg-fx
  ::download
