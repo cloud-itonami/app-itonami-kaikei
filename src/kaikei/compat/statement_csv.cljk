@@ -402,6 +402,8 @@
               :currency currency :mapping mapping :origin {:format :statement-csv}}]
     (update (finish "statement-csv" acct candidates currency) :warnings
             (fn [ws] (cond->> ws
+                       (= preset "paypay-wallet")
+                       (cons "PayPay の履歴には処理中・失敗・取消などの取引や給与受取の自動送金が含まれません。PayPayカードの取引が含まれる場合もあるため、カード明細との重複やチャージ・返金を確認してください。")
                        (and p (not (:verified? p)))
                        (cons (str "型「" (:label p) "」の列は一次資料で確かめていません（" (:source p) "）。"
                                   "取り込んだ日付・金額・向きを確かめてください")))))))

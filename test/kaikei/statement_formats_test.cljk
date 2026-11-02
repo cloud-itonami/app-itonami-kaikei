@@ -195,7 +195,9 @@
       (is (= [["2026-11-01" -1200 "支払い 店舗"] ["2026-11-02" 1200 "返金 店舗"]] (rows p)))
       (is (= ["synthetic-1" "synthetic-2"] (mapv :reference (:statement-lines p))))
       (is (= 2 (count (get-in again [:db :statement-lines]))))
-      (is (some #(re-find #"一次資料で確かめていません" %) (:warnings p)))))
+      (is (some #(re-find #"一次資料で確かめていません" %) (:warnings p)))
+      (is (some #(re-find #"給与受取の自動送金" %) (:warnings p)))
+      (is (some #(re-find #"カード明細との重複" %) (:warnings p)))))
   (testing "確かめた型（三菱UFJ BizSTATION）: 見出しで選び、和暦・入払区分で読む。警告なし"
     (let [p (ingest/ingest-bytes (fixture-bytes "mufg-biz-nyuushukkin.csv") {})]
       (is (= :statement-csv (:format p)))
