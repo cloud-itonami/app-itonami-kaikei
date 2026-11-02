@@ -77,6 +77,21 @@ fixed synthetic IndexedDB database. The digest is calculated from the modified
 artifact by the fixture itself, and the revision is synthetic: neither proves
 publisher identity or release admission. Original-file storage is refused.
 
+The opt-in `--legacy-empty`, `--legacy-present` and `--legacy-failure` modes
+modify only the generated test guest. The synthetic host reads a fixed test
+localStorage key and includes that value in its test ledger-read response;
+the guest uses that response in place of direct localStorage access. The host
+never reads the actual kaikei key, and does not remove the synthetic legacy
+copy. These modes model only the initial handoff, not guest authentication,
+origin migration, conflict resolution, or a production storage protocol.
+With the combined #14/#15 candidate, one in-app browser showed an empty editor
+when no synthetic legacy existed, a 123/123 trial balance for a synthetic old
+ledger, and a load warning with editing stopped on simulated read failure.
+After adding the built-in sample to the synthetic old ledger and reloading,
+the fixture restored a 767,623/767,623 trial balance and warned that the old
+copy remained. The host and guest are test-modified and self-digested; no real
+data, actual provider, or publisher admission was exercised.
+
 On 2026-11-02, an in-app browser on loopback loaded the actual generated kaikei
 UI, saved its built-in sample, and recovered the sample trial balance after a
 page reload (767,500 on each side). With two tabs opened on the same sample,
