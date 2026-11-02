@@ -43,7 +43,10 @@ replacement = '''(defn- idb-request
        (let [fake #js {:get (fn [k] #js {:action "read" :key k})
                        :put (fn [v k] #js {:action "write" :key k :value v})
                        :delete (fn [k] #js {:action "write" :key k :value nil})}]
-         (.request js/kaikeiFixtureLedger (f fake)))
+         (let [request (f fake)]
+           (if (vector? request)
+             (.then (.request js/kaikeiFixtureLedger (first request)) (fn [v] [v nil]))
+             (.request js/kaikeiFixtureLedger request))))
        (catch :default e (js/Promise.reject e)))
      (js/Promise.reject (js/Error. "fixture does not support original files")))))
 '''

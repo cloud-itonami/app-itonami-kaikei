@@ -17,7 +17,7 @@ fail = 'true' if len(sys.argv) == 4 else 'false'
 adapter = '''(defn- idb-request
   ([mode f] (idb-request idb-store mode f))
   ([store mode f]
-   (if (= mode "readonly") (js/Promise.resolve nil)
+   (if (= mode "readonly") (js/Promise.resolve [nil nil])
      (let [fake #js {:put (fn [value key] value) :delete (fn [key] "deleted")}
            value (f fake)
            older? (.includes value "older")

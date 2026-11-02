@@ -28,6 +28,7 @@
             [kaikei.view :as view]))
 
 (def storage-key "itonami.kaikei.v1")
+(def ^:private revision-key "itonami.kaikei.v1.revision")
 
 ;; ───────── effects / coeffects ─────────
 
@@ -68,7 +69,7 @@
                  (fn [resolve reject]
                    (let [tx (.transaction idb store mode)
                          req (f (.objectStore tx store))]
-                     (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve (.-result req))))
+                     (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve (if (vector? req) (mapv #(.-result %) req) (.-result req)))))
                      (set! (.-onerror tx) (fn [_] (.close idb) (reject (.-error tx))))
                      ;; 明示的な abort は error event を伴わない場合がある。
                      (set! (.-onabort tx) (fn [_] (.close idb) (reject (or (.-error tx) (js/Error. "IndexedDB transaction aborted")))))))))))))
@@ -79,19 +80,25 @@
 ;; それ以外の旧データは別タブの編集かもしれないため残す。
 (def ^:private legacy-migration-source (atom nil))
 (def ^:private idb-expected (atom ::unloaded))
+(def ^:private idb-revision (atom ::unloaded))
 (def ^:private idb-conflict? (atom false))
+
+(defn- valid-revision? [v]
+  (or (nil? v) (and (number? v) (js/Number.isSafeInteger v) (pos? v))))
 
 (rf/reg-fx
  ::load
  (fn [_]
    ;; IndexedDB に無く localStorage にだけあるもの（前の版の保存）は、そちらを読む。
    ;; 次の保存で IndexedDB へ移り、localStorage の分は消える。
-   (-> (idb-request "readonly" #(.get % storage-key))
+   (-> (idb-request "readonly" #(vector (.get % storage-key) (.get % revision-key)))
        ;; 旧保存領域が読めない場合は「旧データなし」と判断しない。
        ;; 既存 IndexedDB がある場合は旧領域を読む必要はない。
-       (.then (fn [v]
+       (.then (fn [[v revision]]
+                (when-not (valid-revision? revision) (throw (js/Error. "invalid ledger revision")))
                 (let [legacy (if (some? v) (local-get) (.getItem js/localStorage storage-key))]
                   (reset! idb-expected (when (some? v) v))
+                  (reset! idb-revision revision)
                   (reset! legacy-migration-source (when (nil? v) legacy))
                   (rf/dispatch [::loaded (if (some? v) v legacy) :indexeddb (and (some? v) (some? legacy))]))))
        (.catch (fn [e] (rf/dispatch [::load-failed (and (some? e) (= (.-message e) "storage-upgrade-blocked"))]))))))
@@ -113,6 +120,7 @@
                           files (.objectStore tx files-store)
                           changed? (atom false)
                           conflict? (atom false)
+                          next-revision (atom nil)
                           cleanup (fn [] (when clear-snapshot (remove-watch rf-db/app-db ::clear-guard)) (.close idb))]
                       (when clear-snapshot
                         (add-watch rf-db/app-db ::clear-guard
@@ -120,20 +128,28 @@
                                      (when (not= clear-snapshot (:data next-db))
                                        (reset! changed? true)
                                        (try (.abort tx) (catch :default _ nil))))))
-                      (set! (.-oncomplete tx) (fn [_] (cleanup) (reset! idb-expected text) (resolve nil)))
+                      (set! (.-oncomplete tx) (fn [_] (cleanup) (reset! idb-expected text) (reset! idb-revision @next-revision) (resolve nil)))
                       (set! (.-onabort tx) (fn [_] (cleanup)
                                               (reject (cond @changed? (js/Error. "消去中に帳簿が変更されました。消去を中止しました")
                                                             @conflict? (js/Error. "別のタブで帳簿が更新されました。控えを保存してから再読み込みしてください")
                                                             :else (or (.-error tx) (js/Error. "IndexedDB transaction aborted"))))))
                       (try
-                        (let [read (.get state storage-key)]
-                          (set! (.-onsuccess read)
+                        (let [read (.get state storage-key)
+                              rev-read (.get state revision-key)]
+                          (set! (.-onsuccess rev-read)
                                 (fn [_]
                                   (let [current (.-result read)
-                                        current (when (some? current) current)]
-                                    (if (or (= @idb-expected ::unloaded) (not= current @idb-expected))
+                                        current (when (some? current) current)
+                                        revision (.-result rev-read)
+                                        revision (when (some? revision) revision)]
+                                    (if (or (= @idb-expected ::unloaded) (not= current @idb-expected)
+                                            (= @idb-revision ::unloaded) (not= revision @idb-revision)
+                                            (not (valid-revision? revision))
+                                            (= revision js/Number.MAX_SAFE_INTEGER))
                                       (do (reset! conflict? true) (reset! idb-conflict? true) (.abort tx))
                                       (try
+                                        (reset! next-revision (if revision (inc revision) 1))
+                                        (.put state @next-revision revision-key)
                                         (if text (.put state text storage-key) (.delete state storage-key))
                                         (cond put (.put files (:bytes put) (:id put))
                                               delete (.delete files delete)

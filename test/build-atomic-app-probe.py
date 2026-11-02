@@ -7,13 +7,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in ('--old', '--preclear', '--allow-clear', '--race-clear', '--in-tx-race', '--guard-old', '--pre-cas')):
+if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in ('--old', '--preclear', '--allow-clear', '--race-clear', '--in-tx-race', '--guard-old', '--pre-cas', '--pre-revision')):
     raise SystemExit('usage: python3 test/build-atomic-app-probe.py PREVIEW NEW_OUTPUT_DIR [option]')
 preview, out = map(Path, sys.argv[1:3])
 if out.exists():
     raise SystemExit('output directory must not exist')
 root = Path(__file__).resolve().parents[1]
-revisions = {'--old': 'e1355bc', '--preclear': '6a795ba', '--guard-old': '353a1b5', '--pre-cas': '84cc10c'}
+revisions = {'--old': 'e1355bc', '--preclear': '6a795ba', '--guard-old': '353a1b5', '--pre-cas': '84cc10c', '--pre-revision': 'ba5dbc0'}
 revision = revisions.get(sys.argv[3]) if len(sys.argv) == 4 else None
 app = (subprocess.check_output(['git', 'show', revision + ':site/app.cljk'], cwd=root, text=True)
        if revision else (root / 'site/app.cljk').read_text())
@@ -65,7 +65,7 @@ shutil.copytree(preview, out)
 index = out / 'index.html'
 html = index.read_text()
 hook = '''<script>const original=IDBObjectStore.prototype.put;IDBObjectStore.prototype.put=function(value,key){const r=original.call(this,value,key);if(this.name==='files' && value instanceof Uint8Array && value[0]===2)this.transaction.abort();return r;};const originalClear=IDBObjectStore.prototype.clear;IDBObjectStore.prototype.clear=function(){const r=originalClear.call(this);if(this.name==='files')this.transaction.abort();return r;};</script>'''
-if len(sys.argv) == 4 and sys.argv[3] in ('--allow-clear', '--race-clear', '--in-tx-race', '--guard-old', '--pre-cas'):
+if len(sys.argv) == 4 and sys.argv[3] in ('--allow-clear', '--race-clear', '--in-tx-race', '--guard-old', '--pre-cas', '--pre-revision'):
     hook = hook.replace("const originalClear=IDBObjectStore.prototype.clear;IDBObjectStore.prototype.clear=function(){const r=originalClear.call(this);if(this.name==='files')this.transaction.abort();return r;};", '')
 if html.count('<head>') != 1:
     raise SystemExit('expected one head')
