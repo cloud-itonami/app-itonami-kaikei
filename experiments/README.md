@@ -75,9 +75,19 @@ instead of silently opening an empty ledger. In an in-app browser the
 the earlier app candidate opened an empty editable ledger for the same
 synthetic input. A normal empty store and the built-in sample's save/reload
 also worked in the synthetic bridge. This is not comprehensive schema or
-corruption recovery, and it does not yet fix IndexedDB open/read failure
-falling back to an absent localStorage value. The injected corrupt value and
-all stores used in the probe are synthetic.
+corruption recovery. The injected corrupt value and all stores used in the
+probe are synthetic.
+
+The candidate also stops editing if the primary IndexedDB read fails, rather
+than assuming that an absent or older localStorage value is the current book.
+The `--read-failure` synthetic bridge probe showed the warning and no editor;
+the earlier candidate opened an empty editor for the same failure, while a
+successful empty read still opened normally. This intentionally removes the
+previous ability to continue editing via localStorage when IndexedDB cannot be
+read, even for a browser that only ever used localStorage. No read-only legacy
+export or recovery UI is implemented yet. Legacy localStorage is still read if
+IndexedDB opens successfully and has no ledger. Real IndexedDB failures and
+legacy migration require further browser validation before release.
 
 The diagnostic host now adds `frame-src 'none'` before loading the guest.
 In a 2026-11-02 in-app browser test, an opaque synthetic guest's attempted

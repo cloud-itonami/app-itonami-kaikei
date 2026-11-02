@@ -6,8 +6,8 @@ import re
 import sys
 from pathlib import Path
 
-if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] != '--corrupt-ledger'):
-    raise SystemExit('usage: python3 test/build-kaikei-storage-probe.py PREVIEW EMPTY_OUTPUT_DIR [--corrupt-ledger]')
+if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in ('--corrupt-ledger', '--read-failure')):
+    raise SystemExit('usage: python3 test/build-kaikei-storage-probe.py PREVIEW EMPTY_OUTPUT_DIR [--corrupt-ledger|--read-failure]')
 preview, out = map(Path, sys.argv[1:3])
 if out.exists() and any(out.iterdir()):
     raise SystemExit('output directory must be empty')
@@ -25,7 +25,9 @@ if len(sys.argv) == 4:
     marker = 'export async function readFixture(signal) {'
     if store.count(marker) != 1:
         raise SystemExit('expected fixture read not found')
-    store = store.replace(marker, marker + ' return {revision: 1, value: JSON.stringify("{invalid-edn")};')
+    injection = (' return {revision: 1, value: JSON.stringify("{invalid-edn")};'
+                 if sys.argv[3] == '--corrupt-ledger' else ' throw Error("synthetic-read-failure");')
+    store = store.replace(marker, marker + injection)
 (out / 'store.mjs').write_text(store)
 (out / 'port.mjs').write_bytes((root / 'experiments/local-ledger-port-fixture.mjs').read_bytes())
 

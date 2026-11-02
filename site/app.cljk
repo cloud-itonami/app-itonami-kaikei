@@ -5,8 +5,8 @@
 ;; DOM を直接いじるのは effect（保存・ダウンロード・ファイル読み込み）の中だけ。
 ;;
 ;; ネットワークは使わない。fetch も XHR も無い。保存はこの端末の IndexedDB
-;; （itonami.kaikei の state ストア）で、読み込み時に使えなければ localStorage を使う。
-;; IndexedDB を選んだ後の書き込み失敗は別の保存先に隠さず画面に出す。
+;; （itonami.kaikei の state ストア）。読み取り失敗時は空帳簿と決めつけず編集を止める。
+;; IndexedDB に保存がない場合は旧版の localStorage を読む。書き込み失敗も画面に出す。
 ;; 1 年分の仕訳帳は数 MB の文字列になり（実測: 5,000 仕訳・1 万行で約 270 万字）、
 ;; localStorage の上限（ブラウザごとに違い、同じオリジンの mihari・dandori と
 ;; 分け合う）では足りないことがあるため。読み書きの失敗は画面に出す。
@@ -73,7 +73,7 @@
    ;; 次の保存で IndexedDB へ移り、localStorage の分は消える。
    (-> (idb-request "readonly" #(.get % storage-key))
        (.then (fn [v] (rf/dispatch [::loaded (or v (local-get)) :indexeddb])))
-       (.catch (fn [_] (rf/dispatch [::loaded (local-get) :local-storage]))))))
+       (.catch (fn [_] (rf/dispatch [::load-failed]))))))
 
 (rf/reg-fx
  ::store
@@ -174,6 +174,11 @@
  (fn [_ _]
    {:db {:data core/empty-db :ui (assoc view/initial-ui :booting? true)}
     ::load true}))
+
+(rf/reg-event-db
+ ::load-failed
+ (fn [db _]
+   (assoc-in db [:ui :load-error] "端末の帳簿保存領域を開けませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、利用環境と復旧方法を確認してください。")))
 
 (rf/reg-event-db
  ::loaded
