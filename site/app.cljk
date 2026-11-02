@@ -245,7 +245,8 @@
          (throw (js/Error. "保存データの形式が正しくありません")))
        {:data (if stored (merge core/empty-db (:data stored)) core/empty-db)
         :backend backend
-        :ui (merge (:ui db) {:booting? false :legacy-extra? legacy-extra?} (select-keys (:settings stored) [:fy-start :pl-style]))})
+        :ui (merge (:ui db) {:booting? false :legacy-extra? (or legacy-extra? (get-in db [:ui :legacy-extra?]))}
+                   (select-keys (:settings stored) [:fy-start :pl-style]))})
      (catch :default _
        (assoc-in db [:ui :load-error] "保存済みの帳簿を読み取れませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、復旧方法を確認してください。")))))
 
@@ -275,6 +276,11 @@
 
 (rf/reg-event-db ::stored-ok (fn [db _] (assoc-in db [:ui :store-error] nil)))
 (rf/reg-event-db ::store-failed (fn [db [_ msg]] (assoc-in db [:ui :store-error] msg)))
+
+;; 別タブが旧保存先へ書いた場合も、再読込を待たず控えを案内する。
+(rf/reg-event-db ::legacy-written
+ (fn [db _]
+   (-> db (assoc-in [:ui :legacy-extra?] true) (assoc-in [:ui :legacy-backup?] true))))
 
 (reg-ui-event :set-mode (fn [db [_ m]] (assoc-in db [:ui :mode] m)))
 (reg-ui-event :toggle-import (fn [db _] (update-in db [:ui :import-open?] not)))
@@ -720,4 +726,11 @@
        (view/root (cond-> {:data data :ui ui} statements (assoc :statements statements)) derived handlers)])))
 
 (rf/dispatch-sync [:init])
+(.addEventListener js/window "storage"
+                   (fn [e]
+                     (try
+                       (when (and (.-isTrusted e) (= (.-storageArea e) js/localStorage)
+                                  (= (.-key e) storage-key) (some? (.-newValue e)))
+                         (rf/dispatch [::legacy-written]))
+                       (catch :default _ nil))))
 (rdom/render [root] (.getElementById js/document "app"))
