@@ -73,4 +73,15 @@ index.write_text(html.replace('<head>', '<head>' + hook, 1))
 (out / 'inspect.html').write_text('''<!doctype html><meta charset="utf-8"><p id="result">reading</p><script>const r=indexedDB.open('kaikei-jun771-atomic-pair',2);r.onsuccess=()=>{const db=r.result;const tx=db.transaction(['state','files']);const state=tx.objectStore('state').get('kaikei.jun771.atomic-pair.v1');const file=tx.objectStore('files').get('fixture-file');tx.oncomplete=()=>{document.querySelector('#result').textContent='ledger='+state.result+' file='+file.result?.[0];db.close();}};</script>''')
 (out / 'inspect-import.html').write_text('''<!doctype html><meta charset="utf-8"><p id="result">reading</p><script>const r=indexedDB.open('kaikei-jun771-atomic-pair',2);r.onsuccess=()=>{const db=r.result;const tx=db.transaction(['state','files']);const state=tx.objectStore('state').get('kaikei.jun771.atomic-pair.v1');const file=tx.objectStore('files').get('f1');tx.oncomplete=async()=>{const digest=await crypto.subtle.digest('SHA-256',file.result);const hex=Array.from(new Uint8Array(digest),x=>x.toString(16).padStart(2,'0')).join('');document.querySelector('#result').textContent='ledger-file-id='+String(state.result).includes(':file-id "f1"')+' sha256='+hex;db.close();}};</script>''')
 (out / 'inspect-presence.html').write_text('''<!doctype html><meta charset="utf-8"><p id="result">reading</p><script>const r=indexedDB.open('kaikei-jun771-atomic-pair',2);r.onsuccess=()=>{const db=r.result;const tx=db.transaction(['state','files']);const state=tx.objectStore('state').get('kaikei.jun771.atomic-pair.v1');const file=tx.objectStore('files').get('f1');tx.oncomplete=()=>{document.querySelector('#result').textContent='ledger='+(state.result!==undefined)+' file='+(file.result!==undefined);db.close();}};</script>''')
+# The app must first create its synthetic database and seed fixture A. These
+# pages modify only that database's revision, never the real kaikei database.
+for name, value in [('bad-revision.html', '"corrupt"'), ('max-revision.html', 'Number.MAX_SAFE_INTEGER')]:
+    (out / name).write_text('''<!doctype html><meta charset="utf-8"><p id="result">seeding</p><script>
+const r=indexedDB.open('kaikei-jun771-atomic-pair',2);
+r.onupgradeneeded=()=>r.transaction.abort();
+r.onerror=()=>document.querySelector('#result').textContent='seed failed';
+r.onsuccess=()=>{const db=r.result;const tx=db.transaction('state','readwrite');
+tx.objectStore('state').put(VALUE,'itonami.kaikei.v1.revision');
+tx.oncomplete=()=>{document.querySelector('#result').textContent='synthetic revision seeded';db.close();};
+tx.onabort=()=>{document.querySelector('#result').textContent='seed failed';db.close();};};</script>'''.replace('VALUE', value))
 print('built synthetic-only app probe; serve on a fresh loopback origin')

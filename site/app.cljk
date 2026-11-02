@@ -120,6 +120,7 @@
                           files (.objectStore tx files-store)
                           changed? (atom false)
                           conflict? (atom false)
+                          overflow? (atom false)
                           next-revision (atom nil)
                           cleanup (fn [] (when clear-snapshot (remove-watch rf-db/app-db ::clear-guard)) (.close idb))]
                       (when clear-snapshot
@@ -131,6 +132,7 @@
                       (set! (.-oncomplete tx) (fn [_] (cleanup) (reset! idb-expected text) (reset! idb-revision @next-revision) (resolve nil)))
                       (set! (.-onabort tx) (fn [_] (cleanup)
                                               (reject (cond @changed? (js/Error. "消去中に帳簿が変更されました。消去を中止しました")
+                                                            @overflow? (js/Error. "帳簿の更新番号が上限に達しました。控えを保存して復旧方法を確認してください")
                                                             @conflict? (js/Error. "別のタブで帳簿が更新されました。控えを保存してから再読み込みしてください")
                                                             :else (or (.-error tx) (js/Error. "IndexedDB transaction aborted"))))))
                       (try
@@ -142,10 +144,12 @@
                                         current (when (some? current) current)
                                         revision (.-result rev-read)
                                         revision (when (some? revision) revision)]
-                                    (if (or (= @idb-expected ::unloaded) (not= current @idb-expected)
+                                    (if (and (= revision @idb-revision) (= revision js/Number.MAX_SAFE_INTEGER)
+                                             (= current @idb-expected))
+                                      (do (reset! overflow? true) (reset! idb-conflict? true) (.abort tx))
+                                      (if (or (= @idb-expected ::unloaded) (not= current @idb-expected)
                                             (= @idb-revision ::unloaded) (not= revision @idb-revision)
-                                            (not (valid-revision? revision))
-                                            (= revision js/Number.MAX_SAFE_INTEGER))
+                                            (not (valid-revision? revision)))
                                       (do (reset! conflict? true) (reset! idb-conflict? true) (.abort tx))
                                       (try
                                         (reset! next-revision (if revision (inc revision) 1))
@@ -154,7 +158,7 @@
                                         (cond put (.put files (:bytes put) (:id put))
                                               delete (.delete files delete)
                                               clear? (.clear files))
-                                        (catch :default _ (try (.abort tx) (catch :default _ nil)))))))))
+                                        (catch :default _ (try (.abort tx) (catch :default _ nil))))))))))
                         (catch :default e (.abort tx) (reject e))))
                     (catch :default e (.close idb) (reject e)))))))))
 
