@@ -85,6 +85,8 @@
        (.then (fn [v] (rf/dispatch [::loaded (if (some? v) v (.getItem js/localStorage storage-key)) :indexeddb])))
        (.catch (fn [e] (rf/dispatch [::load-failed (and (some? e) (= (.-message e) "storage-upgrade-blocked"))]))))))
 
+(def ^:private store-tail (atom (js/Promise.resolve nil)))
+
 (rf/reg-fx
  ::store
  (fn [{:keys [saved backend]}]
@@ -96,13 +98,19 @@
                       (.removeItem js/localStorage storage-key))
                     (rf/dispatch [::stored-ok])
                     (catch :default e (rf/dispatch [::store-failed (.-message e)]))))]
-     (if (= backend :local-storage)
-       (local!)
-       (-> (idb-request "readwrite" #(if text (.put % text storage-key) (.delete % storage-key)))
-           (.then (fn [_]
-                    (try (.removeItem js/localStorage storage-key) (catch :default _ nil))
-                    (rf/dispatch [::stored-ok])))
-           (.catch (fn [e] (rf/dispatch [::store-failed (or (.-message e) "IndexedDB への保存に失敗しました")]))))))))
+     ;; 同じ画面からの全帳簿 snapshot を発行順に commit する。
+     ;; open や transaction の完了順が逆転して古い帳簿で上書きしない。
+     (reset! store-tail
+             (-> @store-tail
+                 (.then (fn [_]
+                          (if (= backend :local-storage)
+                            (local!)
+                            (-> (idb-request "readwrite" #(if text (.put % text storage-key) (.delete % storage-key)))
+                                (.then (fn [_]
+                                         (try (.removeItem js/localStorage storage-key) (catch :default _ nil))
+                                         (rf/dispatch [::stored-ok])))))))
+                 ;; 失敗後も次の snapshot を処理できるよう、拒否をここで解消する。
+                 (.catch (fn [e] (rf/dispatch [::store-failed (or (.-message e) "IndexedDB への保存に失敗しました")]))))))))
 
 (rf/reg-fx
  ::download
