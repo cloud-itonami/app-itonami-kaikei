@@ -130,6 +130,16 @@ CORS and HTTP errors occur after transmission. This comparison covers only
 these fixed probes, one browser and loopback destinations; it does not prove
 complete egress isolation or qualify a production host.
 
+`test/origin-isolation-fixture.html` uses only the fixed synthetic store above.
+In an in-app browser on 2026-11-02, a page at loopback port 18785 wrote the
+synthetic sentinel; a second page on that same origin read it, while the same
+fixture at port 18786 reported an empty store. This confirms that URL paths do
+not isolate IndexedDB and illustrates a separate-origin candidate; it does
+not establish trusted hosting, protection against other code on that origin,
+owner authentication, or safe migration of existing data. Serve the repository
+on two loopback ports and open this fixture on each to reproduce. Synthetic
+test records can remain on the test origins.
+
 Important limits before any production use:
 
 - The fixture's parent creates a raw iframe; it does not use the canonical

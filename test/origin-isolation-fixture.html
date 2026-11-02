@@ -1,0 +1,7 @@
+<!doctype html><meta charset="utf-8"><title>Synthetic origin isolation</title><h1>Synthetic origin isolation</h1><p>Fixed synthetic IndexedDB only.</p><button id="write">Write sentinel</button><button id="read">Read sentinel</button><p id="result">ready</p>
+<script type="module">
+import {readFixture,compareAndSwapFixture} from '../experiments/local-ledger-fixture.mjs';
+const result=document.getElementById('result');
+document.getElementById('write').onclick=async()=>{try{const before=await readFixture(); const r=await compareAndSwapFixture(before.revision,'synthetic-isolation-sentinel'); result.textContent=r.ok?'write ok':'write conflict'}catch(e){result.textContent='write failed'}};
+document.getElementById('read').onclick=async()=>{try{const r=await readFixture();result.textContent=r.value===null?'empty':r.value==='synthetic-isolation-sentinel'?'synthetic sentinel visible':'other synthetic value'}catch(e){result.textContent='read failed'}};
+</script>
