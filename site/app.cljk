@@ -427,7 +427,7 @@
      :format (some-> (:format result) name)}))
 
 (defn- store-file-fx
-  "取り込みで行を足したときだけ、元のバイト列を IndexedDB に置く effect。"
+  "追加・訂正または警告のある取り込みの元のバイト列を IndexedDB に置く effect。"
   [db bytes]
   (let [id (::stored-file db)
         db (dissoc db ::stored-file)]

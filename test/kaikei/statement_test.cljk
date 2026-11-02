@@ -351,6 +351,95 @@
       (is (= ["a1"] (distinct (map :account-id (:statement-lines db)))))
       (is (= 1 (count (:statement-accounts db)))))))
 
+(deftest changed-statement-id-is-not-silently-discarded
+  (let [parsed (ingest/ingest-text (fixture "ofx-bank.ofx") {})
+        {original :db} (core/merge-import core/empty-db parsed)
+        same (core/merge-import original parsed)
+        changed (update-in parsed [:statement-lines 0 :amount] + 1)
+        result (core/merge-import original changed)
+        warning (first (:warnings result))]
+    (is (empty? (:warnings same)))
+    (is (= 1 (count (:warnings result))))
+    (is (string? warning))
+    (is (re-find #"同じ明細 ID の内容が変わっています" warning))
+    (is (= (:statement-lines original) (:statement-lines (:db result))))
+    (is (= 0 (:lines-added result)))
+    (is (= 3 (:lines-duplicates result)))
+    (testing "同じ取り込み内で重複 ID の内容が異なる場合も警告"
+      (let [one (first (:statement-lines parsed))
+            p (assoc parsed :statement-lines [one (update one :amount + 1)])
+            r (core/merge-import core/empty-db p)]
+        (is (= 1 (:lines-added r)))
+        (is (= 1 (:lines-duplicates r)))
+        (is (= 1 (count (:warnings r))))))))
+
+(deftest conflicting-replacement-must-not-delete-original
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        original {:account-id "a1" :uid "old" :date "2026-01-01" :amount -100 :description "original"}
+        replacement {:account-id "a1" :uid "new" :date "2026-01-02" :amount -200 :description "existing replacement"}
+        base {:currency "JPY" :statement-accounts [account]}
+        db (:db (core/merge-import core/empty-db (assoc base :statement-lines [original replacement])))
+        changed (assoc replacement :amount -250 :correct {:uid "old" :action :replace})
+        result (core/merge-import db (assoc base :statement-lines [changed]))]
+    (is (= (:statement-lines db) (:statement-lines (:db result))))
+    (is (= 0 (:lines-corrected result)))
+    (is (seq (:warnings result)))
+    (testing "同じ入力内で置換先の ID が衝突しても元の行を残す"
+      (let [db0 (:db (core/merge-import core/empty-db (assoc base :statement-lines [original])))
+            r (core/merge-import db0 (assoc base :statement-lines [(assoc replacement :correct {:uid "old" :action :replace}) changed]))]
+        (is (= #{"old" "new"} (set (map :uid (get-in r [:db :statement-lines])))))
+        (is (= 0 (:lines-corrected r)))
+        (is (seq (:warnings r)))))
+    (testing "衝突しない置換はこれまでどおり"
+      (let [db0 (:db (core/merge-import core/empty-db (assoc base :statement-lines [original])))
+            r (core/merge-import db0 (assoc base :statement-lines [(assoc replacement :correct {:uid "old" :action :replace})]))]
+        (is (= ["new"] (map :uid (get-in r [:db :statement-lines]))))
+        (is (= 1 (:lines-corrected r)))))))
+
+(deftest replacement-of-handled-line-does-not-create-new-open-line
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        old {:account-id "a1" :uid "old" :date "2026-01-01" :amount -100 :description "original"}
+        new {:account-id "a1" :uid "new" :date "2026-01-02" :amount -110 :description "replacement"
+             :correct {:uid "old" :action :replace}}
+        base {:currency "JPY" :statement-accounts [account]}
+        db (:db (core/merge-import core/empty-db (assoc base :statement-lines [old])))
+        id (:id (first (:statement-lines db)))]
+    (doseq [[label handled] [["posted" (assoc db :entries [{:id "e1" :origin {:format :statement :line-id id}}])]
+                             ["matched" (assoc-in db [:statement-lines 0 :match] {:entry-id "e1"})]]]
+      (testing label
+        (let [r (core/merge-import handled (assoc base :statement-lines [new]))]
+          (is (= (:statement-lines handled) (get-in r [:db :statement-lines])))
+          (is (= 0 (:lines-added r)))
+          (is (= 0 (:lines-corrected r)))
+          (is (seq (:warnings r)))
+          (let [dup (dissoc new :correct)
+                repeated (core/merge-import handled (assoc base :statement-lines [dup new]))]
+            (is (= (:statement-lines handled) (get-in repeated [:db :statement-lines])))
+            (is (= 0 (:lines-added repeated)))
+            (is (seq (:warnings repeated)))))))))
+
+(deftest warning-only-import-retains-original-file-for-review
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        old {:account-id "a1" :uid "old" :date "2026-01-01" :amount -100 :description "original"}
+        new {:account-id "a1" :uid "new" :date "2026-01-02" :amount -110 :description "replacement"
+             :correct {:uid "old" :action :replace}}
+        base {:currency "JPY" :statement-accounts [account]}
+        db (:db (core/merge-import core/empty-db (assoc base :statement-lines [old])))
+        id (:id (first (:statement-lines db)))
+        handled (assoc db :entries [{:id "e1" :origin {:format :statement :line-id id}}])
+        file {:name "correction.ofx" :sha256 "synthetic-hash" :size 123 :format "ofx"}
+        parsed (assoc base :statement-lines [new])
+        result (core/merge-import handled parsed :append {:file file})
+        stored (:db result)
+        again (core/merge-import stored parsed :append {:file file})]
+    (is (= 0 (:lines-added result)))
+    (is (= "f1" (:file-id result)))
+    (is (= [(assoc file :id "f1" :account-ids ["a1"])] (:files stored)))
+    (is (= (:statement-lines handled) (:statement-lines stored)))
+    (is (= "f1" (:file-id again)))
+    (is (= 1 (count (:files (:db again)))))
+    (is (seq (:warnings result)))))
+
 (deftest ledger-json-round-trip
   (let [{db :db} (st/post-preselected sample-db ["l1" "l2" "l3"])
         db (:db (st/post-line db "l4" {:type :exclude}))
@@ -384,3 +473,18 @@
 (deftest settlements-are-not-learned
   (let [{db :db} (st/post-preselected sample-db ["l1" "l2"])]
     (is (empty? (filter (fn [[[_ _ k] _]] (re-find #"消込" k)) (st/learn db))))))
+
+(deftest deletion-only-correction-retains-source-file
+  (let [account {:id "a1" :key "synthetic-bank" :kind :bank :name "test"}
+        old {:account-id "a1" :uid "old" :date "2026-01-01" :amount -100 :description "original"}
+        delete-line {:account-id "a1" :uid "delete-op" :date "2026-01-02" :amount 0
+                     :correct {:uid "old" :action :delete}}
+        base {:currency "JPY" :statement-accounts [account]}
+        db (:db (core/merge-import core/empty-db (assoc base :statement-lines [old])))
+        file {:name "delete.ofx" :sha256 "synthetic-delete" :size 123 :format "ofx"}
+        result (core/merge-import db (assoc base :statement-lines [delete-line]) :append {:file file})]
+    (is (= 1 (:lines-corrected result)))
+    (is (= 0 (:lines-added result)))
+    (is (= "f1" (:file-id result)))
+    (is (= [(assoc file :id "f1" :account-ids ["a1"])] (get-in result [:db :files])))
+    (is (empty? (get-in result [:db :statement-lines])))))
