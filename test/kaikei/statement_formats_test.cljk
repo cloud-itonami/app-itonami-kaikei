@@ -236,6 +236,12 @@
                                 {:format "statement-csv" :mapping {:date "日付" :description ["内容"]}})]
       (is (empty? (:statement-lines p)))
       (is (seq (:warnings p)))))
+  (testing "金額欄が空の明細は拒否し、数値の 0 は取り込む"
+    (let [p (ingest/ingest-text "日付,金額,内容\n2026/11/01,,欠落\n2026/11/02,0,ゼロ\n"
+                                {:format "statement-csv" :mapping {:date "日付" :amount "金額" :description ["内容"]}})]
+      (is (= [["2026-11-02" 0 "ゼロ"]] (rows p)))
+      (is (= 1 (:rejected p)))
+      (is (re-find #"金額がありません" (first (:warnings p))))))
   (testing "列の名前（画面の割り当てに出す）"
     (is (= ["#1" "#2" "#3"] (kaikei.compat.statement-csv/headers [["a" "b" "c"]] {:header? false})))))
 

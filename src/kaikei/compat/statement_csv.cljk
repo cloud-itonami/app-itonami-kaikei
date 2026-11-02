@@ -376,6 +376,7 @@
               ;; 日付が読めず、金額の欄も数でない行（カードの会員の行・合計の行）は黙って飛ばす
               :when (or date (some #(and (cell r %) (not (:error (core/parse-amount (cell r %) exp)))) [amount out in]))]
           (let [p* (common/first-problem (remove nil? [a o i b]))
+                no-amount? (not-any? #(cell r %) [amount out in])
                 v (cond
                     amount (let [n (:amount a)]
                              (cond
@@ -386,6 +387,7 @@
             (cond
               p* {:problem (:problem p*)}
               (nil? date) {:problem (str where ": 日付が読めません")}
+              no-amount? {:problem (str where ": 金額がありません")}
               (nil? v) {:problem (str where ": 入出金の区分 \"" dir "\" を読めません")}
               :else
               {:line (cond-> {:date date :amount v
