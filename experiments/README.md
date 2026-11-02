@@ -1,9 +1,19 @@
 # JUN-771: synthetic local-storage experiment
 
 This is **not wired into kaikei**, not a broker, not a production host, and
-must not handle real financial data. It uses only the fixed IndexedDB name
+must not handle real financial data. The first experiment uses the fixed IndexedDB name
 `kaikei-jun771-synthetic-fixture` and one fixed key; it never opens, reads,
 migrates or removes the existing `itonami.kaikei` database.
+
+`test/atomic-ledger-fixture.html` separately uses the fixed test database
+`kaikei-jun771-atomic-synthetic` with a fresh random key per run. It tests a
+revision-checked write across synthetic ledger and file stores, concurrent
+conflict rejection, rollback after queued writes, and file deletion in the same
+transaction. This models only one synthetic file per ledger and leaves its
+test records in the test origin. It is not a migration, production transaction,
+guest authentication or a solution for older clients that write without a
+revision check. Multi-file operations, quota, process termination, cross-tab
+lifecycle and integration with the real kaikei model remain unqualified.
 
 The experiment performs a read and a revision-checked update in one IndexedDB
 transaction. The successful result is returned only on transaction completion;
