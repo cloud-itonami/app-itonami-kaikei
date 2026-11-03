@@ -147,3 +147,30 @@
     (is (not-any? fn? (nodes tree)))
     (is (has-text? tree "経費・買掛のファイル"))
     (is (has-text? tree "transactionID,reportID,date,merchant,amount_cents"))))
+
+(deftest statement-file-only-book-remains-accessible
+  (let [data (assoc core/empty-db
+                    :statement-accounts [{:id "a1" :name "合成口座" :kind :bank}]
+                    :files [{:id "f1" :name "unresolved.ofx" :sha256 "synthetic" :size 1 :account-ids ["a1"]}])
+        tree (render data view/initial-ui view/ssr-handlers)
+        buttons (filter #(and (vector? %) (= :button (first %)) (map? (second %))) (nodes tree))
+        button-for (fn [label] (first (filter #(some #{label} %) buttons)))
+        statements (render data (assoc view/initial-ui :mode :statements) view/ssr-handlers)]
+    (is (not (:disabled (second (button-for "書き出す")))))
+    (is (not (:disabled (second (button-for "すべて消去")))))
+    (is (has-text? tree "明細"))
+    (is (has-text? statements "unresolved.ofx"))))
+
+(deftest original-file-shows-persistent-review-notice
+  (let [data (assoc core/empty-db
+                    :statement-accounts [{:id "a1" :name "合成口座" :kind :bank}]
+                    :files [{:id "f1" :name "review.ofx" :sha256 "synthetic" :size 1
+                             :account-ids ["a1"] :review-required true}])
+        tree (render data (assoc view/initial-ui :mode :statements) view/ssr-handlers)]
+    (is (has-text? tree "取込時に要確認"))))
+
+(deftest import-rejections-name-the-correct-record-type
+  (is (has-text? (view/import-result {:format :paypay-merchant-csv :rejected 5 :lines-added 0} view/ssr-handlers)
+                 "読めなかった明細 5 行"))
+  (is (has-text? (view/import-result {:format :yayoi :rejected 2 :added 0} view/ssr-handlers)
+                 "読めなかった仕訳 2 件")))

@@ -13,6 +13,12 @@
 {:title "kaikei — 会計帳簿・請求書・明細の消込（MF・freee・弥生・QuickBooks・Xero 互換）"
  :description "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作る。請求書を作って適格請求書の記載事項を確かめ、売掛金・買掛金の仕訳として計上する。自分で落とした銀行・カードの明細（OFX・各社の明細 CSV）を取り込み、請求書の消込と仕訳の候補を確かめてから計上する。データは送信されず、この端末のブラウザの中（IndexedDB）にだけ残る。"
  :page {:ns kaikei.page :fn document}
+ ;; Stage the exact canonical broker. It is not loaded and grants no operations.
+ :client-runtime {:repo "kotoba-lang/kotoba"
+                  :sha "86fce2b078dfcab7d58061afd53c716cc574f85c"
+                  :files [{:from "lib/kotoba.wasmWebcomponent/src/kotoba-client-runtime.js"
+                           :to "runtime/kotoba-client-runtime.js"
+                           :sha256 "0d8ed12a795fdf46de32ac01c0675adec9f22df64f24769a4d4a960d6a345ac5"}]}
  :vendor ["react.production.min.js" "react-dom.production.min.js"
           "scittle.js" "scittle.reagent.js" "scittle.re-frame.js"]
  :external [{:repo "kotoba-lang/text" :sha "bc551a3ecc68e551ba1dd2fcb22d5f1b8dd7805d"
@@ -38,6 +44,7 @@
            {:from "src/kaikei/compat/freee.cljk" :to "kaikei/compat/freee.cljs"}
            {:from "src/kaikei/compat/ofx.cljk" :to "kaikei/compat/ofx.cljs"}
            {:from "src/kaikei/compat/statement_csv.cljk" :to "kaikei/compat/statement_csv.cljs"}
+           {:from "src/kaikei/compat/paypay_merchant.cljk" :to "kaikei/compat/paypay_merchant.cljs"}
            {:from "src/kaikei/compat/zengin.cljk" :to "kaikei/compat/zengin.cljs"}
            {:from "src/kaikei/compat/ramp.cljk" :to "kaikei/compat/ramp.cljs"}
            {:from "src/kaikei/compat/brex.cljk" :to "kaikei/compat/brex.cljs"}

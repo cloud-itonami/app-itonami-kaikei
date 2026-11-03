@@ -187,6 +187,17 @@
 ;; ───────── 汎用の CSV（判断 3） ─────────
 
 (deftest mapped-csv-presets
+  (testing "PayPay の公開項目から作った合成 CSV（実ファイルの見出しは未確認）"
+    (let [csv "取引日,出金金額（円）,入金金額（円）,取引内容,取引先,取引番号\n2026/11/01 12:30,1200,,支払い,店舗,synthetic-1\n2026/11/02 09:00,,1200,返金,店舗,synthetic-2\n"
+          p (ingest/ingest-text csv {})
+          result (core/merge-import core/empty-db p :append)
+          again (core/merge-import (:db result) p :append)]
+      (is (= [["2026-11-01" -1200 "支払い 店舗"] ["2026-11-02" 1200 "返金 店舗"]] (rows p)))
+      (is (= ["synthetic-1" "synthetic-2"] (mapv :reference (:statement-lines p))))
+      (is (= 2 (count (get-in again [:db :statement-lines]))))
+      (is (some #(re-find #"一次資料で確かめていません" %) (:warnings p)))
+      (is (some #(re-find #"給与受取の自動送金" %) (:warnings p)))
+      (is (some #(re-find #"カード明細との重複" %) (:warnings p)))))
   (testing "確かめた型（三菱UFJ BizSTATION）: 見出しで選び、和暦・入払区分で読む。警告なし"
     (let [p (ingest/ingest-bytes (fixture-bytes "mufg-biz-nyuushukkin.csv") {})]
       (is (= :statement-csv (:format p)))
@@ -216,6 +227,23 @@
       (is (= "statement-csv:custom:bank" (:key (first (:statement-accounts p)))))))
   (testing "割り当ての無い汎用 CSV は取り込まない"
     (is (re-find #"列を割り当てて" (first (:warnings (ingest/ingest-text "a,b\n1,2\n" {:format "statement-csv"}))))))
+  (testing "保存された割り当ての金額列が別のカード明細に無い場合、0 円として取り込まない"
+    (let [p (ingest/ingest-text "日付,別の金額\n2026/11/01,1500\n"
+                                {:format "statement-csv" :mapping {:date "日付" :amount "金額" :kind :card}})]
+      (is (empty? (:statement-lines p)))
+      (is (empty? (:statement-accounts p)))
+      (is (re-find #"見つからない列.*金額" (first (:warnings p))))))
+  (testing "金額の割り当てが無ければ取り込まない"
+    (let [p (ingest/ingest-text "日付,内容\n2026/11/01,購入\n"
+                                {:format "statement-csv" :mapping {:date "日付" :description ["内容"]}})]
+      (is (empty? (:statement-lines p)))
+      (is (seq (:warnings p)))))
+  (testing "金額欄が空の明細は拒否し、数値の 0 は取り込む"
+    (let [p (ingest/ingest-text "日付,金額,内容\n2026/11/01,,欠落\n2026/11/02,0,ゼロ\n"
+                                {:format "statement-csv" :mapping {:date "日付" :amount "金額" :description ["内容"]}})]
+      (is (= [["2026-11-02" 0 "ゼロ"]] (rows p)))
+      (is (= 1 (:rejected p)))
+      (is (re-find #"金額がありません" (first (:warnings p))))))
   (testing "列の名前（画面の割り当てに出す）"
     (is (= ["#1" "#2" "#3"] (kaikei.compat.statement-csv/headers [["a" "b" "c"]] {:header? false})))))
 
@@ -235,3 +263,61 @@
       (let [back (:db (core/merge-import core/empty-db (ingest/ingest-text (kaikei.compat.native/write db) {})))]
         (is (= (:files db) (:files back)))
         (is (= (map :file-id (:statement-lines db)) (map :file-id (:statement-lines back))))))))
+
+(deftest paypay-merchant-instant-reconciliation
+  (let [header "決済番号,加盟店ID,屋号,店舗ID,店舗名,端末番号/PosID,取引ステータス,取引日時,取引金額,レシート番号,支払い方法,マーチャント決済ID,支払い詳細\n"
+        data (str header "P1,M1,店舗,S1,店,1,取引完了,2020-01-30 23:58:30,150,,残高,A1,\n"
+                  "P1,M1,店舗,S1,店,1,返金完了,2020-01-31 01:00:00,-100,,残高,R1,\n"
+                  "P2,M1,店舗,S1,店,1,取引失敗,2020-01-31 02:00:00,200,,残高,A2,\n"
+                  "P3,M1,店舗,S1,店,1,取引完了,2020-01-31 02:00:00,-10,,残高,A3,\n")
+        p (ingest/ingest-bytes (:bytes (enc/encode data "shift_jis")) {})
+        merged (core/merge-import core/empty-db p :append)
+        repeated (core/merge-import (:db merged) p :append)]
+    (is (= :paypay-merchant-csv (:format p)))
+    (is (= [["2020-01-30" 150 "取引完了 A1"]] (rows p)))
+    (is (= 3 (:rejected p)))
+    (is (= 1 (count (get-in repeated [:db :statement-lines]))))
+    (is (= 1 (count (distinct (map :uid (:statement-lines p))))))
+    (is (= (pr-str ["P1" "取引完了" "A1"]) (:uid (first (:statement-lines p)))))
+    (is (some #(re-find #"個人の PayPay 支出" %) (:warnings p)))))
+
+(deftest paypay-instant-refunds-with-ambiguous-identity-are-held
+  (let [header "決済番号,加盟店ID,屋号,店舗ID,店舗名,端末番号/PosID,取引ステータス,取引日時,取引金額,レシート番号,支払い方法,マーチャント決済ID,支払い詳細\n"
+        row "P,M,店,S,店,1,返金完了,2020-01-30 12:00:00,-100,,残高,R,\n"
+        p (ingest/ingest-text (str header row row) {})
+        first-db (:db (core/merge-import core/empty-db p :append))
+        repeated (core/merge-import first-db p :append)]
+    (is (= 2 (:rejected p)))
+    (is (empty? (:statement-lines p)))
+    (is (= 2 (count (filter #(re-find #"識別子の一意性が未確認" %) (:warnings p)))))
+    (is (empty? (get-in repeated [:db :statement-lines])))
+    (is (= 1 (count (get-in repeated [:db :statement-accounts]))))))
+
+(deftest paypay-merchant-separates-merchants-and-refuses-unknowns
+  (let [header "決済番号,加盟店ID,屋号,店舗ID,店舗名,端末番号/PosID,取引ステータス,取引日時,取引金額,レシート番号,支払い方法,マーチャント決済ID,支払い詳細\n"
+        data (str header "P,M1,店舗,S1,店,1,取引完了,2020-01-30 12:00:00,100,,残高,A,\n"
+                  "P,M2,店舗,S2,店,2,取引完了,2020-01-30 12:00:00,100,,残高,A,\n"
+                  "P,M2,店舗,S2,店,2,保留,2020-01-30 12:00:00,100,,残高,B,\n"
+                  "P,M2,店舗,S2,店,2,返金完了,2020-01-30 12:00:00,-100,,残高,,\n")
+        parsed (ingest/ingest-text data {})
+        merged (:db (core/merge-import core/empty-db parsed :append))]
+    (is (= 2 (count (:statement-accounts parsed))))
+    (is (= 2 (:rejected parsed)))
+    (is (= 2 (count (:statement-lines merged))))
+    (is (= 2 (count (distinct (map :account-id (:statement-lines merged))))))))
+
+(deftest paypay-merchant-captured-reconciliation
+  (let [header "orderId,merchantId,brandName,storeId,storeName,terminalId,transactionStatus,acceptedAt,amount,orderReceiptNumber,methodOfPayment,merchantPaymentId,paymentDetails\n"
+        data (str header "P,M,店,S,店,1,AUTHORIZED,2020-01-30T00:00:00+09:00,480,,wallet,AUTH,\n"
+                  "P,M,店,S,店,1,COMPLETED,2020-01-30T00:00:26+09:00,480,,wallet,CAP,\n"
+                  "P,M,店,S,店,1,REFUNDED,2020-01-30T16:53:25+09:00,-480,,wallet,REF,\n"
+                  "Q,M,店,S,店,1,REFUNDED,2020-01-31T00:00:00+09:00,250,,wallet,REF2,\n"
+                  "R,M,店,S,店,1,CANCELED,2020-01-31T00:00:00+09:00,300,,wallet,CANCEL,\n")
+        p (ingest/ingest-bytes (:bytes (enc/encode data "shift_jis")) {})
+        first-db (:db (core/merge-import core/empty-db p :append))
+        second-db (:db (core/merge-import first-db p :append))]
+    (is (= :paypay-merchant-csv (:format p)))
+    (is (= [480 -480 -250] (mapv :amount (:statement-lines p))))
+    (is (= 2 (:rejected p)))
+    (is (= 3 (count (:statement-lines second-db))))
+    (is (= 3 (count (distinct (map :uid (:statement-lines p))))))))

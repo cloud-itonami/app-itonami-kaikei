@@ -192,7 +192,8 @@
     (assoc ::store {:backend (:backend db')
                     :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db')))
                                      (seq (:invoices (:data db'))) (seq (:business (:data db')))
-                                     (seq (:statement-lines (:data db'))) (seq (:rules (:data db'))))
+                                     (seq (:statement-lines (:data db'))) (seq (:rules (:data db')))
+                                     (seq (:statement-accounts (:data db'))) (seq (:files (:data db'))))
                              (saved-state db'))})))
 
 (defn- reg-data-event
@@ -285,12 +286,13 @@
       (and (= :statement-csv (:format result)) (empty? (:statement-lines result)) (empty? (:statement-accounts result)))))
 
 (defn- file-meta [bytes filename sha256 result]
-  (when (and sha256 (seq (:statement-lines result)))
+  (when (and sha256 (or (seq (:statement-lines result))
+                        (and (seq (:statement-accounts result)) (pos? (or (:rejected result) 0)))))
     {:name filename :sha256 sha256 :size (.-length bytes) :imported-at (now-iso)
      :format (some-> (:format result) name)}))
 
 (defn- store-file-fx
-  "取り込みで行を足したときだけ、元のバイト列を IndexedDB に置く effect。"
+  "追加・訂正または警告のある取り込みの元のバイト列を IndexedDB に置く effect。"
   [db bytes]
   (let [id (::stored-file db)
         db (dissoc db ::stored-file)]

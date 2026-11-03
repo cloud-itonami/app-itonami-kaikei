@@ -299,6 +299,11 @@
     :signature ["操作日(年)" "操作日(月)" "操作日(日)" "摘要" "お支払金額" "お預り金額" "残高"]
     :mapping {:date-parts ["操作日(年)" "操作日(月)" "操作日(日)"] :out "お支払金額" :in "お預り金額"
               :balance "残高" :reference "取引順番号" :description ["摘要"] :kind :bank}}
+   {:id "paypay-wallet" :verified? false :label "PayPay 取引履歴 CSV（個人・見出し未確認）"
+    :source "PayPay ヘルプ c0447 の項目一覧（実際の CSV の見出しは未確認）"
+    :signature ["取引日" "出金金額（円）" "入金金額（円）" "取引内容" "取引先" "取引番号"]
+    :mapping {:date "取引日" :out "出金金額（円）" :in "入金金額（円）"
+              :reference "取引番号" :description ["取引内容" "取引先"] :counterparty "取引先" :kind :bank}}
    {:id "yucho-biz" :verified? false :label "ゆうちょBizダイレクト 入出金明細 CSV"
     :source "ゆうちょ銀行 bizdirect_18.pdf §18.4（列の名前だけ。文字コードと日付の形は未確認）"
     :signature ["取引日" "入出金区分" "取引内容" "取引金額"]
@@ -345,7 +350,7 @@
                                                                       "-" (subs v 2 4) "-" (subs v 4 6)))))))
     :else (common/parse-ordered-date (cell rec date) order)))
 
-(defn read-mapped
+(defn- read-mapped-valid
   "割り当て（mapping）で CSV の行を読む。opts の :currency は帳簿の通貨。"
   [rows mapping {:keys [currency] :or {currency "JPY"}}]
   (let [{:keys [skip-rows header? amount out in direction invert? description counterparty balance reference kind preset]
@@ -371,6 +376,7 @@
               ;; 日付が読めず、金額の欄も数でない行（カードの会員の行・合計の行）は黙って飛ばす
               :when (or date (some #(and (cell r %) (not (:error (core/parse-amount (cell r %) exp)))) [amount out in]))]
           (let [p* (common/first-problem (remove nil? [a o i b]))
+                no-amount? (not-any? #(cell r %) [amount out in])
                 v (cond
                     amount (let [n (:amount a)]
                              (cond
@@ -381,6 +387,7 @@
             (cond
               p* {:problem (:problem p*)}
               (nil? date) {:problem (str where ": 日付が読めません")}
+              no-amount? {:problem (str where ": 金額がありません")}
               (nil? v) {:problem (str where ": 入出金の区分 \"" dir "\" を読めません")}
               :else
               {:line (cond-> {:date date :amount v
@@ -395,6 +402,24 @@
               :currency currency :mapping mapping :origin {:format :statement-csv}}]
     (update (finish "statement-csv" acct candidates currency) :warnings
             (fn [ws] (cond->> ws
+                       (= preset "paypay-wallet")
+                       (cons "PayPay の履歴には処理中・失敗・取消などの取引や給与受取の自動送金が含まれません。PayPayカードの取引が含まれる場合もあるため、カード明細との重複やチャージ・返金を確認してください。")
                        (and p (not (:verified? p)))
                        (cons (str "型「" (:label p) "」の列は一次資料で確かめていません（" (:source p) "）。"
                                   "取り込んだ日付・金額・向きを確かめてください")))))))
+
+(defn read-mapped
+  "存在しない列や必須の割り当てがあれば、金額 0 の明細を作らず拒否する。"
+  [rows mapping opts]
+  (let [names (set (column-names rows mapping))
+        date-cols (or (seq (:date-parts mapping)) (some-> (:date mapping) vector))
+        amount-cols (remove nil? [(:amount mapping) (:out mapping) (:in mapping)])
+        columns (remove nil? (concat date-cols amount-cols (:description mapping)
+                                     [(:counterparty mapping) (:balance mapping) (:reference mapping)
+                                      (get-in mapping [:direction :column])]))
+        missing (vec (remove names columns))]
+    (if (or (empty? date-cols) (empty? amount-cols) (seq missing))
+      {:format :statement-csv :accounts [] :statement-accounts [] :statement-lines []
+       :rejected 0 :warnings [(str "CSV の列の割り当てを確認してください"
+                                  (when (seq missing) (str "（見つからない列: " (text/join "、" missing) "）")))]}
+      (read-mapped-valid rows mapping opts))))

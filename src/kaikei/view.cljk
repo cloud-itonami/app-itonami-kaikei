@@ -184,7 +184,8 @@
    [:journal "仕訳帳"] [:accounts "勘定科目"] [:invoices "請求書"] [:statements "明細"]])
 
 (defn- empty-book? [data]
-  (and (empty? (:entries data)) (empty? (:invoices data)) (empty? (:statement-lines data))))
+  (and (empty? (:entries data)) (empty? (:invoices data)) (empty? (:statement-lines data))
+       (empty? (:statement-accounts data)) (empty? (:files data))))
 
 (defn toolbar [{:keys [data ui]} h]
   (let [empty? (empty-book? data)]
@@ -353,7 +354,10 @@
               "を取り込みました。"
               (when (pos? (or duplicates 0)) (str "同じ仕訳 " duplicates " 件は飛ばしました。"))
               (when (pos? (or invoices-duplicates 0)) (str "同じ請求書 " invoices-duplicates " 件は飛ばしました。"))
-              (when (pos? (or rejected 0)) (str "読めなかった仕訳 " rejected " 件は取り込んでいません。"))
+              (when (pos? (or rejected 0))
+                (if (= :statements (:content (ingest/format-by-id (some-> format name))))
+                  (str "読めなかった明細 " rejected " 行は取り込んでいません。")
+                  (str "読めなかった仕訳 " rejected " 件は取り込んでいません。")))
               (when (pos? (or invoices-rejected 0)) (str "読めなかった請求書 " invoices-rejected " 件は取り込んでいません。"))
               (when (pos? (or invoices-dropped 0))
                 (str "通貨が変わったので、帳簿にあった請求書 " invoices-dropped " 件は残せませんでした。"))
@@ -1229,7 +1233,8 @@
      [:p {:class "kk-help"}
       "ファイル選択で取り込んだ明細は、元のバイト列のまま、この端末に残します（SHA-256 で同じものか確かめられます）。"
       "受け取ったデータそのものの保存（電子帳簿保存法 一問一答【電子取引関係】問 36）を助けるだけで、要件を満たすとは言いません。"
-      "ブラウザの保存は消えることがあるので、書き出して手元にも残してください。"]
+      "ブラウザの保存は消えることがあるので、書き出して手元にも残してください。"
+      "「取込時に要確認」は取り込み時に警告があった記録です。内容を確認してください。訂正は自動で再処理されません。"]
      (if (empty? fs)
        [:p "まだありません（貼り付けた明細は残しません）。"]
        [:div {:class "kk-table-wrap"}
@@ -1239,7 +1244,7 @@
                   [:th {:scope "col"} [:span {:class "kk-visually-hidden"} "操作"]]]]
          (into [:tbody]
                (for [f fs]
-                 [:tr [:th {:scope "row"} (:name f)] [:td (:imported-at f)]
+                 [:tr [:th {:scope "row"} (:name f) (when (:review-required f) [:span "（取込時に要確認）"])] [:td (:imported-at f)]
                   [:td [:code {:title (:sha256 f)} (str (subs (str (:sha256 f)) 0 (min 16 (count (str (:sha256 f))))) "…")]]
                   [:td {:class "kk-num"} (:size f)]
                   [:td {:class "kk-num"} (count (filter #(= (:id f) (:file-id %)) (:statement-lines data)))]
