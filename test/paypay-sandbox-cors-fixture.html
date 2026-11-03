@@ -1,0 +1,15 @@
+<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="frame-src 'none'; connect-src https://apigw.sandbox.paypay.ne.jp"><title>PayPay sandbox CORS synthetic probe</title><h1>PayPay sandbox CORS synthetic probe</h1><p>After approval this test contacts PayPay sandbox using a synthetic ID and intentionally invalid authorization. No account credentials or financial data are used.</p><p id="state">preparing</p><main></main>
+<script type="module">
+import {createClientConsentHost,createClientOperationBroker,verifyClientArtifact,mountRestrictedClientApp} from './runtime.js';
+const url='https://apigw.sandbox.paypay.ne.jp/v2/codes/payments/KAIKEI_CORS_SYNTHETIC'; const op={capability:'test/sandbox-read',service:'paypay-sandbox-test',operation:'read',consent:'each-operation','data-categories':['synthetic-test-id'],endpoint:{origin:'https://apigw.sandbox.paypay.ne.jp',method:'GET',path:'/v2/codes/payments/KAIKEI_CORS_SYNTHETIC'}};
+const runtime={schema:'kotoba.app.client-runtime.v1',target:'browser',profile:'restricted-wasm-v1',entry:'app.html','local-state':{adapter:'localstorage',schema:'test.state.v1',version:1},workers:[],operations:[op]};
+const state=document.querySelector('#state'); const count=()=>performance.getEntriesByType('resource').filter(e=>e.name===url).length; new PerformanceObserver(()=>state.textContent='HTTP resource entries '+count()).observe({type:'resource',buffered:true});
+try {
+const consentHost=createClientConsentHost();
+const broker=createClientOperationBroker({runtime,requestedCapabilities:[op.capability],approvedOperations:[op],hostSupportedOperations:[[op.capability,op.service,op.operation]],consentHost});
+const guest=`<button id="go">Request synthetic sandbox lookup</button><p id="result">waiting</p><script>let port, n=0;addEventListener('message', e=>{if(e.data.protocol!=='kotoba.client.host.v1'||e.ports.length!==1)return;port=e.ports[0];port.onmessage=e=>document.getElementById('result').textContent=e.data.ok?'approved HTTP status '+e.data.status:'denied '+e.data.error;});document.getElementById('go').onclick=()=>{port.postMessage({protocol:'kotoba.client.operation.v1',id:'request-'+(++n),selector:{capability:'test/sandbox-read',service:'paypay-sandbox-test',operation:'read'},payload:{input:'https://apigw.sandbox.paypay.ne.jp/v2/codes/payments/KAIKEI_CORS_SYNTHETIC',init:{headers:{Authorization:'hmac OPA-Auth:TEST:INVALID'}}}})};<\/script>`;
+const bytes=new TextEncoder().encode(guest), digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),x=>x.toString(16).padStart(2,'0')).join('');
+const artifact=await verifyClientArtifact(bytes,{revision:'1111111111111111111111111111111111111111',sha256:digest,'max-bytes':1048576});
+await mountRestrictedClientApp({artifact,container:document.querySelector('main'),broker});state.textContent='HTTP resource entries '+count();
+}catch(e){state.textContent='SETUP FAILED '+e.message}
+</script>

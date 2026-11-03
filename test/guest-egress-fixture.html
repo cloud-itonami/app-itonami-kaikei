@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="frame-src 'none'"><title>Synthetic guest egress</title><h1>Synthetic guest egress</h1><main></main><p id="status">preparing</p>
+<script type="module">
+import {verifyClientArtifact,mountRestrictedClientApp} from './runtime.js';
+const guest=`<p id="status">starting</p><script>
+(async()=>{ const target='http://127.0.0.1:18783/'; const r={};
+try { await fetch(target+'fetch?synthetic=1'); r.fetch='sent'; } catch(e) {r.fetch='blocked'}
+try { r.beacon=navigator.sendBeacon(target+'beacon?synthetic=1','synthetic'); } catch(e) {r.beacon='blocked'}
+r.image=await new Promise(resolve=>{const i=new Image();i.onload=()=>resolve('loaded');i.onerror=()=>resolve('blocked');i.src=target+'image?synthetic=1';setTimeout(()=>resolve('timeout'),2000)});
+r.websocket=await new Promise(resolve=>{try{const w=new WebSocket('ws://127.0.0.1:18783/socket?synthetic=1');w.onopen=()=>{w.close();resolve('open')};w.onerror=()=>resolve('blocked');setTimeout(()=>resolve('timeout'),2000)}catch(e){resolve('blocked')}});
+r.worker=await new Promise(resolve=>{try{const js="fetch('http://127.0.0.1:18783/worker?synthetic=1').then(()=>postMessage('sent')).catch(()=>postMessage('blocked'))";const w=new Worker(URL.createObjectURL(new Blob([js],{type:'text/javascript'})));w.onmessage=e=>{w.terminate();resolve(e.data)};w.onerror=()=>resolve('failed');setTimeout(()=>{w.terminate();resolve('timeout')},2000)}catch(e){resolve('failed')}});
+document.getElementById('status').textContent=JSON.stringify(r);
+})();<\/script>`;
+try {const bytes=new TextEncoder().encode(guest),digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');const artifact=await verifyClientArtifact(bytes,{revision:'1111111111111111111111111111111111111111',sha256:digest,'max-bytes':1048576});await mountRestrictedClientApp({artifact,container:document.querySelector('main'),broker:{invoke:async()=>{throw Error('denied')}}});document.getElementById('status').textContent='mounted'} catch(e) { document.getElementById('status').textContent='SETUP FAILED: '+e.message }
+</script>

@@ -5,7 +5,8 @@
 ;; DOM を直接いじるのは effect（保存・ダウンロード・ファイル読み込み）の中だけ。
 ;;
 ;; ネットワークは使わない。fetch も XHR も無い。保存はこの端末の IndexedDB
-;; （itonami.kaikei の state ストア）で、使えなければ localStorage に落とす。
+;; （itonami.kaikei の state ストア）。読み取り失敗時は空帳簿と決めつけず編集を止める。
+;; IndexedDB に保存がない場合は旧版の localStorage を読む。書き込み失敗も画面に出す。
 ;; 1 年分の仕訳帳は数 MB の文字列になり（実測: 5,000 仕訳・1 万行で約 270 万字）、
 ;; localStorage の上限（ブラウザごとに違い、同じオリジンの mihari・dandori と
 ;; 分け合う）では足りないことがあるため。読み書きの失敗は画面に出す。
@@ -16,6 +17,7 @@
   (:require [clojure.edn :as edn]
             [reagent.dom :as rdom]
             [re-frame.core :as rf]
+            [re-frame.db :as rf-db]
             [kotoba.lang.text :as text]
             [kaikei.core :as core]
             [kaikei.ingest :as ingest]
@@ -26,6 +28,7 @@
             [kaikei.view :as view]))
 
 (def storage-key "itonami.kaikei.v1")
+(def ^:private revision-key "itonami.kaikei.v1.revision")
 
 ;; ───────── effects / coeffects ─────────
 
@@ -41,13 +44,19 @@
   (js/Promise.
    (fn [resolve reject]
      (try
-       (let [req (.open js/indexedDB idb-name 2)]
+       (let [req (.open js/indexedDB idb-name 2)
+             blocked? (atom false)]
          (set! (.-onupgradeneeded req)
                (fn [_]
-                 (let [idb (.-result req)]
-                   (when-not (.contains (.-objectStoreNames idb) idb-store) (.createObjectStore idb idb-store))
-                   (when-not (.contains (.-objectStoreNames idb) files-store) (.createObjectStore idb files-store)))))
-         (set! (.-onsuccess req) (fn [_] (resolve (.-result req))))
+                 (if @blocked?
+                   (.abort (.-transaction req))
+                   (let [idb (.-result req)]
+                     (when-not (.contains (.-objectStoreNames idb) idb-store) (.createObjectStore idb idb-store))
+                     (when-not (.contains (.-objectStoreNames idb) files-store) (.createObjectStore idb files-store))))))
+         ;; blocked 後も要求はブラウザ内で待機する。後から成功した場合は接続を閉じ、
+         ;; 遅れて upgrade が始まった場合は上で取り消す。
+         (set! (.-onblocked req) (fn [_] (reset! blocked? true) (reject (js/Error. "storage-upgrade-blocked"))))
+         (set! (.-onsuccess req) (fn [_] (if @blocked? (.close (.-result req)) (resolve (.-result req)))))
          (set! (.-onerror req) (fn [_] (reject (.-error req)))))
        (catch :default e (reject e))))))
 
@@ -60,23 +69,102 @@
                  (fn [resolve reject]
                    (let [tx (.transaction idb store mode)
                          req (f (.objectStore tx store))]
-                     (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve (.-result req))))
-                     (set! (.-onerror tx) (fn [_] (.close idb) (reject (.-error tx))))))))))))
+                     (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve (if (vector? req) (mapv #(.-result %) req) (.-result req)))))
+                     (set! (.-onerror tx) (fn [_] (.close idb) (reject (.-error tx))))
+                     ;; 明示的な abort は error event を伴わない場合がある。
+                     (set! (.-onabort tx) (fn [_] (.close idb) (reject (or (.-error tx) (js/Error. "IndexedDB transaction aborted")))))))))))))
 
 (defn- local-get [] (try (.getItem js/localStorage storage-key) (catch :default _ nil)))
+
+;; 起動時に IndexedDB が空で読み込んだ旧データだけが移行後の消去対象。
+;; それ以外の旧データは別タブの編集かもしれないため残す。
+(def ^:private legacy-migration-source (atom nil))
+(def ^:private idb-expected (atom ::unloaded))
+(def ^:private idb-revision (atom ::unloaded))
+(def ^:private idb-conflict? (atom false))
+
+(defn- valid-revision? [v]
+  (or (nil? v) (and (number? v) (js/Number.isSafeInteger v) (pos? v))))
 
 (rf/reg-fx
  ::load
  (fn [_]
    ;; IndexedDB に無く localStorage にだけあるもの（前の版の保存）は、そちらを読む。
    ;; 次の保存で IndexedDB へ移り、localStorage の分は消える。
-   (-> (idb-request "readonly" #(.get % storage-key))
-       (.then (fn [v] (rf/dispatch [::loaded (or v (local-get)) :indexeddb])))
-       (.catch (fn [_] (rf/dispatch [::loaded (local-get) :local-storage]))))))
+   (-> (idb-request "readonly" #(vector (.get % storage-key) (.get % revision-key)))
+       ;; 旧保存領域が読めない場合は「旧データなし」と判断しない。
+       ;; 既存 IndexedDB がある場合は旧領域を読む必要はない。
+       (.then (fn [[v revision]]
+                (when-not (valid-revision? revision) (throw (js/Error. "invalid ledger revision")))
+                (let [legacy (if (some? v) (local-get) (.getItem js/localStorage storage-key))]
+                  (reset! idb-expected (when (some? v) v))
+                  (reset! idb-revision revision)
+                  (reset! legacy-migration-source (when (nil? v) legacy))
+                  (rf/dispatch [::loaded (if (some? v) v legacy) :indexeddb (and (some? v) (some? legacy))]))))
+       (.catch (fn [e] (rf/dispatch [::load-failed (and (some? e) (= (.-message e) "storage-upgrade-blocked"))]))))))
+
+(def ^:private store-tail (atom (js/Promise.resolve nil)))
+;; 元ファイルを含む保存が失敗した後は、欠けたデータを後続の帳簿だけの保存で確定しない。
+(def ^:private file-write-failed? (atom false))
+
+(defn- idb-write-with-file [text {:keys [put delete clear?]} clear-snapshot]
+  (-> (idb-open)
+      (.then (fn [idb]
+               (js/Promise.
+                (fn [resolve reject]
+                  (try
+                    (when (and clear-snapshot (not= clear-snapshot (:data @rf-db/app-db)))
+                      (throw (js/Error. "消去中に帳簿が変更されました。消去を中止しました")))
+                    (let [tx (.transaction idb #js [idb-store files-store] "readwrite")
+                          state (.objectStore tx idb-store)
+                          files (.objectStore tx files-store)
+                          changed? (atom false)
+                          conflict? (atom false)
+                          overflow? (atom false)
+                          next-revision (atom nil)
+                          cleanup (fn [] (when clear-snapshot (remove-watch rf-db/app-db ::clear-guard)) (.close idb))]
+                      (when clear-snapshot
+                        (add-watch rf-db/app-db ::clear-guard
+                                   (fn [_ _ _ next-db]
+                                     (when (not= clear-snapshot (:data next-db))
+                                       (reset! changed? true)
+                                       (try (.abort tx) (catch :default _ nil))))))
+                      (set! (.-oncomplete tx) (fn [_] (cleanup) (reset! idb-expected text) (reset! idb-revision @next-revision) (resolve nil)))
+                      (set! (.-onabort tx) (fn [_] (cleanup)
+                                              (reject (cond @changed? (js/Error. "消去中に帳簿が変更されました。消去を中止しました")
+                                                            @overflow? (js/Error. "帳簿の更新番号が上限に達しました。控えを保存して復旧方法を確認してください")
+                                                            @conflict? (js/Error. "別のタブで帳簿が更新されました。控えを保存してから再読み込みしてください")
+                                                            :else (or (.-error tx) (js/Error. "IndexedDB transaction aborted"))))))
+                      (try
+                        (let [read (.get state storage-key)
+                              rev-read (.get state revision-key)]
+                          (set! (.-onsuccess rev-read)
+                                (fn [_]
+                                  (let [current (.-result read)
+                                        current (when (some? current) current)
+                                        revision (.-result rev-read)
+                                        revision (when (some? revision) revision)]
+                                    (if (and (= revision @idb-revision) (= revision js/Number.MAX_SAFE_INTEGER)
+                                             (= current @idb-expected))
+                                      (do (reset! overflow? true) (reset! idb-conflict? true) (.abort tx))
+                                      (if (or (= @idb-expected ::unloaded) (not= current @idb-expected)
+                                            (= @idb-revision ::unloaded) (not= revision @idb-revision)
+                                            (not (valid-revision? revision)))
+                                      (do (reset! conflict? true) (reset! idb-conflict? true) (.abort tx))
+                                      (try
+                                        (reset! next-revision (if revision (inc revision) 1))
+                                        (.put state @next-revision revision-key)
+                                        (if text (.put state text storage-key) (.delete state storage-key))
+                                        (cond put (.put files (:bytes put) (:id put))
+                                              delete (.delete files delete)
+                                              clear? (.clear files))
+                                        (catch :default _ (try (.abort tx) (catch :default _ nil))))))))))
+                        (catch :default e (.abort tx) (reject e))))
+                    (catch :default e (.close idb) (reject e)))))))))
 
 (rf/reg-fx
  ::store
- (fn [{:keys [saved backend]}]
+ (fn [{:keys [saved backend file-op clear-snapshot]}]
    (let [text (when saved (pr-str saved))
          local! (fn []
                   (try
@@ -85,13 +173,31 @@
                       (.removeItem js/localStorage storage-key))
                     (rf/dispatch [::stored-ok])
                     (catch :default e (rf/dispatch [::store-failed (.-message e)]))))]
-     (if (= backend :local-storage)
-       (local!)
-       (-> (idb-request "readwrite" #(if text (.put % text storage-key) (.delete % storage-key)))
-           (.then (fn [_]
-                    (try (.removeItem js/localStorage storage-key) (catch :default _ nil))
-                    (rf/dispatch [::stored-ok])))
-           (.catch (fn [_] (local!))))))))
+     ;; 同じ画面からの全帳簿 snapshot を発行順に commit する。
+     ;; open や transaction の完了順が逆転して古い帳簿で上書きしない。
+     (reset! store-tail
+             (-> @store-tail
+                 (.then (fn [_]
+                          (when (or @file-write-failed? @idb-conflict?)
+                            (throw (js/Error. "保存を続けられません。表示中の帳簿の控えを保存してから再読み込みしてください")))
+                          (if (= backend :local-storage)
+                            (if file-op (throw (js/Error. "元ファイルを含む帳簿は IndexedDB に保存する必要があります")) (local!))
+                            (-> (idb-write-with-file text file-op clear-snapshot)
+                                (.then (fn [_]
+                                         (when (some? @legacy-migration-source)
+                                           (try
+                                             (when (= @legacy-migration-source (.getItem js/localStorage storage-key))
+                                               (.removeItem js/localStorage storage-key))
+                                             (catch :default _ nil))
+                                           (reset! legacy-migration-source nil))
+                                         (if clear-snapshot
+                                           (rf/dispatch-sync [::clear-committed clear-snapshot])
+                                           (rf/dispatch [::stored-ok]))))))))
+                 ;; 失敗後も次の snapshot を処理できるよう、拒否をここで解消する。
+                 (.catch (fn [e]
+                           (when file-op (reset! file-write-failed? true))
+                           (when clear-snapshot (rf/dispatch [::clear-failed]))
+                           (rf/dispatch [::store-failed (or (.-message e) "IndexedDB への保存に失敗しました")]))))))))
 
 (rf/reg-fx
  ::download
@@ -120,12 +226,6 @@
                       (.catch (fn [_] (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file) nil]))))))))))
 
 (rf/reg-fx
- ::store-file
- (fn [{:keys [id bytes]}]
-   (-> (idb-request files-store "readwrite" #(.put % bytes id))
-       (.catch (fn [e] (rf/dispatch [::store-failed (str "元のファイル: " (.-message e))]))))))
-
-(rf/reg-fx
  ::download-file
  (fn [{:keys [id name]}]
    (-> (idb-request files-store "readonly" #(.get % id))
@@ -140,14 +240,6 @@
                     (js/setTimeout #(.revokeObjectURL js/URL url) 1000))
                   (rf/dispatch [::store-failed "元のファイルがこの端末にありません（別の端末で取り込んだか、消えています）"]))))
        (.catch (fn [e] (rf/dispatch [::store-failed (.-message e)]))))))
-
-(rf/reg-fx
- ::delete-file
- (fn [id] (-> (idb-request files-store "readwrite" #(.delete % id)) (.catch (fn [_] nil)))))
-
-(rf/reg-fx
- ::clear-files
- (fn [_] (-> (idb-request files-store "readwrite" #(.clear %)) (.catch (fn [_] nil)))))
 
 (rf/reg-fx
  ::print
@@ -175,26 +267,65 @@
     ::load true}))
 
 (rf/reg-event-db
+ ::load-failed
+ (fn [db [_ blocked?]]
+   (-> db
+       (assoc-in [:ui :legacy-backup?] (some? (local-get)))
+       (assoc-in [:ui :load-error] (if blocked?
+                                    "別のタブが帳簿保存領域を使用しているため更新できません。データを保護するため編集を停止しました。他の kaikei タブを閉じてから再読み込みしてください。ブラウザの保存データは消去しないでください。"
+                                    "端末の帳簿保存領域を開けませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、利用環境と復旧方法を確認してください。")))))
+
+(rf/reg-event-fx
+ :export-legacy-backup
+ (fn [{:keys [db]} _]
+   (if-some [text (local-get)]
+     {::download {:filename "kaikei-legacy-backup.edn" :mime "text/plain;charset=utf-8" :bytes text}}
+     {:db (assoc-in db [:ui :legacy-backup-error] "旧保存データを読み取れませんでした。ブラウザの保存データは消去しないでください。")})))
+
+(rf/reg-event-fx
+ :export-legacy-json
+ (fn [{:keys [db]} _]
+   (try
+     (let [text (local-get)
+           stored (when (some? text) (edn/read-string text))]
+       (when-not (and (map? stored) (map? (:data stored)))
+         (throw (js/Error. "invalid legacy ledger")))
+       (let [result (export/export (merge core/empty-db (:data stored)) "kaikei-json")]
+         (if (:bytes result)
+           {::download (assoc (select-keys result [:mime :bytes]) :filename "kaikei-legacy-recovery.json")}
+           (throw (js/Error. "legacy conversion failed")))))
+     (catch :default _
+       {:db (assoc-in db [:ui :legacy-backup-error] "旧保存データを JSON に変換できませんでした。EDN の控えを保存し、元のデータを消去しないでください。")}))))
+
+(rf/reg-event-db
  ::loaded
- (fn [db [_ text backend]]
-   (let [stored (try (some-> text edn/read-string) (catch :default _ nil))
-         data (if (map? (:data stored)) (merge core/empty-db (:data stored)) core/empty-db)]
-     {:data data
-      :backend backend
-      :ui (merge (:ui db) {:booting? false} (select-keys (:settings stored) [:fy-start :pl-style]))})))
+ (fn [db [_ text backend legacy-extra?]]
+   (try
+     (let [stored (when (some? text) (edn/read-string text))]
+       (when (and (some? text) (not (and (map? stored) (map? (:data stored)))))
+         (throw (js/Error. "保存データの形式が正しくありません")))
+       {:data (if stored (merge core/empty-db (:data stored)) core/empty-db)
+        :backend backend
+        :ui (merge (:ui db) {:booting? false :legacy-extra? (or legacy-extra? (get-in db [:ui :legacy-extra?]))}
+                   (select-keys (:settings stored) [:fy-start :pl-style]))})
+     (catch :default _
+       (assoc-in db [:ui :load-error] "保存済みの帳簿を読み取れませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、復旧方法を確認してください。")))))
 
 (defn- with-store
   "db → db' の effect に、変えた data を保存する ::store を足す（data が空なら保存を消す）。"
   [db db' fx]
-  (cond-> (assoc fx :db db')
-    (or (not= (:data db) (:data db'))
+  (let [file-op (cond (::store-file fx) {:put (::store-file fx)}
+                      (::delete-file fx) {:delete (::delete-file fx)}
+                      (::clear-files fx) {:clear? true})]
+    (cond-> (assoc (dissoc fx ::store-file ::delete-file ::clear-files) :db db')
+    (or file-op (not= (:data db) (:data db'))
         (not= (saved-state db) (saved-state db')))
-    (assoc ::store {:backend (:backend db')
+    (assoc ::store {:backend (:backend db') :file-op file-op
                     :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db')))
                                      (seq (:invoices (:data db'))) (seq (:business (:data db')))
                                      (seq (:statement-lines (:data db'))) (seq (:rules (:data db')))
                                      (seq (:statement-accounts (:data db'))) (seq (:files (:data db'))))
-                             (saved-state db'))})))
+                             (saved-state db'))}))))
 
 (defn- reg-data-event
   "data を変える event。handler は (fn [db event] db')。変えた data を ::store
@@ -210,6 +341,11 @@
 
 (rf/reg-event-db ::stored-ok (fn [db _] (assoc-in db [:ui :store-error] nil)))
 (rf/reg-event-db ::store-failed (fn [db [_ msg]] (assoc-in db [:ui :store-error] msg)))
+
+;; 別タブが旧保存先へ書いた場合も、再読込を待たず控えを案内する。
+(rf/reg-event-db ::legacy-written
+ (fn [db _]
+   (-> db (assoc-in [:ui :legacy-extra?] true) (assoc-in [:ui :legacy-backup?] true))))
 
 (reg-ui-event :set-mode (fn [db [_ m]] (assoc-in db [:ui :mode] m)))
 (reg-ui-event :toggle-import (fn [db _] (update-in db [:ui :import-open?] not)))
@@ -374,7 +510,26 @@
 (rf/reg-event-fx
  :clear-all
  (fn [{:keys [db]} _]
-   (with-store db (assoc db :data core/empty-db :ui view/initial-ui) {::clear-files true})))
+   (when-not (get-in db [:ui :clear-pending?])
+     {:db (assoc-in db [:ui :clear-pending?] true)
+      ::store {:backend (:backend db) :saved nil :file-op {:clear? true} :clear-snapshot (:data db)}})))
+
+(rf/reg-event-db
+ ::clear-failed
+ (fn [db _] (assoc-in db [:ui :clear-pending?] false)))
+
+(rf/reg-event-db
+ ::clear-committed
+ (fn [db [_ snapshot]]
+   (if (= snapshot (:data db))
+     (assoc db :data core/empty-db
+               :ui (assoc view/initial-ui :legacy-extra? (get-in db [:ui :legacy-extra?])))
+     (do
+       ;; 消去待ちの間に非同期処理が内容を変えた場合、画面の内容を消さない。
+       (reset! file-write-failed? true)
+       (-> db
+           (assoc-in [:ui :clear-pending?] false)
+           (assoc-in [:ui :store-error] "消去中に帳簿が変更されました。現在の内容を書き出してから再読み込みしてください"))))))
 
 (rf/reg-event-fx
  :export
@@ -633,12 +788,34 @@
         ui @(rf/subscribe [::ui])
         derived @(rf/subscribe [::derived])
         statements @(rf/subscribe [::statements])]
-    [:<>
+    (if (:clear-pending? ui)
+      [:div {:class "kk-app"} [:p {:role "status"} "帳簿と元ファイルを消去しています…"]]
+      (if-let [e (:load-error ui)]
+      [:div {:class "kk-app"}
+       [:p {:class "kk-warnings" :role "alert"} e]
+       (when (:legacy-backup? ui)
+         [:div
+          [:p "旧保存データの控えを取り出せます。最新の帳簿とは限らず、元ファイルは含みません。JSON は帳簿として取り込めますが、一部の値や画面設定を保持できないことがあります。取り込み後に内容を確認し、EDN の控えも保管してください。"]
+          [:button {:type "button" :on-click (fn [_] (rf/dispatch [:export-legacy-backup]))} "旧保存データを控えとして保存（EDN）"]
+          [:button {:type "button" :on-click (fn [_] (rf/dispatch [:export-legacy-json]))} "旧帳簿を取り込み用 JSON として保存"]])
+       (when-let [err (:legacy-backup-error ui)] [:p {:class "kk-warnings" :role "alert"} err])]
+      [:<>
+     (when (:legacy-extra? ui)
+       [:div {:class "kk-warnings kk-app" :role "alert"}
+        [:p "別の旧保存データがこの端末に残っています。現在の帳簿とは異なる可能性があります。消去せず、控えを保存して内容を確認してください。"]
+        [:button {:type "button" :on-click (fn [_] (rf/dispatch [:export-legacy-backup]))} "旧保存データを控えとして保存（EDN）"]])
      (when-let [e (:store-error ui)]
        [:p {:class "kk-warnings kk-app" :role "alert"}
         (str "この端末に保存できませんでした（" e "）。書き出して手元に残してください。")])
      ;; :booting? の間は SSR と同じ「読み込んでいます」を描く（保存の読み出しは非同期）
-     (view/root (cond-> {:data data :ui ui} statements (assoc :statements statements)) derived handlers)]))
+       (view/root (cond-> {:data data :ui ui} statements (assoc :statements statements)) derived handlers)]))))
 
 (rf/dispatch-sync [:init])
+(.addEventListener js/window "storage"
+                   (fn [e]
+                     (try
+                       (when (and (.-isTrusted e) (= (.-storageArea e) js/localStorage)
+                                  (= (.-key e) storage-key) (some? (.-newValue e)))
+                         (rf/dispatch [::legacy-written]))
+                       (catch :default _ nil))))
 (rdom/render [root] (.getElementById js/document "app"))

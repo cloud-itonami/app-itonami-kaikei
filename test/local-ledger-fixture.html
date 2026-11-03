@@ -1,0 +1,68 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>kaikei synthetic local ledger experiment</title>
+<h1>合成データのローカル保存実験</h1>
+<p>実帳簿は使用しません。同期や broker の承認は有効にしません。</p>
+<button id="run">合成データの保存と衝突を試す</button>
+<button id="read">保存済みの合成データを確認</button>
+<button id="abort">書き込み中の取消を試す</button>
+<p id="status">未実行</p>
+<script type="module">
+import {readFixture, compareAndSwapFixture} from '../experiments/local-ledger-fixture.mjs';
+const status = document.querySelector('#status');
+const check = (value, message) => { if (!value) throw Error(message); };
+document.querySelector('#run').addEventListener('click', async () => {
+  try {
+    const before = await readFixture();
+    const [first, second] = await Promise.all([
+      compareAndSwapFixture(before.revision, 'synthetic:one'),
+      compareAndSwapFixture(before.revision, 'synthetic:two'),
+    ]);
+    check([first, second].filter(x => x.ok).length === 1, 'competing writes');
+    const saved = await readFixture();
+    check(saved.revision === before.revision + 1 && ['synthetic:one', 'synthetic:two'].includes(saved.value), 'committed value');
+    let rejected = false;
+    try { await compareAndSwapFixture(saved.revision, 'あ'.repeat(22000)); } catch { rejected = true; }
+    check(rejected, 'oversize was not rejected');
+    const after = await readFixture();
+    check(after.revision === saved.revision && after.value === saved.value, 'rejection changed saved value');
+    status.textContent = `PASS: 競合一件・保存一件、超過拒否、revision ${after.revision}`;
+  } catch (error) { status.textContent = `FAIL: ${error.message}`; }
+});
+document.querySelector('#read').addEventListener('click', async () => {
+  try {
+    const saved = await readFixture();
+    check(saved.revision > 0 && ['synthetic:one', 'synthetic:two'].includes(saved.value), 'no synthetic data');
+    status.textContent = `PASS: 合成データ復元、revision ${saved.revision}`;
+  } catch (error) { status.textContent = `FAIL: ${error.message}`; }
+});
+document.querySelector('#abort').addEventListener('click', async () => {
+  const originalPut = IDBObjectStore.prototype.put;
+  try {
+    const before = await readFixture();
+    const controller = new AbortController();
+    const alreadyAborted = new AbortController();
+    alreadyAborted.abort();
+    let preAborted = false;
+    try { await compareAndSwapFixture(before.revision, 'synthetic:pre-aborted', alreadyAborted.signal); }
+    catch (error) { preAborted = error.name === 'AbortError'; }
+    check(preAborted, 'already-aborted request was not rejected');
+    let didPut = false;
+    IDBObjectStore.prototype.put = function(...args) {
+      const request = originalPut.apply(this, args);
+      didPut = true;
+      controller.abort();
+      return request;
+    };
+    let aborted = false;
+    try { await compareAndSwapFixture(before.revision, 'synthetic:aborted', controller.signal); }
+    catch (error) { aborted = error.name === 'AbortError'; }
+    IDBObjectStore.prototype.put = originalPut;
+    check(didPut && aborted, 'active transaction was not aborted');
+    const after = await readFixture();
+    check(after.revision === before.revision && after.value === before.value, 'aborted write persisted');
+    status.textContent = `PASS: put 後の取消、保存値と revision ${after.revision} は不変`;
+  } catch (error) { status.textContent = `FAIL: ${error.message}`; }
+  finally { IDBObjectStore.prototype.put = originalPut; }
+});
+</script>

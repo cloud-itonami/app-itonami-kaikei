@@ -1,0 +1,58 @@
+<!doctype html><meta charset="utf-8"><title>Sibling port isolation fixture</title>
+<h1>別 guest からのポート偽装試験</h1>
+<p>合成値だけを扱う、製品未接続の試験です。</p>
+<p><code>?unsafe=1</code> は送信元検査を無効にする試験専用の負の対照です。</p>
+<button id="run">合成試験を実行</button><p id="result">未実行</p><div id="frames"></div>
+<script type="module">
+import {bindFixturePort} from '../experiments/local-ledger-port-fixture.mjs';
+const result = document.querySelector('#result');
+const container = document.querySelector('#frames');
+document.querySelector('#run').onclick = () => {
+  if (container.hasChildNodes()) return;
+  result.textContent = '実行中';
+  let rejected = false, attackSent = false, realRead = false, fakeReceived = false;
+  const report = () => {
+    if (fakeReceived) result.textContent = 'FAIL: sibling port received a request';
+    else if (rejected && attackSent && realRead) result.textContent = 'PASS: sibling port rejected; host port read only synthetic value';
+  };
+  const victim = document.createElement('iframe');
+  victim.title = 'synthetic target guest'; victim.sandbox = 'allow-scripts';
+  victim.srcdoc = `<!doctype html><script>
+    let port;
+    addEventListener('message', e => {
+      if(e.data !== 'fixture-storage-port') return;
+      if(e.source !== parent && !UNSAFE) { parent.postMessage({type:'sibling-rejected'},'*'); return; }
+      if(port || e.ports.length !== 1) return;
+      port=e.ports[0]; port.onmessage=e=>parent.postMessage({type:'real-reply',value:e.data.result?.value},'*');
+      port.postMessage({protocol:'kaikei.fixture.local-ledger.v1',id:1,action:'read',expectedRevision:null,value:null});
+    });
+  <\/script>`.replace('UNSAFE', new URLSearchParams(location.search).get('unsafe') === '1' ? 'true' : 'false');
+  const attacker = document.createElement('iframe');
+  attacker.title = 'synthetic sibling guest'; attacker.sandbox = 'allow-scripts';
+  attacker.srcdoc = `<!doctype html><script>
+    addEventListener('message', e=>{
+      if(e.source!==parent || e.data!=='attack')return;
+      const channel=new MessageChannel();
+      channel.port1.onmessage=()=>parent.postMessage({type:'fake-received'},'*');
+      parent.frames[0].postMessage('fixture-storage-port','*',[channel.port2]);
+      parent.postMessage({type:'attack-sent'},'*');
+    });
+  <\/script>`;
+  let started = 0, sent = false;
+  const channel = new MessageChannel();
+  const bridge = bindFixturePort(channel.port1, {read:async()=>({revision:1,value:'synthetic-only'}),write:async()=>{throw Error('not used');}});
+  const timer = setTimeout(()=>{if(result.textContent==='実行中'){result.textContent='FAIL: timed out';bridge.close();}},5000);
+  const ready = () => { if(++started===2) attacker.contentWindow.postMessage('attack','*'); };
+  victim.onload=ready; attacker.onload=ready;
+  addEventListener('message', e => {
+    if(e.source===victim.contentWindow && e.data?.type==='sibling-rejected') rejected=true;
+    if(e.source===attacker.contentWindow && e.data?.type==='attack-sent') attackSent=true;
+    if(e.source===attacker.contentWindow && e.data?.type==='fake-received') fakeReceived=true;
+    if(e.source===victim.contentWindow && e.data?.type==='real-reply') realRead=e.data.value==='synthetic-only';
+    if(rejected && attackSent && !sent) { sent=true;victim.contentWindow.postMessage('fixture-storage-port','*',[channel.port2]); }
+    report();
+    if(result.textContent.startsWith('PASS') || result.textContent.startsWith('FAIL')) {clearTimeout(timer);bridge.close();}
+  });
+  container.append(victim, attacker);
+};
+</script>

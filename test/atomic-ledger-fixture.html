@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>Atomic ledger fixture</title>
+<h1>合成帳簿と元ファイルの原子的保存</h1>
+<p>隔離された試験用データベースに合成値を書きます。実帳簿は読みません。</p>
+<button id="run">合成試験を実行</button><p id="result">未実行</p>
+<script type="module">
+import {runAtomicFixture} from '../experiments/atomic-ledger-fixture.mjs';
+document.querySelector('#run').addEventListener('click', async () => {
+  const result = document.querySelector('#result');
+  result.textContent = '実行中';
+  try { result.textContent = await runAtomicFixture(); }
+  catch (error) { result.textContent = `FAIL: ${error.message}`; }
+});
+</script>

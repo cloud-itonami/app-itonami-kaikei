@@ -125,7 +125,7 @@
     (get m "account") (assoc :account (get m "account"))
     (get m "account_code") (assoc :account-code (get m "account_code"))
     (integer-value? (get m "rate")) (assoc :rate (get m "rate"))
-    (true? (get m "reduced")) (assoc :reduced? true)
+    (boolean? (get m "reduced")) (assoc :reduced? (get m "reduced"))
     (scheme-code (get m "tax")) (assoc :tax (scheme-code (get m "tax")))))
 
 (defn- stated-in [m]
@@ -135,7 +135,7 @@
       (assoc :tax-by-rate (vec (for [r (get m "tax_by_rate") :when (and (map? r) (integer-value? (get r "tax")))]
                                  (cond-> {:tax (get r "tax")}
                                    (integer-value? (get r "rate")) (assoc :rate (get r "rate"))
-                                   (true? (get r "reduced")) (assoc :reduced? true)
+                                   (boolean? (get r "reduced")) (assoc :reduced? (get r "reduced"))
                                    (kw (get r "category")) (assoc :category (kw (get r "category")))))))
       (integer-value? (get m "tax")) (assoc :tax (get m "tax"))
       (integer-value? (get m "total")) (assoc :total (get m "total")))))
@@ -365,14 +365,14 @@
                                    ["account_code" (:account-code l)]
                                    ["category" (kw-name (:category l :taxable))]
                                    ["rate" (:rate l)]
-                                   ["reduced" (when (:reduced? l) true)]
+                                   ["reduced" (when (boolean? (:reduced? l)) (:reduced? l))]
                                    ["tax" (when-let [{:keys [scheme code]} (:tax l)]
                                             (json/ordered [["scheme" (name scheme)] ["code" code]]))]])))]
     ["stated" (when-let [st (not-empty (:stated inv))]
                 (json/ordered [["tax_by_rate" (when (seq (:tax-by-rate st))
                                                 (vec (for [r (:tax-by-rate st)]
                                                        (json/ordered [["rate" (:rate r)]
-                                                                      ["reduced" (when (:reduced? r) true)]
+                                                                      ["reduced" (when (boolean? (:reduced? r)) (:reduced? r))]
                                                                       ["category" (kw-name (:category r))]
                                                                       ["tax" (:tax r)]]))))]
                                ["tax" (:tax st)]

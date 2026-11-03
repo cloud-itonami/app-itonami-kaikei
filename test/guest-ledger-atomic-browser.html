@@ -1,0 +1,36 @@
+<!doctype html><meta charset="utf-8"><p id="result">RUNNING</p><div id="container"></div>
+<script type="module">
+import {bindFixturePort} from '../experiments/local-ledger-port-fixture.mjs';
+import {watchFixtureGuest} from '../experiments/guest-ledger-lifetime-fixture.mjs';
+import {openAtomicFixture,writeAtomicFixture,readAtomicFixture} from '../experiments/atomic-ledger-fixture.mjs';
+const out=document.querySelector('#result');let db, bridge, port2;
+try {
+ const negative=new URLSearchParams(location.search).has('negative');
+ db=await openAtomicFixture(); const key=crypto.randomUUID();
+ const oldFile=new Uint8Array([0,1,128,255]), newFile=new Uint8Array([255,128,1,0]);
+ if(await writeAtomicFixture(db,key,0,'synthetic-old',oldFile)!=='committed') throw Error('seed failed');
+ const container=document.querySelector('#container'),frame=document.createElement('iframe');
+ frame.sandbox='allow-scripts';frame.srcdoc='<p>synthetic</p>';container.append(frame);
+ const channel=new MessageChannel(); port2=channel.port2;let started=0,aborted=false,settled;
+ const done=new Promise(resolve=>{settled=resolve});
+ bridge=bindFixturePort(channel.port1,{read:async()=>({}),write:async (revision,value,signal)=>{
+   started++; signal.addEventListener('abort',()=>{aborted=true},{once:true});
+   try { return await writeAtomicFixture(db,key,revision,value,newFile,false,signal,()=>{frame.remove();container.append(frame)}); }
+   finally {settled()}
+ }});
+ if(!negative) watchFixtureGuest(frame,container,bridge);
+ const msg=id=>({protocol:'kaikei.fixture.local-ledger.v1',id,action:'write',expectedRevision:1,value:'synthetic-new'});
+ port2.postMessage(msg(1));port2.postMessage(msg(2));await done;
+ await new Promise(resolve=>setTimeout(resolve,100));
+ const after=await readAtomicFixture(db,key);
+ const matches=bytes=>after.file instanceof Uint8Array && bytes.every((v,i)=>after.file[i]===v) && after.file.length===bytes.length;
+ if(negative) {
+   if(after.ledger.revision!==2 || after.ledger.value!=='synthetic-new' || !matches(newFile) || aborted) throw Error('negative did not commit both');
+   out.textContent='PASS negative: unmonitored ledger and binary file committed';
+ } else {
+   if(after.ledger.revision!==1 || after.ledger.value!=='synthetic-old' || !matches(oldFile) || !aborted || started!==1) throw Error('atomic rollback or queue failed');
+   out.textContent='PASS: guest removal aborted ledger and binary file together; previous bytes preserved; queued write not started';
+ }
+} catch(e) {out.textContent='FAIL: '+e.message}
+finally {bridge?.close();port2?.close();db?.close()}
+</script>
