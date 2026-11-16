@@ -25,3 +25,11 @@ static assets do not authorize an app-origin API/BFF or remote fallback.
 
 The dependency is apex PR242, stacked after PR241. Merge in dependency order,
 repeat final-head checks, and qualify the owning artifact before publication.
+
+The owning app repository is public while apex is private. Its default
+`GITHUB_TOKEN` cannot read that source. CI therefore requires a narrowly scoped
+`AWAI_INVOICE_UI_SOURCE_READ_TOKEN` secret with Contents: read on **apex only**;
+it is used only for the pinned checkout and not persisted. Missing credentials
+fail the check explicitly, never skip the build or report success. No broad
+personal token was copied into CI. Org-wide secret inventory was not available
+to this session, so an existing suitable org secret remains unknown.
