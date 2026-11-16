@@ -28,7 +28,7 @@ jobs:
         with:
           token: ${{ secrets.AWAI_INVOICE_UI_SOURCE_READ_TOKEN }}
           repository: network-awai/network-awai-apex
-          ref: 4f7c8354021069666292f714563802611d9e479b
+          ref: 02748d4073ace4366c6b7c39f2600345d845c92e
           path: .agent-output/ui-source
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
