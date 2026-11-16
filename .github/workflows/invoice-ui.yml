@@ -34,7 +34,7 @@ jobs:
         with:
           ssh-key: ${{ secrets.AWAI_INVOICE_UI_SOURCE_SSH_KEY_2986 }}
           repository: network-awai/network-awai-apex
-          ref: 02748d4073ace4366c6b7c39f2600345d845c92e
+          ref: fced010f4818887c7faea3c43e2db93749be29e2
           path: .agent-output/ui-source
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
