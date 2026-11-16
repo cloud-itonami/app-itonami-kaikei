@@ -10,6 +10,12 @@ permissions:
   contents: read
 jobs:
   static-addon:
+    # Private source key is available only to reviewed owner-authored refs.
+    if: >-
+      ${{ github.actor == 'com-junkawasaki' &&
+          (github.event_name == 'workflow_dispatch' ||
+           (github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.login == 'com-junkawasaki')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -18,15 +24,15 @@ jobs:
           persist-credentials: false
       - name: Require least-privilege access to owning private UI source
         env:
-          UI_SOURCE_READ_TOKEN: ${{ secrets.AWAI_INVOICE_UI_SOURCE_READ_TOKEN }}
+          UI_SOURCE_SSH_KEY: ${{ secrets.AWAI_INVOICE_UI_SOURCE_SSH_KEY_2986 }}
         run: |
-          if [ -z "$UI_SOURCE_READ_TOKEN" ]; then
-            echo '::error::Configure AWAI_INVOICE_UI_SOURCE_READ_TOKEN with contents:read for network-awai/network-awai-apex only. No build was qualified.'
+          if [ -z "$UI_SOURCE_SSH_KEY" ]; then
+            echo '::error::Configure AWAI_INVOICE_UI_SOURCE_SSH_KEY_2986 with a read-only apex deploy key for network-awai/network-awai-apex only. No build was qualified.'
             exit 1
           fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          token: ${{ secrets.AWAI_INVOICE_UI_SOURCE_READ_TOKEN }}
+          ssh-key: ${{ secrets.AWAI_INVOICE_UI_SOURCE_SSH_KEY_2986 }}
           repository: network-awai/network-awai-apex
           ref: 02748d4073ace4366c6b7c39f2600345d845c92e
           path: .agent-output/ui-source

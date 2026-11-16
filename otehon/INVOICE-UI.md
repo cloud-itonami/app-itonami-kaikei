@@ -28,8 +28,11 @@ repeat final-head checks, and qualify the owning artifact before publication.
 
 The owning app repository is public while apex is private. Its default
 `GITHUB_TOKEN` cannot read that source. CI therefore requires a narrowly scoped
-`AWAI_INVOICE_UI_SOURCE_READ_TOKEN` secret with Contents: read on **apex only**;
-it is used only for the pinned checkout and not persisted. Missing credentials
+`AWAI_INVOICE_UI_SOURCE_SSH_KEY_2986` secret containing an **apex-only,
+read-only deploy key**;
+it is used only for the pinned checkout and not persisted. Only owner-authored
+same-repository PRs or owner manual runs can receive this secret. Standard public
+GitHub-hosted compute is retained; no artifact/cache uploads are added. Missing credentials
 fail the check explicitly, never skip the build or report success. No broad
 personal token was copied into CI. Org-wide secret inventory was not available
 to this session, so an existing suitable org secret remains unknown.
