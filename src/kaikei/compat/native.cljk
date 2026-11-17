@@ -295,7 +295,9 @@
 
 (defn- valid-account? [account]
   (and (map? account) (string? (get account "name"))
-       (not (text/blank? (get account "name")))))
+       (not (text/blank? (get account "name")))
+       (or (not (contains? account "class"))
+           (contains? core/class-code (kw (get account "class"))))))
 
 (defn read-data
   "構文解析済みの JSON（文字列キー）→ 取り込み結果。"
