@@ -232,6 +232,14 @@
       (is (= 1 (:rejected result)) field)
       (is (seq (:warnings result)) field))))
 
+(deftest native-json-reports-unknown-statement-kind-and-rule-direction
+  (doseq [[field record] [["statement_accounts" "{\"id\":\"a1\",\"kind\":\"future\"}"]
+                          ["rules" "{\"when\":{\"text\":\"x\",\"direction\":\"future\"},\"then\":{\"account\":\"cash\"}}"]]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"" field "\":[" record "]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:rejected result)) field)
+      (is (seq (:warnings result)) field))))
+
 (deftest native-json-reports-malformed-transaction-arrays
   (doseq [field ["entries" "invoices" "statement_lines"]]
     (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"currency\":\"JPY\",\"" field "\":null}")

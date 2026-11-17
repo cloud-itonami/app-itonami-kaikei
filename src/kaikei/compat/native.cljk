@@ -195,7 +195,8 @@
 (defn- str-or-nil [v] (when (and (string? v) (not (text/blank? v))) v))
 
 (defn- statement-account-in [m]
-  (when (and (map? m) (str-or-nil (get m "id")))
+  (when (and (map? m) (str-or-nil (get m "id"))
+             (or (not (contains? m "kind")) (#{:bank :card :expense} (kw (get m "kind")))))
     (cond-> {:id (get m "id")
              :kind (or (#{:bank :card :expense} (kw (get m "kind"))) :bank)
              :name (str (get m "name" ""))
@@ -245,7 +246,8 @@
 (defn- rule-in [m]
   (let [w (get m "when") t (get m "then")]
     (when (and (map? m) (map? w) (map? t) (str-or-nil (get w "text")) (str-or-nil (get t "account"))
-               (or (not (contains? w "op")) (#{:exact :prefix :suffix :contains} (kw (get w "op")))))
+               (or (not (contains? w "op")) (#{:exact :prefix :suffix :contains} (kw (get w "op"))))
+               (or (not (contains? w "direction")) (#{:in :out} (kw (get w "direction")))))
       (cond-> {:when (cond-> {:text (get w "text")
                               :op (or (#{:exact :prefix :suffix :contains} (kw (get w "op"))) :contains)}
                        (#{:in :out} (kw (get w "direction"))) (assoc :direction (kw (get w "direction")))
