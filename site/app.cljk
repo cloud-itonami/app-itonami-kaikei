@@ -222,8 +222,8 @@
                   (-> (.digest (.-subtle js/crypto) "SHA-256" buf)
                       (.then (fn [d]
                                (let [hex (apply str (map #(text/pad-left (.toString % 16) 2 "0") (array-seq (js/Uint8Array. d))))]
-                                 (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file) hex]))))
-                      (.catch (fn [_] (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file) nil]))))))))))
+                                 (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file) hex])))))))
+         (.catch (fn [_] (rf/dispatch [::read-file-failed])))))))
 
 (rf/reg-fx
  ::download-file
@@ -337,6 +337,12 @@
 
 (rf/reg-event-db ::stored-ok (fn [db _] (assoc-in db [:ui :store-error] nil)))
 (rf/reg-event-db ::store-failed (fn [db [_ msg]] (assoc-in db [:ui :store-error] msg)))
+
+(rf/reg-event-db
+ ::read-file-failed
+ (fn [db _]
+   (assoc-in db [:ui :import-result :error]
+             "ファイルを読み取るか SHA-256 を計算できませんでした。元ファイルを保存できないため、取り込みを中止しました。")))
 
 ;; 別タブが旧保存先へ書いた場合も、再読込を待たず控えを案内する。
 (rf/reg-event-db ::legacy-written
