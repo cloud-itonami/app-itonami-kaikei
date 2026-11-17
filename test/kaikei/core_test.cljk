@@ -6,6 +6,18 @@
 
 (def sample-db (:db (core/merge-import core/empty-db core/sample-import)))
 
+(deftest native-replace-preserves-ledger-on-partial-or-metadata-only-input
+  (let [with-file (assoc sample-db :files [{:id "f1" :sha256 "fixture"}])
+        empty-native {:format :kaikei-json :currency "JPY" :entries [] :accounts []}]
+    (doseq [[db parsed] [[sample-db (assoc empty-native :rejected 1)]
+                         [sample-db (assoc empty-native :invoices-rejected 1)]
+                         [sample-db (assoc empty-native :warnings ["bad input"])]
+                         [sample-db (assoc empty-native :files [{:id "f2" :sha256 "other"}])]
+                         [with-file (assoc empty-native :files [])]]]
+      (let [result (core/merge-import db parsed :replace)]
+        (is (:error result))
+        (is (= db (:db result)))))))
+
 (def fy-from 20260401)
 (def fy-to 20270331)
 

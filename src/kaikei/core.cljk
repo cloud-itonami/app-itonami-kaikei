@@ -981,10 +981,21 @@
          base (cond-> base
                 (pos? dropped) (assoc :invoices [])
                 (pos? lines-dropped) (assoc :statement-accounts [] :statement-lines []))]
-     (if (and (or (seq (:entries base)) (seq (:invoices base)) (seq (:statement-lines base)))
-              (not= currency (:currency base)))
+     (cond
+       (and replace? (= :kaikei-json (:format parsed))
+            (or (pos? (or (:rejected parsed) 0))
+                (pos? (or (:invoices-rejected parsed) 0))
+                (seq (:warnings parsed))
+                (and (contains? parsed :files) (or (seq (:files parsed)) (seq (:files db))))))
+       {:db db :added 0 :duplicates 0 :invoices-added 0 :invoices-duplicates 0
+        :error "読み取りに警告があるか元ファイルの中身を含まないため、この帳簿では入れ替えできません。元の帳簿を保持しました。"}
+
+       (and (or (seq (:entries base)) (seq (:invoices base)) (seq (:statement-lines base)))
+            (not= currency (:currency base)))
        {:db db :added 0 :duplicates 0 :invoices-added 0 :invoices-duplicates 0
         :error (str "帳簿の通貨は " (:currency base) " です。" currency " の仕訳・請求書・明細は合流しません（1 帳簿 1 通貨）。")}
+
+       :else
        (let [base (cond-> (assoc base :currency currency)
                     (and (:business parsed) (or replace? (nil? (:business base))))
                     (assoc :business (:business parsed))
