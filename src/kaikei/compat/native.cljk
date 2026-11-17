@@ -238,7 +238,8 @@
 
 (defn- rule-in [m]
   (let [w (get m "when") t (get m "then")]
-    (when (and (map? m) (map? w) (map? t) (str-or-nil (get w "text")) (str-or-nil (get t "account")))
+    (when (and (map? m) (map? w) (map? t) (str-or-nil (get w "text")) (str-or-nil (get t "account"))
+               (or (not (contains? w "op")) (#{:exact :prefix :suffix :contains} (kw (get w "op")))))
       (cond-> {:when (cond-> {:text (get w "text")
                               :op (or (#{:exact :prefix :suffix :contains} (kw (get w "op"))) :contains)}
                        (#{:in :out} (kw (get w "direction"))) (assoc :direction (kw (get w "direction")))

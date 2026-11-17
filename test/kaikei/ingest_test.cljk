@@ -220,3 +220,15 @@
           result (ingest/ingest-text input {:format "kaikei-json"})]
       (is (pos? (:rejected result)) field)
       (is (seq (:warnings result)) field))))
+
+(deftest native-json-rule-operator-validation
+  (doseq [op ["future-op" "" "CONTAINS"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"rules\":[{\"when\":{\"text\":\"x\",\"op\":\"" op "\"},\"then\":{\"account\":\"cash\"}}]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:rejected result)) op)
+      (is (seq (:warnings result)) op)))
+  (doseq [op ["exact" "prefix" "suffix" "contains"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"rules\":[{\"when\":{\"text\":\"x\",\"op\":\"" op "\"},\"then\":{\"account\":\"cash\"}}]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 0 (:rejected result)) op)
+      (is (= (keyword op) (get-in result [:rules 0 :when :op])) op))))
