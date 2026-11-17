@@ -213,6 +213,17 @@
     (is (seq (:warnings result)))
     (is (empty? (:accounts result)))))
 
+(deftest native-json-reports-unknown-invoice-enums
+  (doseq [field ["status" "tax_mode" "rounding"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"invoices\":[{\"kind\":\"sales\",\"lines\":[],\"" field "\":\"future\"}]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:invoices-rejected result)) field)
+      (is (seq (:warnings result)) field)))
+  (let [input "{\"format\":\"kaikei.ledger.v1\",\"invoices\":[{\"kind\":\"sales\",\"lines\":[{\"amount\":1,\"category\":\"future\"}]}]}"
+        result (ingest/ingest-text input {:format "kaikei-json"})]
+    (is (= 1 (:invoices-rejected result)))
+    (is (seq (:warnings result)))))
+
 (deftest native-json-reports-dropped-collections
   (doseq [[field value] [["statement_accounts" "[{}]"] ["rules" "[{}]"]
                          ["files" "[{}]"] ["rules" "null"] ["files" "{}"]]]

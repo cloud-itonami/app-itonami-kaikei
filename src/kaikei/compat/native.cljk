@@ -114,6 +114,9 @@
   (let [v (kw (get m k))]
     (if (contains? (invoice-enums k) v) v default)))
 
+(defn- known-enum-or-absent? [m k]
+  (or (not (contains? m k)) (contains? (invoice-enums k) (kw (get m k)))))
+
 (defn- integer-value? [v] (and (number? v) (integer? v)))
 
 (defn- invoice-line-in [m]
@@ -150,6 +153,9 @@
       {:problem (str where ": 金額は最小通貨単位の整数で書きます")}
       (not (contains? #{:sales :purchase} (kw (get m "kind"))))
       {:problem (str where ": kind は sales か purchase です")}
+      (not (and (every? #(known-enum-or-absent? m %) ["status" "tax_mode" "rounding"])
+                (every? #(known-enum-or-absent? % "category") lines)))
+      {:problem (str where ": 未対応の状態または税区分があります")}
       :else
       {:invoice (cond-> {:kind (enum m "kind" :sales)
                          :number (str (get m "number" ""))
