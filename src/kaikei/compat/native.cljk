@@ -293,6 +293,10 @@
 (defn- safe-items [data key]
   (let [items (get data key)] (if (sequential? items) items [])))
 
+(defn- valid-account? [account]
+  (and (map? account) (string? (get account "name"))
+       (not (text/blank? (get account "name")))))
+
 (defn read-data
   "構文解析済みの JSON（文字列キー）→ 取り込み結果。"
   [data]
@@ -301,7 +305,7 @@
      :warnings [(str "\"format\": \"" format-id "\" の JSON ではありません")] :rejected 0}
     (let [currency (get data "currency" "JPY")
           accounts (safe-items data "accounts")
-          invalid-accounts (rejected-items data "accounts" map?)
+          invalid-accounts (rejected-items data "accounts" valid-account?)
           invalid-statement-accounts (rejected-items data "statement_accounts" statement-account-in)
           invalid-rules (rejected-items data "rules" rule-in)
           invalid-files (rejected-items data "files" file-in)
@@ -317,7 +321,7 @@
          :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")] :rejected 0}
         (cond-> {:format :kaikei-json
                  :currency currency
-                 :accounts (mapv read-account (filter map? accounts))
+                 :accounts (mapv read-account (filter valid-account? accounts))
                  :entries (vec (keep :entry candidates))
                  :warnings (vec (concat (when (pos? invalid-collections)
                                           [(str "帳簿の配列・項目のうち " invalid-collections " 件を読めません")])

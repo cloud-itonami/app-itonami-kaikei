@@ -200,7 +200,7 @@
                                                   {:currency "XXX"})))))))
 
 (deftest native-json-reports-dropped-accounts
-  (doseq [accounts ["[42]" "null" "{}"]]
+  (doseq [accounts ["[42]" "null" "{}" "[{}]" "[{\"name\":null}]" "[{\"name\":\" \"}]" "[{\"name\":42}]"]]
     (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"currency\":\"JPY\",\"accounts\":" accounts ",\"entries\":[]}")
           result (ingest/ingest-text input {:format "kaikei-json"})]
       (is (= 1 (:rejected result)) accounts)
