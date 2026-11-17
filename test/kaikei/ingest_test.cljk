@@ -198,3 +198,25 @@
   (testing "知らない通貨は桁を推測しない"
     (is (= 0 (count (:entries (ingest/ingest-text (str (fs/readFileSync "test/fixtures/xero-journals.json"))
                                                   {:currency "XXX"})))))))
+
+(deftest native-json-reports-dropped-accounts
+  (doseq [accounts ["[42]" "null" "{}"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"currency\":\"JPY\",\"accounts\":" accounts ",\"entries\":[]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:rejected result)) accounts)
+      (is (seq (:warnings result)) accounts))))
+
+(deftest native-json-reports-dropped-collections
+  (doseq [[field value] [["statement_accounts" "[{}]"] ["rules" "[{}]"]
+                         ["files" "[{}]"] ["rules" "null"] ["files" "{}"]]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"currency\":\"JPY\",\"entries\":[],\"" field "\":" value "}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:rejected result)) field)
+      (is (seq (:warnings result)) field))))
+
+(deftest native-json-reports-malformed-transaction-arrays
+  (doseq [field ["entries" "invoices" "statement_lines"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"currency\":\"JPY\",\"" field "\":null}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (pos? (:rejected result)) field)
+      (is (seq (:warnings result)) field))))
