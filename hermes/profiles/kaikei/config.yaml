@@ -1,5 +1,10 @@
 # Host-local blocks (command_allowlist, onboarding, secrets, skills, terminal) are kept on the host and omitted here.
 providers:
+  awai-node:
+    base_url: http://127.0.0.1:11434/v1
+    api_mode: chat_completions
+    stale_timeout_seconds: 600
+    request_timeout_seconds: 900
   openrouter-free:
     base_url: https://openrouter.ai/api/v1
     api_mode: chat_completions
@@ -28,18 +33,10 @@ providers:
         context_length: 262144
       qwen3.8-flash-next-whitehacker:
         context_length: 131072
-  openrouter:
-    base_url: https://openrouter.ai/api/v1
-    api_mode: chat_completions
-    key_env: OPENROUTER_API_KEY
-    stale_timeout_seconds: 600
-    extra_headers:
-      HTTP-Referer: https://itonami.cloud
-      X-OpenRouter-Title: Itonami By KotobaLabs
 model:
-  provider: openrouter
-  base_url: https://openrouter.ai/api/v1
-  default: xiaomi/mimo-v2.6-pro
+  provider: awai-node
+  base_url: http://127.0.0.1:11434/v1
+  default: local
   max_tokens: 8192
   context_length: 131072
 auxiliary:
