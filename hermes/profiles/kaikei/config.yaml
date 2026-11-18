@@ -1,21 +1,5 @@
 # Host-local blocks (command_allowlist, onboarding, secrets, skills, terminal) are kept on the host and omitted here.
 providers:
-  murakumo:
-    base_url: https://api.murakumo.cloud/v1
-    api_mode: chat_completions
-    models:
-      mishima:
-        context_length: 131072
-        max_tokens: 1024
-      nex-n2.5-mini-uncensored:
-        context_length: 65536
-        max_tokens: 8192
-    stale_timeout_seconds: 600
-    request_timeout_seconds: 900
-    extra_headers:
-      HTTP-Referer: https://itonami.cloud
-      X-OpenRouter-Title: Itonami By KotobaLabs
-      X-Title: Itonami By KotobaLabs
   openrouter-free:
     base_url: https://openrouter.ai/api/v1
     api_mode: chat_completions
@@ -44,10 +28,18 @@ providers:
         context_length: 262144
       qwen3.8-flash-next-whitehacker:
         context_length: 131072
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_mode: chat_completions
+    key_env: OPENROUTER_API_KEY
+    stale_timeout_seconds: 600
+    extra_headers:
+      HTTP-Referer: https://itonami.cloud
+      X-OpenRouter-Title: Itonami By KotobaLabs
 model:
-  provider: murakumo
-  base_url: https://api.murakumo.cloud/v1
-  default: murakumo/free
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+  default: xiaomi/mimo-v2.6-pro
   max_tokens: 8192
   context_length: 131072
 auxiliary:
@@ -92,9 +84,6 @@ openrouter:
   response_cache: true
   response_cache_ttl: 300
 fallback_providers:
-  - provider: murakumo
-    model: mishima
-    base_url: https://api.murakumo.cloud/v1
   - provider: openrouter-free
     model: z-ai/glm-5.3-flash
     base_url: https://openrouter.ai/api/v1
