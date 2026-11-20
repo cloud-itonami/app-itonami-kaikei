@@ -83,3 +83,11 @@
 (println (str "wrote " out-dir "/index.html (" (count html) " chars) + "
               (count (:vendor site)) " vendor + " (+ (count (:external site)) (count (:sources site)))
               " scittle sources"))
+
+;; Explicit Otehon-only addon; the normal/native build never silently falls back.
+(when-let [source (aget js/process.env "AWAI_INVOICE_UI_SOURCE")]
+  (let [canonical (aget js/process.env "AWAI_CANONICAL_SOURCE")]
+    (when-not (seq canonical) (throw (js/Error. "AWAI_CANONICAL_SOURCE is required for invoice UI")))
+    (cp/execFileSync js/process.execPath
+                     #js ["otehon/build-invoice-ui.mjs" source canonical out-dir]
+                     #js {:stdio "inherit"})))
