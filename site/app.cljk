@@ -222,8 +222,8 @@
                   (-> (.digest (.-subtle js/crypto) "SHA-256" buf)
                       (.then (fn [d]
                                (let [hex (apply str (map #(text/pad-left (.toString % 16) 2 "0") (array-seq (js/Uint8Array. d))))]
-                                 (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file) hex]))))
-                      (.catch (fn [_] (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file) nil]))))))))))
+                                 (rf/dispatch [:run-import-bytes (js/Uint8Array. buf) (.-name file) hex])))))))
+         (.catch (fn [_] (rf/dispatch [::read-file-failed])))))))
 
 (rf/reg-fx
  ::download-file
@@ -312,7 +312,7 @@
        (assoc-in db [:ui :load-error] "保存済みの帳簿を読み取れませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、復旧方法を確認してください。")))))
 
 (defn- with-store
-  "db → db' の effect に、変えた data を保存する ::store を足す（data が空なら保存を消す）。"
+  "db → db' の effect に、変更した帳簿と設定を保存する ::store を足す。"
   [db db' fx]
   (let [file-op (cond (::store-file fx) {:put (::store-file fx)}
                       (::delete-file fx) {:delete (::delete-file fx)}
@@ -321,11 +321,7 @@
     (or file-op (not= (:data db) (:data db'))
         (not= (saved-state db) (saved-state db')))
     (assoc ::store {:backend (:backend db') :file-op file-op
-                    :saved (when (or (seq (:entries (:data db'))) (seq (:accounts (:data db')))
-                                     (seq (:invoices (:data db'))) (seq (:business (:data db')))
-                                     (seq (:statement-lines (:data db'))) (seq (:rules (:data db')))
-                                     (seq (:statement-accounts (:data db'))) (seq (:files (:data db'))))
-                             (saved-state db'))}))))
+                    :saved (saved-state db')}))))
 
 (defn- reg-data-event
   "data を変える event。handler は (fn [db event] db')。変えた data を ::store
@@ -341,6 +337,12 @@
 
 (rf/reg-event-db ::stored-ok (fn [db _] (assoc-in db [:ui :store-error] nil)))
 (rf/reg-event-db ::store-failed (fn [db [_ msg]] (assoc-in db [:ui :store-error] msg)))
+
+(rf/reg-event-db
+ ::read-file-failed
+ (fn [db _]
+   (assoc-in db [:ui :import-result :error]
+             "ファイルを読み取るか SHA-256 を計算できませんでした。元ファイルを保存できないため、取り込みを中止しました。")))
 
 ;; 別タブが旧保存先へ書いた場合も、再読込を待たず控えを案内する。
 (rf/reg-event-db ::legacy-written

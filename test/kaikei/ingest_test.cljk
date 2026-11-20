@@ -198,3 +198,63 @@
   (testing "知らない通貨は桁を推測しない"
     (is (= 0 (count (:entries (ingest/ingest-text (str (fs/readFileSync "test/fixtures/xero-journals.json"))
                                                   {:currency "XXX"})))))))
+
+(deftest native-json-reports-dropped-accounts
+  (doseq [accounts ["[42]" "null" "{}" "[{}]" "[{\"name\":null}]" "[{\"name\":\" \"}]" "[{\"name\":42}]"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"currency\":\"JPY\",\"accounts\":" accounts ",\"entries\":[]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:rejected result)) accounts)
+      (is (seq (:warnings result)) accounts))))
+
+(deftest native-json-reports-unknown-account-class
+  (let [input "{\"format\":\"kaikei.ledger.v1\",\"accounts\":[{\"name\":\"cash\",\"class\":\"future-class\"}],\"entries\":[]}"
+        result (ingest/ingest-text input {:format "kaikei-json"})]
+    (is (= 1 (:rejected result)))
+    (is (seq (:warnings result)))
+    (is (empty? (:accounts result)))))
+
+(deftest native-json-reports-unknown-invoice-enums
+  (doseq [field ["status" "tax_mode" "rounding"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"invoices\":[{\"kind\":\"sales\",\"lines\":[],\"" field "\":\"future\"}]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:invoices-rejected result)) field)
+      (is (seq (:warnings result)) field)))
+  (let [input "{\"format\":\"kaikei.ledger.v1\",\"invoices\":[{\"kind\":\"sales\",\"lines\":[{\"amount\":1,\"category\":\"future\"}]}]}"
+        result (ingest/ingest-text input {:format "kaikei-json"})]
+    (is (= 1 (:invoices-rejected result)))
+    (is (seq (:warnings result)))))
+
+(deftest native-json-reports-dropped-collections
+  (doseq [[field value] [["statement_accounts" "[{}]"] ["rules" "[{}]"]
+                         ["files" "[{}]"] ["rules" "null"] ["files" "{}"]]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"currency\":\"JPY\",\"entries\":[],\"" field "\":" value "}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:rejected result)) field)
+      (is (seq (:warnings result)) field))))
+
+(deftest native-json-reports-unknown-statement-kind-and-rule-direction
+  (doseq [[field record] [["statement_accounts" "{\"id\":\"a1\",\"kind\":\"future\"}"]
+                          ["rules" "{\"when\":{\"text\":\"x\",\"direction\":\"future\"},\"then\":{\"account\":\"cash\"}}"]]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"" field "\":[" record "]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:rejected result)) field)
+      (is (seq (:warnings result)) field))))
+
+(deftest native-json-reports-malformed-transaction-arrays
+  (doseq [field ["entries" "invoices" "statement_lines"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"currency\":\"JPY\",\"" field "\":null}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (pos? (:rejected result)) field)
+      (is (seq (:warnings result)) field))))
+
+(deftest native-json-rule-operator-validation
+  (doseq [op ["future-op" "" "CONTAINS"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"rules\":[{\"when\":{\"text\":\"x\",\"op\":\"" op "\"},\"then\":{\"account\":\"cash\"}}]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 1 (:rejected result)) op)
+      (is (seq (:warnings result)) op)))
+  (doseq [op ["exact" "prefix" "suffix" "contains"]]
+    (let [input (str "{\"format\":\"kaikei.ledger.v1\",\"rules\":[{\"when\":{\"text\":\"x\",\"op\":\"" op "\"},\"then\":{\"account\":\"cash\"}}]}")
+          result (ingest/ingest-text input {:format "kaikei-json"})]
+      (is (= 0 (:rejected result)) op)
+      (is (= (keyword op) (get-in result [:rules 0 :when :op])) op))))

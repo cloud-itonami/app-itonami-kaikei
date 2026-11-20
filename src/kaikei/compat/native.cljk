@@ -114,6 +114,9 @@
   (let [v (kw (get m k))]
     (if (contains? (invoice-enums k) v) v default)))
 
+(defn- known-enum-or-absent? [m k]
+  (or (not (contains? m k)) (contains? (invoice-enums k) (kw (get m k)))))
+
 (defn- integer-value? [v] (and (number? v) (integer? v)))
 
 (defn- invoice-line-in [m]
@@ -150,6 +153,9 @@
       {:problem (str where ": 金額は最小通貨単位の整数で書きます")}
       (not (contains? #{:sales :purchase} (kw (get m "kind"))))
       {:problem (str where ": kind は sales か purchase です")}
+      (not (and (every? #(known-enum-or-absent? m %) ["status" "tax_mode" "rounding"])
+                (every? #(known-enum-or-absent? % "category") lines)))
+      {:problem (str where ": 未対応の状態または税区分があります")}
       :else
       {:invoice (cond-> {:kind (enum m "kind" :sales)
                          :number (str (get m "number" ""))
@@ -189,7 +195,8 @@
 (defn- str-or-nil [v] (when (and (string? v) (not (text/blank? v))) v))
 
 (defn- statement-account-in [m]
-  (when (and (map? m) (str-or-nil (get m "id")))
+  (when (and (map? m) (str-or-nil (get m "id"))
+             (or (not (contains? m "kind")) (#{:bank :card :expense} (kw (get m "kind")))))
     (cond-> {:id (get m "id")
              :kind (or (#{:bank :card :expense} (kw (get m "kind"))) :bank)
              :name (str (get m "name" ""))
@@ -238,7 +245,9 @@
 
 (defn- rule-in [m]
   (let [w (get m "when") t (get m "then")]
-    (when (and (map? m) (map? w) (map? t) (str-or-nil (get w "text")) (str-or-nil (get t "account")))
+    (when (and (map? m) (map? w) (map? t) (str-or-nil (get w "text")) (str-or-nil (get t "account"))
+               (or (not (contains? w "op")) (#{:exact :prefix :suffix :contains} (kw (get w "op"))))
+               (or (not (contains? w "direction")) (#{:in :out} (kw (get w "direction")))))
       (cond-> {:when (cond-> {:text (get w "text")
                               :op (or (#{:exact :prefix :suffix :contains} (kw (get w "op"))) :contains)}
                        (#{:in :out} (kw (get w "direction"))) (assoc :direction (kw (get w "direction")))
@@ -283,6 +292,21 @@
 
 (defn detect? [data] (and (map? data) (= format-id (get data "format"))))
 
+(defn- rejected-items [data key accept?]
+  (if-not (contains? data key)
+    0
+    (let [items (get data key)]
+      (if (sequential? items) (count (remove accept? items)) 1))))
+
+(defn- safe-items [data key]
+  (let [items (get data key)] (if (sequential? items) items [])))
+
+(defn- valid-account? [account]
+  (and (map? account) (string? (get account "name"))
+       (not (text/blank? (get account "name")))
+       (or (not (contains? account "class"))
+           (contains? core/class-code (kw (get account "class"))))))
+
 (defn read-data
   "構文解析済みの JSON（文字列キー）→ 取り込み結果。"
   [data]
@@ -290,33 +314,45 @@
     {:format :kaikei-json :entries [] :accounts []
      :warnings [(str "\"format\": \"" format-id "\" の JSON ではありません")] :rejected 0}
     (let [currency (get data "currency" "JPY")
-          candidates (map-indexed read-entry (get data "entries" []))
-          invoices (map-indexed read-invoice (get data "invoices" []))]
+          accounts (safe-items data "accounts")
+          invalid-accounts (rejected-items data "accounts" valid-account?)
+          invalid-statement-accounts (rejected-items data "statement_accounts" statement-account-in)
+          invalid-rules (rejected-items data "rules" rule-in)
+          invalid-files (rejected-items data "files" file-in)
+          malformed-entries (if (and (contains? data "entries") (not (sequential? (get data "entries")))) 1 0)
+          malformed-invoices (if (and (contains? data "invoices") (not (sequential? (get data "invoices")))) 1 0)
+          malformed-lines (if (and (contains? data "statement_lines") (not (sequential? (get data "statement_lines")))) 1 0)
+          invalid-collections (+ invalid-accounts invalid-statement-accounts invalid-rules invalid-files
+                                 malformed-entries malformed-invoices malformed-lines)
+          candidates (map-indexed read-entry (safe-items data "entries"))
+          invoices (map-indexed read-invoice (safe-items data "invoices"))]
       (if-not (core/exponent currency)
         {:format :kaikei-json :entries [] :accounts []
          :warnings [(str "通貨 " currency " の桁を知らないので取り込みません")] :rejected 0}
         (cond-> {:format :kaikei-json
                  :currency currency
-                 :accounts (mapv read-account (filter map? (get data "accounts" [])))
+                 :accounts (mapv read-account (filter valid-account? accounts))
                  :entries (vec (keep :entry candidates))
-                 :warnings (vec (concat (keep :problem candidates) (keep :problem invoices)))
-                 :rejected (count (filter :problem candidates))}
+                 :warnings (vec (concat (when (pos? invalid-collections)
+                                          [(str "帳簿の配列・項目のうち " invalid-collections " 件を読めません")])
+                                        (keep :problem candidates) (keep :problem invoices)))
+                 :rejected (+ invalid-collections (count (filter :problem candidates)))}
           (contains? data "invoices") (assoc :invoices (vec (keep :invoice invoices))
                                              :invoices-rejected (count (filter :problem invoices)))
           (business-in (get data "business")) (assoc :business (business-in (get data "business")))
           (invoice-settings-in (get data "invoice_settings"))
           (assoc :invoice-settings (invoice-settings-in (get data "invoice_settings")))
           (or (contains? data "statement_lines") (contains? data "statement_accounts"))
-          (as-> r (let [ls (map-indexed read-statement-line (get data "statement_lines" []))]
+          (as-> r (let [ls (map-indexed read-statement-line (safe-items data "statement_lines"))]
                     (-> r
-                        (assoc :statement-accounts (vec (keep statement-account-in (get data "statement_accounts" [])))
+                        (assoc :statement-accounts (vec (keep statement-account-in (safe-items data "statement_accounts")))
                                :statement-lines (vec (keep :line ls)))
                         (update :warnings into (keep :problem ls))
                         (update :rejected + (count (filter :problem ls))))))
-          (contains? data "rules") (assoc :rules (vec (keep rule-in (get data "rules" []))))
+          (contains? data "rules") (assoc :rules (vec (keep rule-in (safe-items data "rules"))))
           (statement-settings-in (get data "statement_settings"))
           (assoc :statement-settings (statement-settings-in (get data "statement_settings")))
-          (contains? data "files") (assoc :files (vec (keep file-in (get data "files" [])))))))))
+          (contains? data "files") (assoc :files (vec (keep file-in (safe-items data "files")))))))))
 
 (defn- line-out [l]
   (json/ordered
