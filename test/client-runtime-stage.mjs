@@ -7,8 +7,8 @@ import { join } from 'node:path';
 
 const [preview, runtimeRepo] = process.argv.slice(2);
 if (!preview || !runtimeRepo) throw new Error('expected preview directory and canonical runtime repository');
-const sha = 'a1b90e38c9e5334facfa993062e237299c70de10';
-const expected = 'd6f67c058c5c40fc56fe500648dc79704a2eee02d4af75fc17898aad1f560a75';
+const sha = 'ee75001ee44a9b793602d1549e5e977c4562a5fe';
+const expected = 'e7bcd2d729ceeed3460cc766335a2ff4d0937f9af7a82b038c5df9d20e427ebe';
 const staged = readFileSync(join(preview, 'runtime/kotoba-client-runtime.js'));
 const canonical = execFileSync('git', ['-C', runtimeRepo, 'show', `${sha}:lib/kotoba.wasmWebcomponent/src/kotoba-client-runtime.js`]);
 assert.deepEqual(staged, canonical);

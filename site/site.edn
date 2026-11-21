@@ -15,10 +15,10 @@
  :page {:ns kaikei.page :fn document}
  ;; Stage the exact canonical broker. It is not loaded and grants no operations.
  :client-runtime {:repo "kotoba-lang/kotoba"
-                  :sha "a1b90e38c9e5334facfa993062e237299c70de10"
+                  :sha "ee75001ee44a9b793602d1549e5e977c4562a5fe"
                   :files [{:from "lib/kotoba.wasmWebcomponent/src/kotoba-client-runtime.js"
                            :to "runtime/kotoba-client-runtime.js"
-                           :sha256 "d6f67c058c5c40fc56fe500648dc79704a2eee02d4af75fc17898aad1f560a75"}]}
+                           :sha256 "e7bcd2d729ceeed3460cc766335a2ff4d0937f9af7a82b038c5df9d20e427ebe"}]}
  :vendor ["react.production.min.js" "react-dom.production.min.js"
           "scittle.js" "scittle.reagent.js" "scittle.re-frame.js"]
  :external [{:repo "kotoba-lang/text" :sha "bc551a3ecc68e551ba1dd2fcb22d5f1b8dd7805d"

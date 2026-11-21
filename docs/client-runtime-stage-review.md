@@ -102,3 +102,11 @@ broker and expect the new digest (they still expected the archived
 no disclosure because their recipients are not confirmed, so the runtime refuses
 them and they send nothing. kaikei still declares no operations; this remains an
 inert staged asset, not host integration.
+
+## 2026-11-22 re-pin to e7bcd2d7 (AWAI-3821)
+
+`site/site.edn`, `test/client-runtime-stage.mjs` and the fixtures now pin `kotoba-lang/kotoba`
+`ee75001ee44a9b793602d1549e5e977c4562a5fe` (#1370, with #1369), SHA-256
+`e7bcd2d729ceeed3460cc766335a2ff4d0937f9af7a82b038c5df9d20e427ebe`. The dialog now also shows the
+declared frequency, withdrawal place and foreign line in trusted-page-v1 and accepts an optional
+`disclosure.note`. kaikei still declares no operations; this remains an inert staged asset.
