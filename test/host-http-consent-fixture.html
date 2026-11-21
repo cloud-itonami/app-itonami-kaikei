@@ -1,4 +1,5 @@
 <!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="frame-src 'none'; connect-src https://api.github.com"><title>Consent HTTP synthetic probe</title><h1>Consent HTTP synthetic probe</h1><p id="state">preparing</p><main></main>
+<!-- disclosure 未確定 (AWAI-3810): the recipient's legal name and country for the GitHub endpoint are not confirmed, so the operation carries no disclosure and the runtime refuses it; setup fails closed and sends nothing. -->
 <script type="module">
 import {createClientConsentHost,createClientOperationBroker,verifyClientArtifact,mountRestrictedClientApp} from './runtime.js';
 const url='https://api.github.com/repos/holochain/holochain'; const op={capability:'test/public-metadata',service:'github-public-fixture',operation:'read',consent:'each-operation','data-categories':['public-repository-metadata'],endpoint:{origin:'https://api.github.com',method:'GET',path:'/repos/holochain/holochain'}};

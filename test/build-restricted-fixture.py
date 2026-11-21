@@ -17,7 +17,7 @@ if out.exists() and any(out.iterdir()):
     raise SystemExit("output directory must be empty")
 out.mkdir(parents=True, exist_ok=True)
 runtime = (preview / "runtime/kotoba-client-runtime.js").read_bytes()
-expected = "7f760128c3a58098123c31ec3dd34b9c871932e3933f2c952facc4ab0e647212"
+expected = "d6f67c058c5c40fc56fe500648dc79704a2eee02d4af75fc17898aad1f560a75"
 if hashlib.sha256(runtime).hexdigest() != expected:
     raise SystemExit("unexpected canonical runtime digest")
 (out / "console.js").write_bytes(runtime)
@@ -45,13 +45,13 @@ digest = hashlib.sha256(content).hexdigest()
 host = '''<!doctype html><title>Kaikei isolated fixture</title>
 <h1>Kaikei isolated fixture</h1><p id="status">Loading</p><div id="app"></div>
 <script type="module">
-import {verifyClientArtifact,mountRestrictedClientApp} from './console.js';
+import {createClientConsentHost,createClientOperationBroker,verifyClientArtifact,mountRestrictedClientApp} from './console.js';
 try {
   const bytes = new Uint8Array(await (await fetch('./kaikei-inline.html')).arrayBuffer());
   const artifact = await verifyClientArtifact(bytes, {revision:'1111111111111111111111111111111111111111',
     sha256:FIXTURE_DIGEST, 'max-bytes':8388608});
   await mountRestrictedClientApp({artifact,container:document.querySelector('#app'),
-    broker:{invoke:async()=>{throw Error('fixture has no eligible operations')}}});
+    broker:createClientOperationBroker({runtime:{schema:'kotoba.app.client-runtime.v1',target:'browser',profile:'restricted-wasm-v1',entry:'app.html','local-state':{adapter:'localstorage',schema:'test.state.v1',version:1},workers:[],operations:[]},consentHost:createClientConsentHost()})});
   document.querySelector('#status').textContent = 'Mounted: no operations';
 } catch (error) { document.querySelector('#status').textContent = 'FAIL ' + error.message; }
 </script>'''.replace("FIXTURE_DIGEST", json.dumps(digest))

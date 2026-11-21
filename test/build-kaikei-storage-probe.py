@@ -16,7 +16,7 @@ if out.exists() and any(out.iterdir()):
     raise SystemExit('output directory must be empty')
 out.mkdir(parents=True, exist_ok=True)
 runtime = (preview / 'runtime/kotoba-client-runtime.js').read_bytes()
-expected = '7f760128c3a58098123c31ec3dd34b9c871932e3933f2c952facc4ab0e647212'
+expected = 'd6f67c058c5c40fc56fe500648dc79704a2eee02d4af75fc17898aad1f560a75'
 if hashlib.sha256(runtime).hexdigest() != expected:
     raise SystemExit('unexpected runtime digest')
 (out / 'console.js').write_bytes(runtime)
@@ -121,7 +121,7 @@ digest = hashlib.sha256(content).hexdigest()
 host = '''<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="frame-src 'none'"><title>Kaikei synthetic storage probe</title>
 <h1>kaikei 合成保存 probe</h1><p id="status">準備中</p><div id="app"></div>
 <script type="module">
-import {verifyClientArtifact,mountRestrictedClientApp} from './console.js';
+import {createClientConsentHost,createClientOperationBroker,verifyClientArtifact,mountRestrictedClientApp} from './console.js';
 import {bindFixturePort} from './port.mjs';
 import {watchFixtureGuest} from './lifetime.mjs';
 import {readFixture,compareAndSwapFixture} from './store.mjs';
@@ -129,7 +129,7 @@ try {
   const bytes=new Uint8Array(await (await fetch('./kaikei-inline.html')).arrayBuffer());
   const artifact=await verifyClientArtifact(bytes,{revision:'1111111111111111111111111111111111111111',sha256:DIGEST,'max-bytes':8388608});
   const container=document.querySelector('#app');
-  await mountRestrictedClientApp({artifact,container,broker:{invoke:async()=>{throw Error('no eligible operations')}}});
+  await mountRestrictedClientApp({artifact,container,broker:createClientOperationBroker({runtime:{schema:'kotoba.app.client-runtime.v1',target:'browser',profile:'restricted-wasm-v1',entry:'app.html','local-state':{adapter:'localstorage',schema:'test.state.v1',version:1},workers:[],operations:[]},consentHost:createClientConsentHost()})});
   const frame=container.querySelector('iframe'), channel=new MessageChannel();
   const bridge=bindFixturePort(channel.port1,{read:readFixture,write:compareAndSwapFixture});
   const lifetime=watchFixtureGuest(frame,container,bridge); let loaded=false;
