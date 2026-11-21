@@ -17,7 +17,7 @@ if out.exists() and any(out.iterdir()):
     raise SystemExit("output directory must be empty")
 out.mkdir(parents=True, exist_ok=True)
 runtime = (preview / "runtime/kotoba-client-runtime.js").read_bytes()
-expected = "e7bcd2d729ceeed3460cc766335a2ff4d0937f9af7a82b038c5df9d20e427ebe"
+expected = "37e826338686eefbb2b9c7a731b73c53f7f5d6864158c0790edad60f25682d6d"
 if hashlib.sha256(runtime).hexdigest() != expected:
     raise SystemExit("unexpected canonical runtime digest")
 (out / "console.js").write_bytes(runtime)

@@ -110,3 +110,9 @@ inert staged asset, not host integration.
 `e7bcd2d729ceeed3460cc766335a2ff4d0937f9af7a82b038c5df9d20e427ebe`. The dialog now also shows the
 declared frequency, withdrawal place and foreign line in trusted-page-v1 and accepts an optional
 `disclosure.note`. kaikei still declares no operations; this remains an inert staged asset.
+
+## 2026-11-22 re-pin to 37e82633 (AWAI-3826)
+
+Pinned `kotoba-lang/kotoba` `e58ae70b4bdc818b3feec767f7ac9908cd6e7a2c` (#1371: the dialog's links are in its
+Tab cycle), SHA-256 `37e826338686eefbb2b9c7a731b73c53f7f5d6864158c0790edad60f25682d6d`. kaikei still declares no
+operations; this remains an inert staged asset.
