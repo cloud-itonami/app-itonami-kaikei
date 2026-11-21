@@ -12,7 +12,7 @@ if len(sys.argv) not in (4, 5) or (len(sys.argv) == 5 and sys.argv[4] != '--http
 preview, runtime, out = map(Path, sys.argv[1:4])
 http = len(sys.argv) == 5
 data = runtime.read_bytes()
-if hashlib.sha256(data).hexdigest() != '0d8ed12a795fdf46de32ac01c0675adec9f22df64f24769a4d4a960d6a345ac5':
+if hashlib.sha256(data).hexdigest() != 'd6f67c058c5c40fc56fe500648dc79704a2eee02d4af75fc17898aad1f560a75':
     raise SystemExit('unexpected reviewed monorepo runtime digest')
 root = Path(__file__).resolve().parents[1]
 subprocess.run([sys.executable, str(root / 'test/build-kaikei-storage-probe.py'), str(preview), str(out)], check=True)
@@ -48,19 +48,18 @@ page.write_text(html.replace('<head>', '<head>' + guest, 1))
 digest = hashlib.sha256(page.read_bytes()).hexdigest()
 host = out / 'index.html'
 text = host.read_text()
-old = "import {verifyClientArtifact,mountRestrictedClientApp} from './console.js';"
-new = "import {createClientConsentHost,createClientOperationBroker,verifyClientArtifact,mountRestrictedClientApp} from './console.js';"
-if text.count(old) != 1:
+if text.count("import {createClientConsentHost,createClientOperationBroker,verifyClientArtifact,mountRestrictedClientApp} from './console.js';") != 1:
     raise SystemExit('unexpected host import')
-text = text.replace(old, new)
-old = "await mountRestrictedClientApp({artifact,container,broker:{invoke:async()=>{throw Error('no eligible operations')}}});"
-new = '''const op={capability:'test/browser-counter',service:'local-fixture',operation:'increment',consent:'each-operation','data-categories':['fixture-number'],endpoint:{origin:'https://fixture.invalid','browser-action':'test/counter'}};
+old = "await mountRestrictedClientApp({artifact,container,broker:createClientOperationBroker({runtime:{schema:'kotoba.app.client-runtime.v1',target:'browser',profile:'restricted-wasm-v1',entry:'app.html','local-state':{adapter:'localstorage',schema:'test.state.v1',version:1},workers:[],operations:[]},consentHost:createClientConsentHost()})});"
+new = '''const op={capability:'test/browser-counter',service:'local-fixture',operation:'increment',consent:'each-operation','data-categories':['fixture-number'],endpoint:{origin:'https://fixture.invalid','browser-action':'test/counter'},disclosure:{recipient:'Synthetic Test Recipient',country:'JP',data:['テスト用の数値'],'special-care':false,purpose:'同意の画面を確かめるための合成の操作です。',frequency:'one-time',withdrawal:'設定 › 許可した送信'}};
   const runtime={schema:'kotoba.app.client-runtime.v1',target:'browser',profile:'restricted-wasm-v1',entry:'app.html','local-state':{adapter:'localstorage',schema:'test.state.v1',version:1},workers:[],operations:[op]};
   let calls=0; const counter=document.createElement('p');counter.id='counter';counter.textContent='handler calls 0';document.body.prepend(counter);
   const consentHost=createClientConsentHost();
   const broker=createClientOperationBroker({runtime,requestedCapabilities:[op.capability],approvedOperations:[op],hostSupportedOperations:[[op.capability,op.service,op.operation]],consentHost,browserAdapters:{'local-fixture':{increment:()=>{counter.textContent='handler calls '+(++calls);return {value:1};}}}});
   await mountRestrictedClientApp({artifact,container,broker});'''
 if http:
+    # disclosure 未確定 (AWAI-3810): GitHub's recipient name, country and foreign-info-url are not
+    # confirmed, so this operation has no disclosure and the runtime refuses it (setup fails closed, no request).
     new = '''const url='https://api.github.com/repos/holochain/holochain';
   const op={capability:'test/public-metadata',service:'github-public-fixture',operation:'read',consent:'each-operation','data-categories':['public-repository-metadata'],endpoint:{origin:'https://api.github.com',method:'GET',path:'/repos/holochain/holochain'}};
   const runtime={schema:'kotoba.app.client-runtime.v1',target:'browser',profile:'restricted-wasm-v1',entry:'app.html','local-state':{adapter:'localstorage',schema:'test.state.v1',version:1},workers:[],operations:[op]};

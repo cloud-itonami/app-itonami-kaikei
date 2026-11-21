@@ -86,3 +86,19 @@ pins, isolate and qualify the trusted
 host, obtain service-specific API and authorization details, declare exact
 operations and CSP, and test deny/allow/replay and redirects in a real browser.
 Do not publish or cut over on the basis of this staging candidate.
+
+## 2026-11-22 re-pin (AWAI-3810)
+
+`site/site.edn` and `test/client-runtime-stage.mjs` now pin `kotoba-lang/kotoba`
+`a1b90e38c9e5334facfa993062e237299c70de10` (#1367, KOTOBA-159),
+SHA-256 `d6f67c058c5c40fc56fe500648dc79704a2eee02d4af75fc17898aad1f560a75`.
+That revision requires a `disclosure` for every operation (recipient legal name,
+country, data, purpose, frequency, withdrawal; country-name and foreign-info-url
+outside Japan), `scope: "lan"` for internal addresses, and mounts only a broker
+made by `createClientOperationBroker`. The stage test checks those refusals.
+The restricted, storage and consent fixtures now mount a canonical no-operation
+broker and expect the new digest (they still expected the archived
+`wasm-webcomponent` digest before). The GitHub and PayPay sandbox fixtures carry
+no disclosure because their recipients are not confirmed, so the runtime refuses
+them and they send nothing. kaikei still declares no operations; this remains an
+inert staged asset, not host integration.
