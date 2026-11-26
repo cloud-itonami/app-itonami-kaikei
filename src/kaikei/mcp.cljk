@@ -6,7 +6,8 @@
   map（通知なら nil）を返す純関数だけを持つ。判定は画面と同じ adapter
   （kaikei.core / ingest / export）で、書き直さない。
 
-  tool は 11。どれも送信せず、保存せず、各社（MoneyForward・freee・弥生・
+  下の既存 tool と、kaikei.tax-semantic から導く確定申告 tool を提供する。
+  いずれも送信せず、ディスクへ保存せず、各社（MoneyForward・freee・弥生・
   QuickBooks・Xero・Zoho・FreshBooks）の API にも、国税庁の公表サイトにも、
   銀行・カード会社にも接続しない:
 
@@ -38,6 +39,9 @@
             [kaikei.invoice :as invoice]
             [kaikei.statement :as statement]
             [kaikei.json :as json]
+            [kaikei.tax-mcp :as tax-mcp]
+            [kaikei.tax-semantic :as semantic]
+            [kaikei.taxreturn :as tax]
             [kaikei.compat.common :as common]
             [kaikei.compat.native :as native]))
 
@@ -703,39 +707,78 @@
         {"content" [{"type" "text" "text" (to-json {"error" "internal-error" "detail" (ex-message e)})}]
          "isError" true}))))
 
-(defn handle
-  "JSON-RPC の 1 通（文字列キーの map）→ 応答の map。通知（id の無いもの）は nil。"
-  [msg]
+(def initial-session {:workspace tax/empty-workspace})
+
+(defn- tax-ledger-arg [args]
+  (let [{:keys [entries accounts currency files warnings]} (native/read-data (get args "ledger"))]
+    (when (seq warnings)
+      (throw (tool-error "invalid-ledger" "argument" "ledger")))
+    {:currency currency :entries entries :files files
+     :accounts (into {} (map (juxt :name identity)) accounts)}))
+
+(defn- call-tax-tool [session actor id operation args]
+  (try
+    (let [ledger (when (or (= operation "ledger.import") (contains? args "ledger")) (tax-ledger-arg args))
+          {:keys [workspace payload]} (tax-mcp/call (:workspace session) operation args actor ledger)]
+      [(assoc session :workspace workspace)
+       (result id {"content" [{"type" "text" "text" (to-json payload)}]
+                   "structuredContent" payload "isError" false})])
+    (catch #?(:cljs :default :clj Exception) e
+      (let [error (or (::tool-error (ex-data e))
+                      {"error" (name (get (ex-data e) :taxreturn/error :internal-error))})]
+        [session (result id {"content" [{"type" "text" "text" (to-json error)}]
+                             "structuredContent" error "isError" true})]))))
+
+(defn handle-session
+  "Pure stdio state machine. The host supplies the process-local session and actor."
+  [session {:keys [actor app-html]} msg]
   (let [id (get msg "id")
         method (get msg "method")
         params (get msg "params" {})
-        notification? (not (contains? msg "id"))]
-    (cond
-      notification? nil
-      (= method "initialize")
-      (result id {"protocolVersion" (let [v (get params "protocolVersion")]
-                                      (if (and (string? v) (not (text/blank? v))) v default-protocol-version))
-                  "capabilities" {"tools" {}}
-                  "serverInfo" {"name" server-name "version" server-version}})
-      (= method "ping") (result id {})
-      (= method "tools/list")
-      (result id {"tools" (mapv #(dissoc % "run") tools)})
-      (= method "tools/call")
-      (let [tool (tool-by-name (get params "name"))
-            args (get params "arguments" {})]
-        (cond
-          (nil? tool) (rpc-error id -32602 (str "Unknown tool: " (get params "name")))
-          (not (map? args)) (rpc-error id -32602 "arguments must be an object")
-          :else (result id (call-tool tool args))))
-      :else (rpc-error id -32601 (str "Method not found: " method)))))
+        apps? (:apps? session)
+        answer (fn [payload] [session (result id payload)])
+        error (fn [code message] [session (rpc-error id code message)])]
+    (if-not (contains? msg "id")
+      [session nil]
+      (case method
+        "initialize"
+        (let [apps? (and (some? app-html) (tax-mcp/app-capable? (get params "capabilities")))
+              v (get params "protocolVersion")]
+          [(assoc session :apps? apps?)
+           (result id {"protocolVersion" (if (and (string? v) (not (text/blank? v))) v default-protocol-version)
+                       "capabilities" (cond-> {"tools" {}} apps? (assoc "resources" {}))
+                       "serverInfo" {"name" server-name "version" server-version}})])
+        "ping" (answer {})
+        "tools/list" (answer {"tools" (into (mapv #(dissoc % "run") tools) (tax-mcp/tools apps?))})
+        "resources/list" (answer {"resources" (if apps? [tax-mcp/resource] [])})
+        "resources/read" (if (and apps? (= tax-mcp/resource-uri (get params "uri")))
+                           (answer {"contents" [(tax-mcp/resource-content app-html)]})
+                           (error -32002 "Resource not found"))
+        "tools/call"
+        (let [name (get params "name")
+              tool (tool-by-name name)
+              args (get params "arguments" {})]
+          (cond
+            (not (map? args)) (error -32602 "arguments must be an object")
+            (contains? semantic/operation-by-id name) (call-tax-tool session actor id name args)
+            tool (answer (call-tool tool args))
+            :else (error -32602 (str "Unknown tool: " name))))
+        (error -32601 (str "Method not found: " method))))))
+
+(defn handle
+  "JSON-RPC の 1 通（文字列キーの map）→ 応答の map。通知（id の無いもの）は nil。"
+  [msg]
+  (second (handle-session initial-session {} msg)))
 
 (defn handle-line
-  "stdin の 1 行 → 書き出す 1 行（JSON 文字列）か nil。空行は無視、読めない行は
-  JSON-RPC の parse error（id null）にする。"
-  [line]
-  (when-not (text/blank? line)
-    (let [msg (try (json/parse line) (catch #?(:cljs :default :clj Exception) _ ::bad))]
-      (cond
-        (= msg ::bad) (to-json (rpc-error nil -32700 "Parse error"))
-        (not (map? msg)) (to-json (rpc-error nil -32600 "Invalid Request"))
-        :else (some-> (handle msg) to-json)))))
+  "Parse one stdio line, returning the next session and encoded response."
+  ([line] (second (handle-line initial-session {} line)))
+  ([session runtime line]
+   (if (text/blank? line)
+     [session nil]
+     (let [msg (try (json/parse line) (catch #?(:cljs :default :clj Exception) _ ::bad))]
+       (cond
+         (= msg ::bad) [session (to-json (rpc-error nil -32700 "Parse error"))]
+         (not (map? msg)) [session (to-json (rpc-error nil -32600 "Invalid Request"))]
+         :else (let [[updated response] (handle-session session runtime msg)]
+                 [updated (some-> response to-json)]))))))

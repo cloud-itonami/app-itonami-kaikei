@@ -24,6 +24,8 @@
             [kaikei.export :as export]
             [kaikei.invoice :as invoice]
             [kaikei.statement :as statement]
+            [kaikei.taxreturn :as tax]
+            [kaikei.tax-semantic :as semantic]
             [kaikei.compat.statement-csv :as statement-csv]
             [kaikei.view :as view]))
 
@@ -409,6 +411,30 @@
     (str (.getFullYear d) "-" (p2 (inc (.getMonth d))) "-" (p2 (.getDate d)) "T" (p2 (.getHours d)) ":" (p2 (.getMinutes d))
          ":" (p2 (.getSeconds d)) (if (neg? off) "-" "+") (p2 (quot (js/Math.abs off) 60)) ":" (p2 (mod (js/Math.abs off) 60)))))
 
+(reg-ui-event :tax-field
+              (fn [db [_ field value]] (assoc-in db [:ui :tax-fields field] value)))
+
+(rf/reg-event-fx
+ :tax-operation
+ (fn [{:keys [db]} [_ operation arguments actor-id]]
+   (try
+     (let [workspace (get-in db [:data :taxreturn] tax/empty-workspace)
+           {:keys [output] updated :workspace}
+           (semantic/invoke workspace operation arguments
+                            {:ledger (:data db)
+                             :actor {:actor-id actor-id :actor-kind :human :at (now-iso)}
+                             :registry-lookup tax/manual-registry})
+           next-db (cond-> (update db :ui dissoc :tax-error)
+                     (not= workspace updated) (assoc-in [:data :taxreturn] updated)
+                     (not= workspace updated) (update :ui dissoc :tax-history :tax-preview)
+                     (= operation "revision.search") (assoc-in [:ui :tax-history] output)
+                     (= operation "invoice.verify_registry") (assoc-in [:ui :tax-registry] output)
+                     (= operation "taxreturn.preview_draft") (assoc-in [:ui :tax-preview] output)
+                     (= "approve" (get arguments "phase")) (assoc-in [:ui :tax-fields :approver] ""))]
+       (with-store db next-db {}))
+     (catch :default e
+       {:db (assoc-in db [:ui :tax-error] (get (ex-data e) :taxreturn/error :internal-error))}))))
+
 (defn- import-opts [ui]
   {:format (:import-format ui) :currency (:import-currency ui) :encoding (:import-encoding ui)})
 
@@ -509,12 +535,21 @@
  (fn [db [_ account v]]
    (update db :data core/set-class account (keyword v))))
 
+(defn- cleared-db [db]
+  (assoc db :data (merge core/empty-db (select-keys (:data db) [:taxreturn]))
+            :ui (assoc view/initial-ui :legacy-extra? (get-in db [:ui :legacy-extra?]))))
+
 (rf/reg-event-fx
  :clear-all
  (fn [{:keys [db]} _]
    (when-not (get-in db [:ui :clear-pending?])
-     {:db (assoc-in db [:ui :clear-pending?] true)
-      ::store {:backend (:backend db) :saved nil :file-op {:clear? true} :clear-snapshot (:data db)}})))
+     (let [snapshot (:data db)]
+       {:db (assoc-in db [:ui :clear-pending?] true)
+        ::store {:backend (:backend db)
+                 :saved (when (:taxreturn snapshot)
+                          (saved-state (cleared-db db)))
+                 :file-op {:clear? true}
+                 :clear-snapshot snapshot}}))))
 
 (rf/reg-event-db
  ::clear-failed
@@ -524,8 +559,7 @@
  ::clear-committed
  (fn [db [_ snapshot]]
    (if (= snapshot (:data db))
-     (assoc db :data core/empty-db
-               :ui (assoc view/initial-ui :legacy-extra? (get-in db [:ui :legacy-extra?])))
+     (cleared-db db)
      (do
        ;; 消去待ちの間に非同期処理が内容を変えた場合、画面の内容を消さない。
        (reset! file-write-failed? true)

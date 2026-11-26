@@ -1,0 +1,207 @@
+(ns kaikei.tax-semantic
+  "The operation contract shared by the browser workflow and MCP."
+  (:require [kaikei.taxreturn :as tax]))
+
+(def schema-version "https://json-schema.org/draft/2020-12/schema")
+
+(defn- object [properties required]
+  {"type" "object" "properties" properties "required" required "additionalProperties" false})
+
+(defn- array [items] {"type" "array" "items" items})
+(defn- choice [values] {"enum" values})
+(def ^:private string-value {"type" "string"})
+(def ^:private label-value {"type" "string" "minLength" 1 "maxLength" 512})
+(def ^:private boolean-value {"type" "boolean"})
+(def ^:private yen {"type" "integer" "minimum" 0 "maximum" 999999999999})
+(def ^:private date-value {"type" "string" "pattern" "^\\d{4}-\\d{2}-\\d{2}$"})
+(def ^:private invoice-number {"type" "string" "pattern" "^T[0-9]{13}$"})
+(def ^:private card-id {"type" "integer" "minimum" 1})
+(def ^:private line (object {"account" label-value "debit" yen "credit" yen}
+                            ["account" "debit" "credit"]))
+(def ^:private entry-fields {"date" date-value "memo" string-value "lines" (array line)})
+(def ^:private entry (object (assoc entry-fields "id" label-value) ["id" "date" "lines"]))
+(def ^:private ledger-input
+  {"type" "object" "description" "Local kaikei.ledger.v1 object. Supply only synthetic data over MCP."})
+(def ^:private classification-input
+  (object {"entry-id" label-value "category" (choice tax/categories)} ["entry-id" "category"]))
+(def ^:private adjustment-input
+  (object {"category" (choice ["business" "miscellaneous"])
+           "kind" (choice tax/adjustment-kinds) "entry" entry} ["category" "kind" "entry"]))
+(def ^:private deduction-fields
+  {"blue-amount" (choice tax/blue-choices) "resident-standard-only" {"const" true}})
+(def ^:private scenario-fields (assoc deduction-fields "salary-income" yen))
+(def ^:private scenario-required ["salary-income" "blue-amount" "resident-standard-only"])
+
+(defn- approval [preview]
+  {"type" "object"
+   "oneOf" [(-> preview
+                  (assoc-in ["properties" "phase"] {"const" "preview"})
+                  (update "required" conj "phase"))
+             (object {"phase" {"const" "approve"} "card-id" card-id} ["phase" "card-id"])]})
+
+(def ^:private revision
+  {"type" "object"
+   "oneOf" [(object {"target" (choice ["entry" "evidence"])
+                     "record-id" label-value "kind" {"const" "void"} "reason" label-value}
+                    ["target" "record-id" "kind" "reason"])
+             (object {"target" {"const" "entry"} "record-id" label-value
+                      "kind" {"const" "correction"} "reason" label-value
+                      "value" (object entry-fields [])}
+                     ["target" "record-id" "kind" "reason" "value"])
+             (object {"target" {"const" "evidence"} "record-id" label-value
+                      "kind" {"const" "correction"} "reason" label-value
+                      "value" (object {"name" label-value} ["name"])}
+                     ["target" "record-id" "kind" "reason" "value"])]})
+
+(defn- operation [id label step mode schema]
+  {:id id :label label :step step :mode mode :input-schema (assoc schema "$schema" schema-version)})
+
+(def steps
+  [{:id "ledger" :label "帳簿確認"}
+   {:id "closing" :label "決算整理"}
+   {:id "deduction" :label "控除"}
+   {:id "review" :label "下書き確認"}
+   {:id "manual" :label "手動提出"}])
+
+(def operations
+  [(operation "ledger.import" "対象年の帳簿を取り込む" "ledger" "local-write"
+              (object {"year" (choice tax/supported-years)
+                       "ledger" ledger-input}
+                      ["year"]))
+   (operation "income.classify" "所得区分を記録" "closing" "local-write" classification-input)
+   (operation "adjustment.draft" "調整仕訳を追加" "closing" "local-write" adjustment-input)
+   (operation "closing.finalize" "決算整理を確認" "closing" "human-approval"
+              (approval (object {"salary-income" yen} ["salary-income"])))
+   (operation "deduction.apply" "控除を試算に反映" "deduction" "local-write"
+              (object deduction-fields ["blue-amount" "resident-standard-only"]))
+   (operation "taxreturn.preview_draft" "申告書下書きを表示" "review" "read"
+              {"type" "object"
+               "oneOf" [(object {} [])
+                        (object scenario-fields scenario-required)
+                        (object (merge scenario-fields {"year" (choice tax/supported-years) "ledger" ledger-input
+                                                        "classifications" (array classification-input)
+                                                        "adjustments" (array adjustment-input)})
+                                (into scenario-required ["year" "ledger" "classifications"]))]})
+   (operation "taxreturn.approve_draft" "申告書下書きを確認" "review" "human-approval"
+              (approval (object {} [])))
+   (operation "revision.append_correction" "訂正・取消を確認" "ledger" "human-approval"
+              {"type" "object"
+               "oneOf" (into [(object {"phase" {"const" "approve"} "card-id" card-id} ["phase" "card-id"])]
+                             (map #(-> % (assoc-in ["properties" "phase"] {"const" "preview"})
+                                       (update "required" conj "phase")))
+                             (get revision "oneOf"))})
+   (operation "revision.search" "履歴を検索" "ledger" "read"
+              (object {"record-id" label-value "target" (choice ["entry" "evidence"])
+                       "query" string-value "from" date-value "to" date-value
+                       "min-amount" yen "max-amount" yen} []))
+   (operation "invoice.verify_registry" "登録番号を照合" "ledger" "local-write"
+              (object {"number" invoice-number "observed-number" invoice-number "save" boolean-value} ["number"]))
+   (operation "checklist.mark" "提出前の確認を記録" "manual" "local-write"
+              (object {"item" (choice (mapv :id tax/checklist)) "checked" boolean-value} ["item" "checked"]))
+   (operation "taxreturn.read_state" "確定申告の状態を表示" nil "read" (object {} []))])
+
+(def operation-by-id (into {} (map (juxt :id identity)) operations))
+
+(defn wire
+  "Convert EDN vocabulary to JSON vocabulary, retaining namespaced keys."
+  [value]
+  (cond
+    (keyword? value) (subs (str value) 1)
+    (map? value) (into {} (map (fn [[k v]] [(wire k) (wire v)])) value)
+    (sequential? value) (mapv wire value)
+    :else value))
+
+(def ^:private income
+  (object (zipmap tax/categories (repeat yen)) tax/categories))
+
+(def ^:private draft-state
+  (object {"year" (choice tax/supported-years)
+           "scope" {"const" "resident-general-income-estimate"}
+           "pack-version" label-value
+           "adjudicating" {"const" false} "submission-status" {"const" "user-manual-required"}
+           "approval-status" (choice ["draft" "approved"])
+           "income" income "total-income" yen "blue-deduction" yen "blue-selected" (choice tax/blue-choices)
+           "basic-deduction" yen "taxable-income" yen "income-tax" yen "reconstruction-surtax" yen "estimate" yen
+           "withholding-and-credits" string-value "final-tax-due" string-value "official-form" string-value
+           "deadline" string-value "destination" string-value}
+          ["year" "pack-version" "adjudicating" "submission-status" "approval-status" "income" "estimate"]))
+
+(def ^:private actor-state
+  (object {"actor-id" string-value "actor-kind" (choice ["human" "agent"]) "at" {"type" "string" "format" "date-time"}}
+          ["actor-id" "actor-kind" "at"]))
+
+(def state-schema
+  (assoc (object {"year" {"enum" (conj tax/supported-years nil)}
+                  "step" (choice (mapv :id steps))
+                  "adjudicating" {"const" false} "submission-status" {"const" "user-manual-required"}
+                  "entries" (array {"type" "object"}) "evidence" (array {"type" "object"})
+                  "adjustments" (array {"type" "object"}) "closing" {"type" ["object" "null"]}
+                  "draft" {"oneOf" [draft-state {"type" "null"}]}
+                  "approval-card" {"oneOf" [(object {"id" card-id "operation" string-value "creator" actor-state
+                                                      "preview" {"type" "object"}}
+                                                     ["id" "operation" "creator" "preview"])
+                                             {"type" "null"}]}
+                  "audit" (array {"type" "object" "properties" (merge (get actor-state "properties")
+                                                                     {"operation" string-value "detail" {"type" "object"}})
+                                  "required" ["actor-id" "actor-kind" "at" "operation"]})
+                  "revision-count" {"type" "integer" "minimum" 0}
+                  "registry" (array {"type" "object"})
+                  "checklist" (array (object {"id" string-value "label" string-value "checked" boolean-value}
+                                             ["id" "label" "checked"]))
+                  "jurisdiction" {"type" "object" "required" ["pack/id" "pack/jurisdiction" "pack/version"
+                                                             "pack/checked-on" "review/status" "pack/sources"
+                                                             "pack/procedure-ref" "fields"]
+                                  "properties" {"pack/jurisdiction" {"const" ["jp"]}
+                                                "review/status" {"const" "unreviewed"}
+                                                "pack/sources"
+                                                {"type" "object" "additionalProperties"
+                                                 (object {"url" string-value "version" string-value "retrieved-on" date-value}
+                                                         ["url" "version" "retrieved-on"])}
+                                                "pack/procedure-ref"
+                                                {"type" "object" "required" ["pack/id" "pack/version" "review/status"
+                                                                            "revision" "events" "procedures"]}}}}
+                 ["step" "adjudicating" "submission-status" "entries" "audit" "jurisdiction"])
+         "$schema" schema-version
+         "$id" "urn:itonami:kaikei:taxreturn-state:v1"))
+
+(defn snapshot [workspace]
+  {:state (tax/state workspace) :state-schema state-schema :steps steps :operations operations})
+
+(defn conforms?
+  "Validate values against the JSON Schema keywords used by this contract."
+  [schema value]
+  (and
+   (or (not (contains? schema "const")) (= (get schema "const") value))
+   (or (not (contains? schema "enum")) (some #(= % value) (get schema "enum")))
+   (or (not (contains? schema "oneOf")) (= 1 (count (filter #(conforms? % value) (get schema "oneOf")))))
+   (case (get schema "type")
+     ["object" "null"] (or (map? value) (nil? value))
+     "null" (nil? value)
+     "object" (and (map? value)
+                   (every? #(contains? value %) (get schema "required"))
+                   (every? (fn [[k v]]
+                             (if-let [field (get-in schema ["properties" k])]
+                               (conforms? field v)
+                               (let [additional (get schema "additionalProperties")]
+                                 (if (map? additional) (conforms? additional v) (not= false additional))))) value))
+     "array" (and (vector? value) (every? #(conforms? (get schema "items") %) value))
+     "string" (and (string? value) (<= (get schema "minLength" 0) (count value) (get schema "maxLength" 1000000))
+                   (or (not (contains? schema "pattern")) (re-find (re-pattern (get schema "pattern")) value)))
+     "integer" (and (integer? value) (<= (get schema "minimum" -9007199254740991) value
+                                        (get schema "maximum" 9007199254740991)))
+     "boolean" (boolean? value)
+     true)))
+
+(defn- domain-args [value]
+  (cond
+    (map? value) (into {} (map (fn [[k v]] [(keyword k) (domain-args v)])) value)
+    (vector? value) (mapv domain-args value)
+    :else value))
+
+(defn invoke [workspace operation-id arguments context]
+  (let [definition (get operation-by-id operation-id)]
+    (when-not definition
+      (throw (ex-info "Unknown semantic operation" {:taxreturn/error :unknown-operation})))
+    (when-not (conforms? (:input-schema definition) arguments)
+      (throw (ex-info "Operation arguments do not match the schema" {:taxreturn/error :invalid-arguments})))
+    (tax/run workspace operation-id (domain-args (dissoc arguments "ledger")) context)))

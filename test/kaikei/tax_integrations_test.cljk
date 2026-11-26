@@ -1,0 +1,85 @@
+(ns kaikei.tax-integrations-test
+  (:require ["node:fs" :as fs]
+            ["node:vm" :as vm]
+            [cljs.test :refer [deftest is]]
+            [kaikei.json :as json]
+            [kaikei.tax-semantic :as semantic]
+            [kaikei.taxreturn :as tax]))
+
+(def ^:private plugin-dir "plugins/kaikei-kakutei/")
+(def ^:private schema-root "https://agent-plugins.org/schemas/1.0.0/")
+(def ^:private string-value {"type" "string"})
+
+(defn- schema-object [properties required]
+  {"type" "object" "properties" properties "required" required "additionalProperties" false})
+
+;; Offline validation of the published v1.0.0 manifest and this package's
+;; portable stdio profile. The schema identifiers are references, never fetched by the test.
+(def ^:private manifest-schema
+  (schema-object
+   (merge (zipmap ["version" "description" "homepage" "repository" "license"] (repeat string-value))
+          {"$schema" {"const" (str schema-root "plugin.schema.json")}
+           "name" {"type" "string" "minLength" 1 "maxLength" 64
+                   "pattern" "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$"}
+           "author" (schema-object (zipmap ["name" "email" "url"] (repeat string-value)) [])
+           "keywords" {"type" "array" "items" string-value}
+           "extensions" {"type" "object"}})
+   ["$schema" "name"]))
+
+(def ^:private mcp-schema
+  (schema-object {"$schema" {"const" (str schema-root "mcp.schema.json")}
+                  "mcpServers"
+                  {"type" "object" "additionalProperties"
+                   (schema-object {"type" {"const" "stdio"} "command" {"type" "string" "minLength" 1}}
+                                  ["type" "command"])}}
+                 ["$schema" "mcpServers"]))
+
+(deftest portable-plugin-schema-and-explicit-local-enablement
+  (let [manifest (json/parse (fs/readFileSync (str plugin-dir "plugin.json") "utf8"))
+        mcp (json/parse (fs/readFileSync (str plugin-dir "mcp.json.example") "utf8"))
+        skill (fs/readFileSync (str plugin-dir "skills/kaikei-kakutei/SKILL.md") "utf8")]
+    (is (semantic/conforms? manifest-schema manifest))
+    (is (not (semantic/conforms? manifest-schema (assoc manifest "name" "kaikei--bad"))))
+    (is (not (semantic/conforms? manifest-schema (assoc manifest "mcpServers" {}))))
+    (is (semantic/conforms? mcp-schema mcp))
+    (is (not (semantic/conforms? mcp-schema (assoc-in mcp ["mcpServers" "kaikei-kakutei" "type"] "streamable-http"))))
+    (is (= "kaikei-mcp" (get-in mcp ["mcpServers" "kaikei-kakutei" "command"])))
+    (is (not (fs/existsSync (str plugin-dir "mcp.json"))))
+    (is (= (get manifest "name") (second (re-find #"^---\nname: ([a-z-]+)\ndescription: .+\n" skill))))))
+
+(deftest sandbox-bridge-lifecycle-and-read-only-refresh
+  (let [html (fs/readFileSync "site/mcp/taxreturn.html" "utf8")
+        script (second (re-find #"<script>([\s\S]+)</script>" html))
+        host (atom [])
+        listener (atom nil)
+        click (atom nil)
+        origin "https://synthetic-host.example"
+        status #js {:textContent ""}
+        refresh #js {:hidden true
+                     :addEventListener (fn [_ f] (reset! click f))}
+        parent #js {:postMessage (fn [payload target]
+                                   (swap! host conj [(json/parse (.stringify js/JSON payload)) target]))}
+        window #js {:parent parent :addEventListener (fn [_ f] (reset! listener f))}
+        document #js {:getElementById (fn [id] (if (= id "status") status refresh))}
+        send (fn [source from message]
+               (@listener #js {:source source :origin from :data (clj->js (assoc message "jsonrpc" "2.0"))}))
+        result {"structuredContent" (semantic/wire (semantic/snapshot tax/empty-workspace))}]
+    (vm/runInNewContext script #js {:window window :document document})
+    (is (= "ui/initialize" (get-in @host [0 0 "method"])))
+    (is (= "2026-01-26" (get-in @host [0 0 "params" "protocolVersion"])))
+    (send #js {} origin {"id" 1 "result" {"protocolVersion" "2026-01-26"}})
+    (is (= 1 (count @host)))
+    (send parent origin {"id" 1 "result" {"protocolVersion" "2026-01-26"
+                                          "hostCapabilities" {"serverTools" {}}}})
+    (is (= "ui/notifications/initialized" (get-in @host [1 0 "method"])))
+    (send parent "https://different-host.example" {"method" "ui/notifications/tool-result" "params" result})
+    (is (.-hidden refresh))
+    (send parent origin {"method" "ui/notifications/tool-result" "params" result})
+    (is (= "帳簿確認" (.-textContent status)))
+    (is (false? (.-hidden refresh)))
+    (@click)
+    (is (= [{"jsonrpc" "2.0" "id" 2 "method" "tools/call"
+             "params" {"name" "taxreturn.read_state" "arguments" {}}} origin] (last @host)))
+    (send parent origin {"id" 2 "result" result})
+    (is (= "帳簿確認" (.-textContent status)))
+    (is (false? (.-disabled refresh)))))

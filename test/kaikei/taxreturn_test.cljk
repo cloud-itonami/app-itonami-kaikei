@@ -1,0 +1,198 @@
+(ns kaikei.taxreturn-test
+  (:require ["node:fs" :as fs]
+            [cljs.test :refer [deftest is testing]]
+            [kaikei.core :as core]
+            [kaikei.json :as json]
+            [kaikei.mcp :as mcp]
+            [kaikei.tax-semantic :as semantic]
+            [kaikei.tax-view :as tax-view]
+            [kaikei.taxreturn :as tax]))
+
+(defn posting [id memo date amount debit credit]
+  {:id id :memo memo :date date
+   :lines [{:account debit :debit amount :credit 0}
+           {:account credit :debit 0 :credit amount}]})
+
+(def ledger
+  (assoc core/empty-db
+         :entries [(posting "e1" "架空の売上" "2026-06-30" 4000000 "普通預金" "売上高")
+                   (posting "e2" "架空の原稿料" "2026-07-01" 500000 "普通預金" "雑収入")
+                   (posting "e3" "対象外の年" "2025-12-31" 900000 "普通預金" "売上高")]
+         :files [{:id "f1" :name "synthetic-receipt.pdf" :size 100
+                  :sha256 (apply str (repeat 64 "0")) :imported-at "2026-07-01T12:00:00Z"}]))
+
+(def author {:actor-id "draft-author" :actor-kind :human :at "2026-11-26T10:00:00Z"})
+(def reviewer {:actor-id "draft-reviewer" :actor-kind :human :at "2026-11-26T10:01:00Z"})
+(def agent {:actor-id "agent-example" :actor-kind :agent :at "2026-11-26T10:02:00Z"})
+
+(defn invoke [ws op args actor]
+  (semantic/invoke ws op args {:actor actor :ledger ledger :registry-lookup tax/manual-registry}))
+
+(defn transition [ws op args actor] (:workspace (invoke ws op args actor)))
+
+(defn denied [ws op args actor]
+  (try (invoke ws op args actor) nil
+       (catch :default e (get (ex-data e) :taxreturn/error))))
+
+(def imported (transition tax/empty-workspace "ledger.import" {"year" 2026} author))
+
+(def classified
+  (-> imported
+      (transition "income.classify" {"entry-id" "e1" "category" "business"} author)
+      (transition "income.classify" {"entry-id" "e2" "category" "miscellaneous"} author)))
+
+(def adjusted
+  (reduce (fn [workspace [kind entry]]
+            (transition workspace "adjustment.draft"
+                        {"kind" kind "category" "business" "entry" (semantic/wire entry)} agent))
+          classified
+          [["depreciation" (posting "a1" "" "2026-12-31" 200000 "減価償却費" "減価償却累計額")]
+           ["household-allocation" (posting "a2" "" "2026-12-31" 50000 "事業主貸" "地代家賃")]
+           ["inventory" (posting "a3" "" "2026-12-31" 100000 "仕入高" "商品")]]))
+
+(def closing-input {"phase" "preview" "salary-income" 1200000})
+(def deduction-input {"blue-amount" 650000 "resident-standard-only" true})
+(def closing-preview (transition adjusted "closing.finalize" closing-input author))
+
+(defn approval-input [workspace] {"phase" "approve" "card-id" (get-in workspace [:card :id])})
+
+(def closed (transition closing-preview "closing.finalize" (approval-input closing-preview) reviewer))
+(def ready (transition closed "deduction.apply" deduction-input author))
+
+(deftest personal-income-draft-calculation
+  (is (= [950000 880000 680000 630000 580000 480000 320000 160000 0]
+         (mapv #(tax/basic-deduction 2025 %)
+               [1320000 1320001 3360001 4890001 6550001 23500001 24000001 24500001 25000001])))
+  (is (= [1040000 670000 620000 480000]
+         (mapv #(tax/basic-deduction 2026 %) [4890000 4890001 6550001 23500001])))
+  (is (= "未対応" (tax/basic-deduction 2027 1000000)))
+  (is (= :income-classification-required (denied imported "closing.finalize" closing-input author)))
+  (is (= :unsupported-income-total
+         (denied adjusted "closing.finalize" {"phase" "preview" "salary-income" 330000000} author)))
+  (is (= {"business" 3750000 "miscellaneous" 500000 "salary" 1200000} (get-in closed [:closing :income])))
+  (let [draft (:output (invoke ready "taxreturn.preview_draft" {} author))
+        scenario (invoke adjusted "taxreturn.preview_draft" (assoc deduction-input "salary-income" 1200000) agent)]
+    (is (= [650000 1040000 3760000 324500 6814 331314]
+           (mapv draft [:blue-deduction :basic-deduction :taxable-income :income-tax :reconstruction-surtax :estimate])))
+    (is (= draft (:output scenario)))
+    (is (= adjusted (:workspace scenario)))
+    (is (= "未対応" (:final-tax-due draft))))
+  (doseq [blue [0 100000 550000 650000]]
+    (is (= blue (get-in (transition closed "deduction.apply" (assoc deduction-input "blue-amount" blue) author)
+                       [:deduction :blue-selected]))))
+  (let [small (assoc-in ready [:closing :income "business"] 30000)]
+    (is (= 30000 (:blue-deduction (tax/draft small)))))
+  (is (= :unreviewed (tax/pack-field :review/status)))
+  (is (= "未対応" (tax/pack-field :filing-deadline)))
+  (is (every? #(and (:version %) (:retrieved-on %) (re-find #"^https://www\.nta\.go\.jp/" (:url %)))
+              (vals (tax/pack-field :pack/sources))))
+  (is (= [:jp] (tax/pack-field :pack/jurisdiction)))
+  (is (= [:jp/shotoku-kakutei-shinkoku-aoiro :jp/shotoku-kakutei-shinkoku-shiroiro]
+         (:procedures (tax/pack-field :pack/procedure-ref)))))
+
+(deftest dry-run-and-separation-of-approval
+  (is (nil? (:closing closing-preview)))
+  (is (= (:audit adjusted) (:audit closing-preview)))
+  (is (= :different-approver-required
+         (denied closing-preview "closing.finalize" (approval-input closing-preview)
+                 (assoc author :actor-id " DRAFT-AUTHOR "))))
+  (is (= :human-approval-required
+         (denied closing-preview "closing.finalize" (approval-input closing-preview) agent)))
+  (let [stale (transition closing-preview "income.classify" {"entry-id" "e2" "category" "salary"} agent)]
+    (is (= :stale-approval-card (denied stale "closing.finalize" (approval-input closing-preview) reviewer))))
+  (let [card (transition ready "taxreturn.approve_draft" {"phase" "preview"} reviewer)
+        approved (transition card "taxreturn.approve_draft" (approval-input card) reviewer)
+        marked (transition approved "checklist.mark" {"item" "documents" "checked" true} reviewer)]
+    (is (= author (get-in card [:card :creator])))
+    (is (= :different-approver-required
+           (denied card "taxreturn.approve_draft" (approval-input card) author)))
+    (is (= :approved (:approval-status (tax/draft approved))))
+    (is (= (assoc (get-in card [:card :preview]) :approval-status :approved)
+           (tax/draft approved)))
+    (is (semantic/conforms? semantic/state-schema (semantic/wire (tax/state approved))))
+    (is (= :user-manual-required (:submission-status (tax/draft marked))))
+    (is (false? (:adjudicating (tax/draft marked))))
+    (is (true? (get-in marked [:checklist "documents"])))
+    (is (= #{:human :agent} (set (map :actor-kind (:audit marked)))))
+    (is (= :human-check-required (denied approved "checklist.mark" {"item" "manual" "checked" true} agent)))))
+
+(deftest append-only-journal-and-evidence
+  (let [args {"phase" "preview" "target" "entry" "record-id" "e1" "kind" "correction"
+              "reason" "合成取引の訂正" "value" {"memo" "訂正後の摘要"}}
+        preview (transition ready "revision.append_correction" args agent)
+        corrected (transition preview "revision.append_correction" (approval-input preview) reviewer)
+        evidence-preview (transition corrected "revision.append_correction"
+                                     {"phase" "preview" "target" "evidence" "record-id" "f1"
+                                      "kind" "correction" "reason" "ファイル名のメタデータ訂正"
+                                      "value" {"name" "synthetic-corrected.pdf"}} author)
+        changed (transition evidence-preview "revision.append_correction" (approval-input evidence-preview) reviewer)
+        void-preview (transition changed "revision.append_correction"
+                                 {"phase" "preview" "target" "evidence" "record-id" "f1"
+                                  "kind" "void" "reason" "合成証憑を取消"} author)
+        voided (transition void-preview "revision.append_correction" (approval-input void-preview) reviewer)]
+    (is (= (:revisions ready) (:revisions preview)))
+    (is (= (:revisions imported) (subvec (:revisions voided) 0 (count (:revisions imported)))))
+    (is (nil? (tax/draft corrected)))
+    (is (= ["架空の売上" "訂正後の摘要"]
+           (mapv #(get-in % [:value :memo]) (tax/history voided {:record-id "e1"}))))
+    (is (= [:original :correction :void] (mapv :kind (tax/history voided {:record-id "f1"}))))
+    (is (every? #(= (apply str (repeat 64 "0")) (get-in % [:value :sha256]))
+                (tax/history voided {:record-id "f1"})))
+    (is (empty? (:evidence (tax/state voided))))
+    (is (= 2 (count (tax/history voided {:target "entry" :from "2026-06-30" :to "2026-06-30"
+                                        :min-amount 4000000 :max-amount 4000000}))))
+    (is (= 1 (count (tax/history voided {:query "訂正後の摘要"}))))
+    (is (= :invalid-history-range
+           (denied voided "revision.search" {"from" "2026-02-30"} author)))
+    (is (= voided (transition voided "ledger.import" {"year" 2026} author)))
+    (is (= :stale-approval-card
+           (denied voided "revision.append_correction" (approval-input void-preview) reviewer)))))
+
+(deftest invoice-registry-never-accepts-a-mismatch
+  (let [number "T0000000000000"
+        args {"number" number}
+        mismatch (assoc args "observed-number" "T9999999999999")]
+    (is (= :offline (get-in (invoke imported "invoice.verify_registry" args author) [:output :status])))
+    (is (= :mismatch (get-in (invoke imported "invoice.verify_registry" mismatch author) [:output :status])))
+    (is (= :registry-match-required (denied imported "invoice.verify_registry" (assoc mismatch "save" true) author)))
+    (is (= :registry-match-required (denied imported "invoice.verify_registry" (assoc args "save" true) author)))
+    (is (true? (tax/valid-invoice-number? number)))
+    (is (false? (tax/valid-invoice-number? "t0000000000000")))
+    (is (= :invalid-arguments (denied imported "invoice.verify_registry" {"number" "T１２３"} author)))
+    (let [saved (transition imported "invoice.verify_registry" (assoc args "observed-number" number "save" true) author)]
+      (is (= :manual-observation (get-in saved [:registry number :method])))
+      (is (= tax/registry-url (get-in saved [:registry number :source]))))))
+
+(deftest negative-controls-for-prohibited-effects
+  (doseq [operation ["taxreturn.submit" "etax.send" "taxreturn.sign_for_user"
+                     "taxreturn.adjudicate" "taxreturn.finalize_liability"]]
+    (is (= :unknown-operation (denied ready operation {} author)))
+    (is (= -32602 (get-in (mcp/handle {"id" 3 "method" "tools/call"
+                                       "params" {"name" operation "arguments" {}}}) ["error" "code"]))))
+  (is (= :invalid-arguments
+         (denied ready "taxreturn.approve_draft"
+                 {"phase" "preview" "submit" true "actor-kind" "human"} agent)))
+  (is (= "未対応" (:final-tax-due (tax/draft ready))))
+  (is (false? (:adjudicating (:state (semantic/snapshot ready)))))
+  (doseq [source ["src/kaikei/taxreturn.cljk" "src/kaikei/tax_semantic.cljk" "src/kaikei/tax_mcp.cljk"
+                  "src/kaikei/tax_view.cljk" "site/mcp/taxreturn.html"]]
+    (is (nil? (re-find #"(?i)(?:\bfetch\s*\(|XMLHttpRequest|WebSocket|sendBeacon|https?://[^\s\"]*e-tax)"
+                       (fs/readFileSync source "utf8"))) source)))
+
+(deftest ui-and-agent-read-the-same-semantic-contract
+  (let [ui (tax-view/panel (assoc ledger :taxreturn ready) {} (fn [_ event] event))
+        element-maps (filter map? (tree-seq coll? seq ui))
+        visible-operations (set (keep :data-operation element-maps))
+        toolset (get-in (mcp/handle {"id" 3 "method" "tools/list"}) ["result" "tools"])
+        registry (into {} (map (juxt #(get % "name") #(get % "inputSchema")) toolset))
+        state-node (some #(when (and (vector? %) (= "taxreturn" (:data-semantic-state (second %)))) %)
+                         (tree-seq coll? seq ui))]
+    (is (contains? visible-operations "taxreturn.approve_draft"))
+    (is (every? registry visible-operations))
+    (is (every? #(re-matches #"[a-z]+\.[a-z_]+" (:id %)) semantic/operations))
+    (doseq [{:keys [id input-schema]} semantic/operations]
+      (is (= input-schema (cond-> (registry id) (= id "ledger.import") (update "required" pop)))))
+    (is (= (semantic/wire (semantic/snapshot ready)) (json/parse (last state-node))))
+    (doseq [workspace [tax/empty-workspace imported closing-preview ready]]
+      (is (semantic/conforms? semantic/state-schema (semantic/wire (tax/state workspace)))))
+    (is (= semantic/schema-version (get semantic/state-schema "$schema")))))

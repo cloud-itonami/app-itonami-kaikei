@@ -5,6 +5,7 @@
 ;; initialize → notifications/initialized → 要求 の 3 行を書いて閉じる。だから
 ;; ここは行ごとに応答し、stdin の EOF で終わる（exit 0）。stdout には JSON-RPC の
 ;; 行だけを書き、診断は stderr へ出す。中身（tool と判定）は src/kaikei/mcp.cljk。
+;; 確定申告 tool は複数の要求を同じ接続で受け、作業状態をメモリに保持できる。
 ;;
 ;; ## 依存は repo の nbb.edn の pin から取る
 ;;
@@ -44,12 +45,19 @@
 
 (require '[kaikei.mcp :as mcp])
 
-(let [rl (.createInterface readline #js {:input js/process.stdin :terminal false})]
+(let [rl (.createInterface readline #js {:input js/process.stdin :terminal false})
+      app-html (fs/readFileSync (path/join app-directory "site" "mcp" "taxreturn.html") "utf8")
+      session (atom mcp/initial-session)]
   (.on rl "line"
        (fn [line]
          (try
-           (when-let [out (mcp/handle-line line)]
-             (.write js/process.stdout (str out "\n")))
+           (let [[updated out] (mcp/handle-line @session
+                                               {:app-html app-html
+                                                :actor {:actor-id "mcp-agent" :actor-kind :agent
+                                                        :at (.toISOString (js/Date.))}}
+                                               line)]
+             (reset! session updated)
+             (when out (.write js/process.stdout (str out "\n"))))
            (catch :default e
              (.write js/process.stderr (str "kaikei-mcp: " (.-message e) "\n"))))))
   ;; EOF: 何もしないで終わる。process.exit を呼ぶと、macOS のパイプでは書きかけの

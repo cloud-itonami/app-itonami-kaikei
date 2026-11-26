@@ -1,0 +1,387 @@
+(ns kaikei.tax-view
+  "Responsive Hiccup view of the tax workspace."
+  (:require [kaikei.core :as core]
+            [kaikei.json :as json]
+            [kaikei.taxreturn :as tax]
+            [kaikei.tax-semantic :as semantic]
+            [kotoba.lang.text :as text]))
+
+(def ^:private category-labels {"business" "事業" "miscellaneous" "雑" "salary" "給与"})
+(def ^:private adjustment-labels
+  {"depreciation" "減価償却" "household-allocation" "家事按分" "inventory" "棚卸" "other" "その他"})
+(def ^:private format-yen #(str (core/display-amount % 0) " 円"))
+(def ^:private errors
+  {:invalid-actor "担当者IDを入力してください。"
+   :invalid-arguments "入力欄を確認してください。"
+   :invalid-entry "対象年の取引日・勘定科目・金額・貸借の一致を確認してください。"
+   :unsupported-year "対象年は未対応です。"
+   :unsupported-currency "日本円の帳簿を取り込んでください。"
+   :requires-correction "取り込み済みの仕訳や証憑に変更があります。訂正・取消カードで記録してください。"
+   :unclassified-account "使用する勘定科目の区分を確認してください。"
+   :invalid-correction "変更内容と元の記録を確認してください。"
+   :invalid-history-range "検索範囲の開始と終了を確認してください。"
+   :unknown-active-record "対象の記録IDを確認してください。"
+   :reason-required "訂正・取消の理由を入力してください。"
+   :income-classification-required "未分類の仕訳または勘定科目を確認してください。"
+   :unsupported-income-total "この所得構成・金額の試算は未対応です。"
+   :unsupported-tax-situation "試算の対象条件を確認してください。"
+   :invalid-invoice-number "Tに続けて半角数字13桁を入力してください。"
+   :registry-match-required "公表サイトで確認した番号と一致した場合に保存できます。"
+   :stale-approval-card "内容が変わりました。現在の内容でカードを作成してください。"
+   :different-approver-required "作成者と異なる担当者IDを入力してください。"
+   :human-approval-required "承認は人が行ってください。"})
+
+(defn mode-button [h active? event label]
+  [:button {:type "button" :class "tax-button tax-button-secondary" :aria-pressed active?
+            :on-click (h :click event)} label])
+
+(defn- fields [ui] (:tax-fields ui))
+
+(defn- field [ui h id label type options default]
+  (let [ev [:tax-field id]
+        value (get (fields ui) id default)
+        id-attr (str "tax-" (if (vector? id) (text/join "-" (map str id)) (name id)))]
+    [:div {:class "tax-field"}
+     [:label {:for id-attr} label]
+     (if (seq options)
+       [:select {:id id-attr :value value :on-change (h :value ev)}
+        (into [:<>] (map (fn [[v s]] [:option {:key v :value v} s]) options))]
+       [:input {:id id-attr :type type :value (when-not (= "checkbox" type) value)
+                :checked (when (= "checkbox" type) (boolean value))
+                :min (when (= "number" type) 0) :on-change (h (if (= "checkbox" type) :checked :value) ev)}])]))
+
+(defn- field-text [ui id] (get (fields ui) id ""))
+
+(defn- amount [value]
+  (when (re-matches #"[0-9]+" (str value)) (parse-long (str value))))
+
+(defn- action
+  ([ui h operation args] (action ui h operation args nil))
+  ([ui h operation args label]
+   (let [definition (get semantic/operation-by-id operation)
+         approve? (= "approve" (get args "phase"))
+         actor (field-text ui (if approve? :approver :actor))]
+     [:button {:type "button" :class "tax-button" :data-operation (:id definition)
+               :data-operation-phase (get args "phase")
+               :on-click (h :click [:tax-operation (:id definition) args actor])}
+      (or label (:label definition))])))
+
+(defn- income-summary [income]
+  (into [:dl {:class "tax-totals"}]
+        (map (fn [category]
+               [:div {:key category} [:dt (category-labels category)] [:dd (format-yen (get income category 0))]])
+             tax/categories)))
+
+(defn- entry-lines [entry]
+  (into [:ul] (map-indexed (fn [i {:keys [account debit credit] :or {debit 0 credit 0}}]
+                             [:li {:key i} account "　借方 " (format-yen debit) "　貸方 " (format-yen credit)])
+                           (:lines entry))))
+
+(defn- draft-summary [{:keys [year approval-status income blue-deduction basic-deduction taxable-income
+                              income-tax reconstruction-surtax estimate deadline destination]}]
+  [:div {:class "tax-summary"}
+   [:p (str year "年分 · " (if (= :approved approval-status) "内部確認済み" "下書き") " · 本人提出")]
+   (income-summary income)
+   [:dl {:class "tax-breakdown"}
+    [:dt "青色申告特別控除の試算"] [:dd (format-yen blue-deduction)]
+    [:dt "基礎控除の試算"] [:dd (format-yen basic-deduction)]
+    [:dt "課税所得の試算"] [:dd (format-yen taxable-income)]
+    [:dt "所得税の試算"] [:dd (format-yen income-tax)]
+    [:dt "復興特別所得税の試算"] [:dd (format-yen reconstruction-surtax)]
+    [:dt "所得税・復興特別所得税の概算"] [:dd {:class "tax-estimate"} (format-yen estimate)]
+    [:dt "納付額・還付額"] [:dd "未対応"]
+    [:dt "期限・提出先"] [:dd (str deadline " / " destination)]]])
+
+(defn- approval-card-view [ui h {:keys [id operation creator preview]}]
+  [:article {:class "tax-card tax-approval" :aria-labelledby "tax-approval-title"}
+   [:h3 {:id "tax-approval-title"} (:label (get semantic/operation-by-id operation))]
+   [:p "承認前のプレビュー　作成者 " [:code (:actor-id creator)]]
+   (case operation
+     "closing.finalize" [:<> (income-summary (:income preview))
+                         (when (seq (:adjustments preview))
+                           [:details
+                            [:summary "試算に反映する調整仕訳"]
+                            (into [:ul]
+                                  (map (fn [{:keys [entry kind]}]
+                                         [:li {:key (:id entry)} (adjustment-labels kind) (entry-lines entry)])
+                                       (:adjustments preview)))])]
+     "taxreturn.approve_draft" (draft-summary preview)
+     "revision.append_correction"
+     (let [{:keys [previous change]} preview]
+       [:div
+        [:p (str (:record-id change) "　版 " (:revision previous) " → " (:revision change))]
+        [:p (:reason change)]
+        (if (= :void (:kind change))
+          [:p "この記録を取り消します。履歴から元の記録を確認できます。"]
+          [:div
+           [:h4 "訂正前"]
+           (if (= :entry (:target change))
+             [:<> [:p (get-in previous [:value :date]) "　" (get-in previous [:value :memo])]
+              (entry-lines (:value previous))]
+             [:p (get-in previous [:value :name])])
+           [:h4 "訂正後"]
+           (if (= :entry (:target change))
+             [:<> [:p (get-in change [:value :date]) "　" (get-in change [:value :memo])]
+              (entry-lines (:value change))]
+             [:p (get-in change [:value :name])])])])
+     nil)
+   (field ui h :approver "承認者ID（作成者と別の担当者）" "text" nil "")
+   (action ui h operation {"phase" "approve" "card-id" id} "この内容を承認")])
+
+(defn- ledger-panel [data ui h {:keys [year entries evidence]}]
+  [:div
+   [:p (str "現在の帳簿 " (count (:entries data)) " 件 · " (:currency data))]
+   (if year
+     [:p (str year "年分に取り込み済み　有効な仕訳 " (count entries) " 件、証憑 " (count evidence) " 件")]
+     (field ui h :year "対象年" "text" (map (fn [y] [(str y) (str y "年分")]) (reverse tax/supported-years)) "2026"))
+   (action ui h "ledger.import" {"year" (or year (amount (get (fields ui) :year "2026")))}
+           (when year "追加分を取り込む"))
+   (when (and (nil? year) (empty? (:entries data)))
+     [:p {:class "tax-muted"} "仕訳がある場合は、会計帳簿の画面で先にファイルを取り込んでください。"])])
+
+(defn- entry-input [ui year]
+  {"date" (get (fields ui) :adjustment-date (str year "-12-31"))
+   "memo" (field-text ui :adjustment-memo)
+   "lines" [{"account" (field-text ui :debit-account) "debit" (amount (field-text ui :adjustment-amount)) "credit" 0}
+            {"account" (field-text ui :credit-account) "debit" 0 "credit" (amount (field-text ui :adjustment-amount))}]})
+
+(defn- adjustment-form [ui h year adjustments]
+  [:details {:class "tax-detail"}
+   [:summary "調整仕訳"]
+   (into [:ul]
+         (map (fn [{:keys [kind entry]}]
+                [:li {:key (:id entry)} (adjustment-labels kind) "　" (:date entry) (entry-lines entry)])
+              adjustments))
+   [:div {:class "tax-fields"}
+    (field ui h :adjustment-kind "調整の種類" "text" (map (juxt identity adjustment-labels) tax/adjustment-kinds) "depreciation")
+    (field ui h :adjustment-category "所得区分" "text" [["business" "事業"] ["miscellaneous" "雑"]] "business")
+    (field ui h :adjustment-date "取引日" "date" nil (str year "-12-31"))
+    (field ui h :adjustment-amount "金額（円）" "number" nil "")
+    (field ui h :debit-account "借方の勘定科目" "text" nil "")
+    (field ui h :credit-account "貸方の勘定科目" "text" nil "")
+    (field ui h :adjustment-memo "摘要" "text" nil "")]
+   (action ui h "adjustment.draft"
+           {"kind" (get (fields ui) :adjustment-kind "depreciation")
+            "category" (get (fields ui) :adjustment-category "business")
+            "entry" (assoc (entry-input ui year) "id" (str "adj-" (inc (count adjustments))))})])
+
+(defn- closing-panel [ui h {:keys [entries year adjustments closing]}]
+  (let [income-entries (filter #(or (:relevant? %) (:unknown? %)) entries)
+        salary (str (get closing :salary-income-input 0))]
+    [:div
+     (when (seq income-entries)
+       [:div {:class "tax-scroll"}
+        [:table {:class "tax-table"}
+         [:thead [:tr [:th {:scope "col"} "日付・仕訳ID"] [:th {:scope "col"} "摘要"]
+                  [:th {:scope "col"} "差額"] [:th {:scope "col"} "所得区分"]]]
+         (into [:tbody]
+               (map (fn [{:keys [id date memo amount unknown? category]}]
+                      (let [selected (get (fields ui) [:category id] (or category "business"))]
+                        [:tr {:key id}
+                         [:th {:scope "row"} date " · " id]
+                         [:td memo]
+                         [:td (format-yen amount)]
+                         [:td
+                          (if unknown?
+                            "勘定科目を帳簿で修正し、取り込み直してください。"
+                            [:<>
+                             [:label {:class "tax-sr" :for (str "tax-category-" id)} (str id "の所得区分")]
+                             [:select {:id (str "tax-category-" id) :value selected
+                                       :on-change (h :value [:tax-field [:category id]])}
+                              (into [:<>] (map (fn [k] [:option {:key k :value k} (category-labels k)]) tax/categories))]
+                             (action ui h "income.classify" {"entry-id" id "category" selected})
+                             [:small (if category (str "記録済み · " (category-labels category)) "未記録")]])]]))
+                    income-entries))]])
+     (adjustment-form ui h year adjustments)
+     (field ui h :salary-income "帳簿に含まれない給与所得（控除後、円）" "number" nil salary)
+     (action ui h "closing.finalize"
+             {"phase" "preview" "salary-income" (amount (get (fields ui) :salary-income salary))}
+             "決算整理の承認カードを作成")]))
+
+(defn- deduction-panel [ui h draft]
+  (let [blue (str (get draft :blue-selected 0))]
+    [:div
+     (field ui h :blue-amount "確認した青色申告特別控除の上限" "text"
+            (map (fn [v] [(str v) (if (zero? v) "適用なし" (format-yen v))]) tax/blue-choices) blue)
+     (field ui h :scope "居住者の通常の所得を試算する（分離課税・損益通算・準確定申告などは未対応）"
+            "checkbox" nil (some? draft))
+     (action ui h "deduction.apply" {"blue-amount" (amount (get (fields ui) :blue-amount blue))
+                                     "resident-standard-only" (get (fields ui) :scope (some? draft))})]))
+
+(defn- review-panel [ui h]
+  [:div
+   (when-let [preview (:tax-preview ui)] (draft-summary preview))
+   (action ui h "taxreturn.preview_draft" {})
+   " "
+   (action ui h "taxreturn.approve_draft" {"phase" "preview"} "下書きの承認カードを作成")])
+
+(defn- checklist-panel [ui h {:keys [checklist draft]}]
+  [:div
+   (draft-summary draft)
+   (into [:ul {:class "tax-checklist"}]
+         (map (fn [{:keys [id label checked]}]
+                [:li {:key id}
+                 [:span label]
+                 (action ui h "checklist.mark" {"item" id "checked" (not checked)}
+                         (if checked "確認済みを取り消す" "確認済みにする"))
+                 (when checked [:span {:class "tax-check-status"} "確認済み"])])
+              checklist))])
+
+(defn- nonempty-args [args] (into {} (remove (comp text/blank? val)) args))
+
+(defn- correction-lines [ui record-id original]
+  (let [extra (get (fields ui) [:extra-lines record-id] 0)]
+    (mapv (fn [index original-line]
+            (let [key-prefix [:correction record-id index]
+                  key-for #(conj key-prefix %)]
+              {:index index :key-for key-for
+               :line original-line
+               :excluded? (true? (get (fields ui) (key-for :exclude)))
+               :replacement {"account" (get (fields ui) (key-for :account) (:account original-line ""))
+                               "debit" (amount (get (fields ui) (key-for :debit) (str (:debit original-line 0))))
+                               "credit" (amount (get (fields ui) (key-for :credit) (str (:credit original-line 0))))}}))
+          (range) (into (:lines original) (repeat extra {})))))
+
+(defn- correction-rows [ui h record-id original rows]
+  [:details {:class "tax-detail"}
+   [:summary "仕訳明細の訂正"]
+   (into [:div]
+         (map (fn [{:keys [index key-for line]}]
+                [:fieldset {:key index :class "tax-fields"}
+                 [:legend (str "仕訳明細 " (inc index))]
+                 (field ui h (key-for :account) "勘定科目" "text" nil (:account line ""))
+                 (field ui h (key-for :debit) "借方（円）" "number" nil (str (:debit line 0)))
+                 (field ui h (key-for :credit) "貸方（円）" "number" nil (str (:credit line 0)))
+                 (field ui h (key-for :exclude) "この行を除く" "checkbox" nil false)])
+              rows))
+   (mode-button h false
+                [:tax-field [:extra-lines record-id] (inc (- (count rows) (count (:lines original))))]
+                "行を追加する")])
+
+(defn- history-panel [ui h {:keys [revision-count entries]}]
+  (let [target (get (fields ui) :revision-target "entry")
+        kind (get (fields ui) :revision-kind "correction")
+        record-id (field-text ui :record-id)
+        original (when (= target "entry") (some #(when (= record-id (:id %)) %) entries))
+        rows (when original (correction-lines ui record-id original))
+        replacements (mapv :replacement (remove :excluded? rows))
+        original-lines (mapv (fn [line] {"account" (:account line) "debit" (:debit line 0) "credit" (:credit line 0)})
+                             (:lines original))
+        patch (if (= target "entry")
+                (cond-> (nonempty-args {"date" (get (fields ui) [:revision-date record-id] "")})
+                  (contains? (fields ui) [:revision-memo record-id])
+                  (assoc "memo" (get (fields ui) [:revision-memo record-id]))
+                  (not= original-lines replacements) (assoc "lines" replacements))
+                {"name" (field-text ui :revision-value)})
+        args (cond-> {"phase" "preview" "target" target "kind" kind
+                      "record-id" record-id "reason" (field-text ui :revision-reason)}
+               (= kind "correction") (assoc "value" patch))
+        search (cond-> (nonempty-args {"query" (field-text ui :search) "from" (field-text ui :search-from)
+                                      "to" (field-text ui :search-to)})
+                 (seq (field-text ui :search-min)) (assoc "min-amount" (amount (field-text ui :search-min)))
+                 (seq (field-text ui :search-max)) (assoc "max-amount" (amount (field-text ui :search-max))))
+        results (:tax-history ui)]
+    [:details {:class "tax-detail"}
+     [:summary (str "訂正・取消履歴（" revision-count "件）")]
+     [:div {:class "tax-fields"}
+      (field ui h :search "仕訳ID・摘要・ファイル名" "text" nil "")
+      (field ui h :search-from "開始日" "date" nil "")
+      (field ui h :search-to "終了日" "date" nil "")
+      (field ui h :search-min "最小金額（円）" "number" nil "")
+      (field ui h :search-max "最大金額（円）" "number" nil "")]
+     (action ui h "revision.search" search)
+     (when (some? results)
+       (if (empty? results)
+         [:p {:role "status"} "該当する履歴はありません。"]
+         (into [:ul {:aria-label "検索結果"}]
+               (map (fn [{:keys [target record-id revision kind value reason actor-id at]}]
+                      [:li {:key (str (name target) "-" record-id "-" revision)}
+                       [:details
+                        [:summary (str record-id " · 版 " revision " · " ({:original "原本" :correction "訂正" :void "取消"} kind))]
+                        [:p (str actor-id " · " at) (when reason (str " · " reason))]
+                        (if (= :entry target)
+                          [:<> [:p (:date value) "　" (:memo value)] (entry-lines value)]
+                          [:p (:name value) "　" (:sha256 value)])]])
+                    results))))
+     (when (pos? revision-count)
+       [:div
+        [:h3 "訂正・取消の承認カード"]
+        [:div {:class "tax-fields"}
+         (field ui h :revision-target "対象" "text" [["entry" "仕訳"] ["evidence" "証憑"]] "entry")
+         (field ui h :record-id "記録ID" "text" nil "")
+         (field ui h :revision-kind "変更" "text" [["correction" "訂正"] ["void" "取消"]] "correction")
+         (field ui h :revision-reason "理由" "text" nil "")
+         (when (and (= kind "correction") (= target "evidence"))
+           (field ui h :revision-value "訂正後のファイル名" "text" nil ""))
+         (when (and (= kind "correction") original)
+           (field ui h [:revision-memo record-id] "訂正後の摘要" "text" nil (or (:memo original) "")))
+         (when (and (= kind "correction") original)
+           (field ui h [:revision-date record-id] "訂正後の取引日（変更する場合）" "date" nil ""))]
+        (when (and (= kind "correction") original)
+          (correction-rows ui h record-id original rows))
+        (action ui h "revision.append_correction" args "訂正・取消の承認カードを作成")])]))
+
+(defn- registry-panel [ui h]
+  (let [args (nonempty-args {"number" (field-text ui :invoice-number)
+                             "observed-number" (field-text ui :listed-number)})]
+    [:details {:class "tax-detail"}
+     [:summary "インボイス登録番号の照合"]
+     [:p "国税庁の公表サイトでご自身で確認した番号を入力してください。 " [:code tax/registry-url]]
+     [:div {:class "tax-fields"}
+      (field ui h :invoice-number "登録番号（T＋数字13桁）" "text" nil "")
+      (field ui h :listed-number "公表サイトで確認した番号" "text" nil "")]
+     (action ui h "invoice.verify_registry" args)
+     " "
+     (action ui h "invoice.verify_registry" (assoc args "save" true) "照合結果を記録")
+     (when-let [status (get-in ui [:tax-registry :status])]
+       [:p {:role "status"} ({:match "入力した番号は一致しています。"
+                              :mismatch "番号が一致しません。"
+                              :offline "オフラインです。照合番号は未入力です。"} status)])]))
+
+(defn panel [data ui h]
+  (let [snapshot (semantic/snapshot (get data :taxreturn tax/empty-workspace))
+        {:keys [state steps]} snapshot
+        {:keys [step draft approval-card]} state
+        active-step (some #(when (= step (:id %)) %) steps)]
+    [:main {:class "tax-screen" :aria-labelledby "tax-title" :data-semantic-view "taxreturn"}
+     [:div {:class "tax-topbar"}
+      [:h1 {:id "tax-title"} "確定申告"]
+      (mode-button h false [:set-mode :trial-balance] "会計帳簿に戻る")]
+     [:p {:class "tax-lead"} "個人の所得税の下書きを準備します。提出はご自身で行います。"]
+     (into [:ol {:class "tax-steps" :aria-label "進捗"}]
+           (map (fn [{:keys [id label]}]
+                  [:li {:key id :aria-current (when (= id step) "step")} label])
+                steps))
+     [:div {:hidden true :data-semantic-state "taxreturn"} (json/write (semantic/wire snapshot))]
+     (when-let [error (:tax-error ui)]
+       [:p {:class "tax-error" :role "alert"} (get errors error (str "操作を完了できませんでした（" (name error) "）。"))])
+     (field ui h :actor "担当者ID（監査用の識別名）" "text" nil "")
+     [:section {:class "tax-card" :aria-labelledby "tax-step-title"}
+      [:h2 {:id "tax-step-title"} (:label active-step)]
+      (case step
+        "ledger" (ledger-panel data ui h state)
+        "closing" (closing-panel ui h state)
+        "deduction" (deduction-panel ui h draft)
+        "review" (review-panel ui h)
+        "manual" (checklist-panel ui h state))]
+     (when approval-card (approval-card-view ui h approval-card))
+     (when-not (= "ledger" step)
+       [:details {:class "tax-detail"}
+        [:summary "帳簿の取り込み"]
+        (ledger-panel data ui h state)])
+     (when (#{"deduction" "review" "manual"} step)
+       [:details {:class "tax-detail"}
+        [:summary "決算整理を見直す"]
+        (closing-panel ui h state)])
+     (when (#{"review" "manual"} step)
+       [:details {:class "tax-detail"}
+        [:summary "控除を見直す"]
+        (deduction-panel ui h draft)])
+     (history-panel ui h state)
+     (registry-panel ui h)
+     [:details {:class "tax-detail"}
+      [:summary "試算に使用した出典"]
+      [:p (str "日本 · " (get-in state [:jurisdiction :pack/version]) " · 専門家レビュー前")]
+      (into [:ul] (map (fn [[id {:keys [url version retrieved-on]}]]
+                         [:li {:key (str id)} [:code url] "　" version "（確認日 " retrieved-on "）"])
+                       (get-in state [:jurisdiction :pack/sources])))]]))

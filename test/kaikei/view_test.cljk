@@ -30,7 +30,8 @@
           (is (has-text? tree "試算表・損益計算書・貸借対照表"))
           (is (has-text? tree "送信されず"))
           (is (has-text? tree "商標"))
-          (is (has-text? tree "電子帳簿保存法への適合を主張せず")))))))
+          (is (has-text? tree "電子帳簿保存法の要件を満たすことは保証しません"))
+          (is (has-text? tree "署名・提出は本人が行います")))))))
 
 (deftest ssr-does-not-claim-empty
   (let [tree (render core/empty-db (assoc view/initial-ui :booting? true) view/ssr-handlers)]
