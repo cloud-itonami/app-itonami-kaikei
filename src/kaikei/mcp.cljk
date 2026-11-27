@@ -707,7 +707,7 @@
         {"content" [{"type" "text" "text" (to-json {"error" "internal-error" "detail" (ex-message e)})}]
          "isError" true}))))
 
-(def initial-session {:workspace tax/empty-workspace})
+(def initial-session {:workspace (tax/tax-years nil)})
 
 (defn- tax-ledger-arg [args]
   (let [{:keys [entries accounts currency files warnings]} (native/read-data (get args "ledger"))]
@@ -760,7 +760,7 @@
               args (get params "arguments" {})]
           (cond
             (not (map? args)) (error -32602 "arguments must be an object")
-            (contains? semantic/operation-by-id name) (call-tax-tool session actor id name args)
+            (semantic/mcp-operation? (get semantic/operation-by-id name)) (call-tax-tool session actor id name args)
             tool (answer (call-tool tool args))
             :else (error -32602 (str "Unknown tool: " name))))
         (error -32601 (str "Method not found: " method))))))

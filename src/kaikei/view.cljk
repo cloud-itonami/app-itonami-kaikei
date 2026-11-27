@@ -207,7 +207,8 @@
      [:div {:class "kk-toolbar-group"}
       (if (:confirm-clear? ui)
         [:span {:class "kk-confirm"}
-         (when (:taxreturn data) [:span "確定申告の履歴は端末に残ります。"])
+         (when (:taxreturn data)
+           [:span "確定申告の履歴と、この端末にある参照先の証憑原本を残します。ほかの帳簿ファイルを消去します。"])
          (btn h [:clear-all] (if (:taxreturn data) "会計帳簿を消去する" "本当にすべて消去する")
               {:type "solid-fill" :class "kk-danger"})
          (btn h [:cancel-clear] "やめる")]

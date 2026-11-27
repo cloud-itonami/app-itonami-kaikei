@@ -45,6 +45,43 @@
   {:revisions [] :audit [] :adjustments [] :classifications {}
    :registry {} :checklist {} :next-card 1})
 
+(def default-year (peek supported-years))
+
+(defn tax-years
+  "Normalize the first version's single workspace without changing its history."
+  [stored]
+  (if (contains? stored :workspaces)
+    stored
+    (let [year (or (:year stored) default-year)]
+      {:selected-year year :workspaces (if stored {year stored} {})})))
+
+(defn selected-workspace [tax-years]
+  (get-in tax-years [:workspaces (:selected-year tax-years)] empty-workspace))
+
+(def ^:private original-prefix "tax-original:")
+
+(defn original-storage-key? [key]
+  (and (string? key) (text/starts-with? key original-prefix)))
+
+(defn original-key [sha256]
+  (when (and (string? sha256) (re-matches #"[0-9a-f]{64}" sha256))
+    (str original-prefix sha256)))
+
+(defn original-file-plan
+  "Match historical evidence to the current ledger by both record ID and hash."
+  [{:keys [taxreturn files]}]
+  (let [referenced (into #{} (comp (mapcat :revisions)
+                                   (filter #(= :evidence (:target %)))
+                                   (map (fn [revision] [(:record-id revision) (get-in revision [:value :sha256])])))
+                         (vals (:workspaces (tax-years taxreturn))))]
+    (into {} (keep (fn [{:keys [id sha256]}]
+                     (when (referenced [id sha256])
+                       (when-let [key (original-key sha256)] [key id]))))
+          files)))
+
+(defn original-status [evidence originals]
+  (if (contains? originals (original-key (:sha256 evidence))) "available" "missing"))
+
 (defn- require! [valid? code]
   (when-not valid? (throw (ex-info (name code) {:taxreturn/error code}))))
 

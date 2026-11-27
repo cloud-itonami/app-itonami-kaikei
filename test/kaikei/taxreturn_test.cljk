@@ -190,9 +190,56 @@
     (is (contains? visible-operations "taxreturn.approve_draft"))
     (is (every? registry visible-operations))
     (is (every? #(re-matches #"[a-z]+\.[a-z_]+" (:id %)) semantic/operations))
-    (doseq [{:keys [id input-schema]} semantic/operations]
+    (doseq [{:keys [id input-schema]} (filter semantic/mcp-operation? semantic/operations)]
       (is (= input-schema (cond-> (registry id) (= id "ledger.import") (update "required" pop)))))
-    (is (= (semantic/wire (semantic/snapshot ready)) (json/parse (last state-node))))
+    (is (= (semantic/wire (semantic/snapshot-years ready #{})) (json/parse (last state-node))))
     (doseq [workspace [tax/empty-workspace imported closing-preview ready]]
       (is (semantic/conforms? semantic/state-schema (semantic/wire (tax/state workspace)))))
     (is (= semantic/schema-version (get semantic/state-schema "$schema")))))
+
+(deftest moves-between-tax-years-with-independent-history-and-cards
+  (let [context {:actor author :ledger ledger}
+        import-year (fn [stored year] (:workspace (semantic/invoke-years stored "ledger.import" {"year" year} context)))
+        run (fn [stored operation args]
+              (:workspace (semantic/invoke-years stored operation args context)))
+        previous (import-year nil 2025)
+        previous (run previous "income.classify" {"entry-id" "e3" "category" "business"})
+        previous (run previous "closing.finalize" closing-input)
+        old-card (get-in previous [:workspaces 2025 :card :id])
+        selected (run previous "taxreturn.select_year" {"year" 2026})
+        started (import-year selected 2026)
+        restarted (run started "taxreturn.read_state" {})
+        back (run restarted "taxreturn.select_year" {"year" 2025})
+        legacy (get-in previous [:workspaces 2025])]
+    (is (= "ledger" (get-in (semantic/snapshot-years selected #{}) [:state :step])))
+    (is (= [2025 2026] (get-in (semantic/snapshot-years started #{}) [:state :available-years])))
+    (is (= [:entry :evidence] (mapv :target (:revisions (tax/selected-workspace back)))))
+    (is (= legacy (tax/selected-workspace back)))
+    (is (= legacy (tax/selected-workspace (tax/tax-years legacy))))
+    (let [next-year (-> started
+                        (run "income.classify" {"entry-id" "e1" "category" "business"})
+                        (run "income.classify" {"entry-id" "e2" "category" "miscellaneous"})
+                        (run "closing.finalize" closing-input))]
+      (is (< old-card (get-in next-year [:workspaces 2026 :card :id])))
+      (is (= :stale-approval-card
+             (try (semantic/invoke-years next-year "closing.finalize" {"phase" "approve" "card-id" old-card}
+                                         {:actor reviewer})
+                  (catch :default e (:taxreturn/error (ex-data e)))))))))
+
+(deftest originals-use-record-hashes-and-local-browser-access
+  (let [sha256 (get-in ledger [:files 0 :sha256])
+        key (tax/original-key sha256)
+        data (assoc ledger :taxreturn imported)
+        mismatch (assoc-in data [:files 0 :sha256] (apply str (repeat 64 "1")))
+        args {"record-id" "f1" "revision" 1}
+        state (fn [originals] (get-in (semantic/snapshot-years imported originals) [:state :evidence 0 :original-status]))]
+    (is (= {key "f1"} (tax/original-file-plan data)))
+    (is (empty? (tax/original-file-plan mismatch)))
+    (is (= "available" (state #{key})))
+    (is (= "missing" (state #{})))
+    (is (= {:id key :name "synthetic-receipt.pdf"}
+           (:output (semantic/invoke-years imported "evidence.download_original" args
+                                           {:browser? true :originals #{key}}))))
+    (is (= -32602 (get-in (mcp/handle {"id" 1 "method" "tools/call"
+                                       "params" {"name" "evidence.download_original" "arguments" args}})
+                         ["error" "code"])))))

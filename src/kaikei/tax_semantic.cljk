@@ -64,7 +64,9 @@
    {:id "manual" :label "手動提出"}])
 
 (def operations
-  [(operation "ledger.import" "対象年の帳簿を取り込む" "ledger" "local-write"
+  [(operation "taxreturn.select_year" "年分を切り替える" nil "local-write"
+              (object {"year" (choice tax/supported-years)} ["year"]))
+   (operation "ledger.import" "対象年の帳簿を取り込む" "ledger" "local-write"
               (object {"year" (choice tax/supported-years)
                        "ledger" ledger-input}
                       ["year"]))
@@ -94,6 +96,8 @@
               (object {"record-id" label-value "target" (choice ["entry" "evidence"])
                        "query" string-value "from" date-value "to" date-value
                        "min-amount" yen "max-amount" yen} []))
+   (operation "evidence.download_original" "保存した原本を取り出す" "ledger" "browser-only"
+              (object {"record-id" label-value "revision" card-id} ["record-id" "revision"]))
    (operation "invoice.verify_registry" "登録番号を照合" "ledger" "local-write"
               (object {"number" invoice-number "observed-number" invoice-number "save" boolean-value} ["number"]))
    (operation "checklist.mark" "提出前の確認を記録" "manual" "local-write"
@@ -101,6 +105,9 @@
    (operation "taxreturn.read_state" "確定申告の状態を表示" nil "read" (object {} []))])
 
 (def operation-by-id (into {} (map (juxt :id identity)) operations))
+
+(defn mcp-operation? [definition]
+  (and (some? definition) (not= "browser-only" (:mode definition))))
 
 (defn wire
   "Convert EDN vocabulary to JSON vocabulary, retaining namespaced keys."
@@ -132,9 +139,13 @@
 
 (def state-schema
   (assoc (object {"year" {"enum" (conj tax/supported-years nil)}
+                  "selected-year" (choice tax/supported-years)
+                  "available-years" (array (choice tax/supported-years))
                   "step" (choice (mapv :id steps))
                   "adjudicating" {"const" false} "submission-status" {"const" "user-manual-required"}
-                  "entries" (array {"type" "object"}) "evidence" (array {"type" "object"})
+                  "entries" (array {"type" "object"})
+                  "evidence" (array {"type" "object"
+                                     "properties" {"original-status" (choice ["available" "missing"])}})
                   "adjustments" (array {"type" "object"}) "closing" {"type" ["object" "null"]}
                   "draft" {"oneOf" [draft-state {"type" "null"}]}
                   "approval-card" {"oneOf" [(object {"id" card-id "operation" string-value "creator" actor-state
@@ -167,6 +178,17 @@
 (defn snapshot [workspace]
   {:state (tax/state workspace) :state-schema state-schema :steps steps :operations operations})
 
+(defn snapshot-years [stored originals]
+  (let [{:keys [selected-year workspaces] :as years} (tax/tax-years stored)]
+    (update (snapshot (tax/selected-workspace years)) :state
+            (fn [state]
+              (-> state
+                  (assoc :selected-year selected-year
+                         :available-years (vec (sort (keep :year (vals workspaces)))))
+                  (update :evidence
+                          (fn [records]
+                            (mapv #(assoc % :original-status (tax/original-status % originals)) records))))))))
+
 (defn conforms?
   "Validate values against the JSON Schema keywords used by this contract."
   [schema value]
@@ -198,10 +220,41 @@
     (vector? value) (mapv domain-args value)
     :else value))
 
-(defn invoke [workspace operation-id arguments context]
+(defn- checked-arguments [operation-id arguments]
   (let [definition (get operation-by-id operation-id)]
     (when-not definition
       (throw (ex-info "Unknown semantic operation" {:taxreturn/error :unknown-operation})))
     (when-not (conforms? (:input-schema definition) arguments)
       (throw (ex-info "Operation arguments do not match the schema" {:taxreturn/error :invalid-arguments})))
-    (tax/run workspace operation-id (domain-args (dissoc arguments "ledger")) context)))
+    (domain-args (dissoc arguments "ledger"))))
+
+(defn invoke [workspace operation-id arguments context]
+  (tax/run workspace operation-id (checked-arguments operation-id arguments) context))
+
+(defn- download-original [workspace {:keys [record-id revision]} {:keys [browser? originals]}]
+  (let [record (some #(when (= revision (:revision %)) (:value %))
+                     (tax/history workspace {:target "evidence" :record-id record-id}))
+        key (tax/original-key (:sha256 record))]
+    (when-not (and browser? (contains? originals key))
+      (throw (ex-info "Evidence original is unavailable" {:taxreturn/error :original-missing})))
+    {:id key :name (or (:name record) record-id)}))
+
+(defn invoke-years [stored operation-id arguments context]
+  (let [{:keys [selected-year workspaces] :as years} (tax/tax-years stored)]
+    (case operation-id
+      "taxreturn.select_year"
+      {:workspace (assoc years :selected-year (:year (checked-arguments operation-id arguments)))}
+
+      "evidence.download_original"
+      {:workspace years
+       :output (download-original (tax/selected-workspace years) (checked-arguments operation-id arguments) context)}
+
+      (let [year (if (= "ledger.import" operation-id) (get arguments "year") selected-year)
+            workspace (get workspaces year tax/empty-workspace)
+            input (if (= "preview" (get arguments "phase"))
+                    (assoc workspace :next-card (reduce max 1 (keep :next-card (vals workspaces))))
+                    workspace)
+            {updated :workspace :as result} (invoke input operation-id arguments context)]
+        (assoc result :workspace
+               (cond-> (assoc years :selected-year year)
+                 (not= workspace updated) (assoc-in [:workspaces year] updated)))))))

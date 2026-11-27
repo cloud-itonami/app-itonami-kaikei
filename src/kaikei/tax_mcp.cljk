@@ -26,11 +26,13 @@
                    "annotations" {"readOnlyHint" (= "read" mode)
                                   "destructiveHint" false "openWorldHint" false}}
             (and apps? (app-tools id)) (assoc "_meta" {"ui" {"resourceUri" resource-uri}})))
-        semantic/operations))
+        (filter semantic/mcp-operation? semantic/operations)))
 
 (defn call [workspace operation arguments actor ledger]
   (let [{:keys [output] updated :workspace}
-        (semantic/invoke workspace operation arguments
-                         {:actor actor :ledger ledger :registry-lookup tax/manual-registry})]
+        (semantic/invoke-years workspace operation arguments
+                               {:actor actor :ledger ledger :registry-lookup tax/manual-registry})]
     {:workspace updated
-     :payload (semantic/wire (cond-> (semantic/snapshot updated) (some? output) (assoc :output output)))}))
+     :payload (semantic/wire (cond-> (update (semantic/snapshot-years updated #{}) :operations
+                                             #(filterv semantic/mcp-operation? %))
+                               (some? output) (assoc :output output)))}))

@@ -20,11 +20,12 @@ Kaikei の試算参照は `:pack/jurisdiction [:jp]`、`:pack/sources`、`:revie
 
 ## 第1スライスの利用範囲
 
-- 会計帳簿から「確定申告を開く」。2025・2026年分のうち選んだ1年分の円建て仕訳と、帳簿内の証憑メタデータを端末内の作業領域に取り込む。ユーザーが仕訳の所得区分と調整仕訳を指定する。給与は控除後の所得金額を使う。青色申告特別控除は確認済みの区分を選び、事業所得の黒字額を上限に試算する。
+- 会計帳簿から「確定申告を開く」。対象年を選び、その年の円建て仕訳と帳簿内の証憑メタデータを年別の作業領域に取り込む。2025年分の履歴、承認、チェックリストを残して2026年分を開始できる。ユーザーが仕訳の所得区分と調整仕訳を指定する。給与は控除後の所得金額を使う。青色申告特別控除は確認済みの区分を選び、事業所得の黒字額を上限に試算する。
 - 対応するのは居住者の通常の確定申告の概算。ここでの給与所得、雑所得、事業所得の合算は、課税対象の非負の所得を前提とする。分離課税、損益通算、準確定申告、源泉徴収・税額控除、正式な帳票と納付・還付額は「未対応」。試算の出典は [国税庁の基礎控除](https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/1199.htm)、[青色申告特別控除](https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/2072.htm)、[所得税の税率](https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/2260.htm)。
-- 作成者と承認者には別の担当者IDを使う。ブラウザで入力したIDはローカルの監査用で、身元や資格の認証はホストの責務。帳簿取り込み・決算整理を変更すると過去の履歴を保持したまま承認状態を再確認に戻す。通常の帳簿の一括消去は、確定申告領域の原本・証憑メタ・訂正履歴を保持する。証憑ファイル本体は既存の帳簿側にあり、この履歴は電子帳簿保存法上の適格性を判定しない。
+- 作成者と承認者には別の担当者IDを使う。ブラウザで入力したIDはローカルの監査用で、身元や資格の認証はホストの責務。帳簿取り込み・決算整理を変更すると、その年の履歴を保持したまま承認状態を再確認に戻す。
+- 証憑の登録時に、この端末にある原本バイトをSHA-256で識別して確定申告用に保存する。会計帳簿を消去しても、すべての年の申告履歴、証憑メタ、参照先の原本を保持する。旧形式では消去前に記録IDとハッシュを突き合わせ、原本が端末にあれば同じトランザクションで確保する。履歴検索は原本が保存済みか、メタデータのみかを示し、保存済みの原本はローカルブラウザから取り出せる。
 - 人向け画面は現在の作業と承認カードを優先し、詳細は必要時に開く。文字階層と操作対象の見分けやすさを参照した。[Apple HIG のデザイン原則](https://developer.apple.com/design/human-interface-guidelines/design-principles)、[Nintendo の公開事例](https://www.nintendo.com/us/whatsnew/ask-the-developer-vol-3-big-brain-academy-brain-vs-brain-part-1/)
-- `bin/kaikei-mcp` は接続単位のメモリに作業状態を持ち、ブラウザの保存領域からは読み出さない。合成帳簿で `taxreturn.read_state` から操作・スキーマを取得し、同じ接続で試算を進める。呼び出しごとに接続を開くホストは、合成帳簿・所得区分・試算条件を `taxreturn.preview_draft` にまとめて渡せる。承認と本人チェックはブラウザで行う。MCP Apps 対応ホストは `ui://kaikei/taxreturn.html` を埋め込める。標準 MCP では同じデータを `structuredContent` とテキストで返す。[SEP-1865](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp)、[MCP Apps 2026-01-26](https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx)
+- `bin/kaikei-mcp` は接続単位のメモリに作業状態を持つ。合成帳簿で `taxreturn.read_state` から操作・スキーマを取得し、同じ接続で試算を進める。呼び出しごとに接続を開くホストは、合成帳簿・所得区分・試算条件を `taxreturn.preview_draft` にまとめて渡せる。承認、本人チェック、証憑原本の取り出しはブラウザで行う。MCP Apps 対応ホストは `ui://kaikei/taxreturn.html` を埋め込める。標準 MCP では同じデータを `structuredContent` とテキストで返す。[SEP-1865](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp)、[AWAI-4143 の固定仕様](https://github.com/modelcontextprotocol/ext-apps/blob/ea3e9d0e624a20bc1c51310292f09d9b8ed17161/specification/2026-01-26/apps.mdx)
 - Plugin のインポートで発見されるのはスキル。MCP 接続は、ホストで同意後に `mcp.json.example` と既存のローカル実行環境を使って明示的に設定する。[Agent Plugins 1.0.0](https://agent-plugins.org/specification)、[Agent Skills](https://agentskills.io/specification)
 
 | 受入条件 | `npm test` で確認する箇所 |
@@ -33,3 +34,6 @@ Kaikei の試算参照は `:pack/jurisdiction [:jp]`、`:pack/sources`、`:revie
 | 決算・下書き・訂正を承認する担当者が作成者と異なる | `dry-run-and-separation-of-approval`、`append-only-journal-and-evidence` |
 | 元の仕訳と証憑メタを検索できる。登録番号の不一致は保存しない | `append-only-journal-and-evidence`、`invoice-registry-never-accepts-a-mismatch` |
 | ブラウザと Agent の操作定義・状態スキーマが一致する | `ui-and-agent-read-the-same-semantic-contract`、`negotiated-app-resource`、`sandbox-bridge-lifecycle-and-read-only-refresh` |
+| 年を切り替えても履歴と承認が独立し、証憑原本は端末だけで扱う | `moves-between-tax-years-with-independent-history-and-cards`、`originals-use-record-hashes-and-local-browser-access` |
+
+ブラウザ回帰試験は `test/tax-evidence-reload-browser.html` をビルド済み `index.html` と同じディレクトリに置き、新規ループバックのポートで開く。合成した旧形式の帳簿を使って、消去・再読込後の原本と欠損の表示、2025・2026年分の切替を確認する。AWAI-4143 の自前ホストでの受入試験と専門家による制度パックのレビューは別途実施する。

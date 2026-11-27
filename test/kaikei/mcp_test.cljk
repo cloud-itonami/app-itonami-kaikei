@@ -31,7 +31,8 @@
             "kaikei_invoice_totals" "kaikei_invoice_check" "kaikei_invoice_post"
             "kaikei_statement_check" "kaikei_statement_suggest" "kaikei_statement_post"]
            (map #(get % "name") (take 11 tools))))
-    (is (= (mapv :id semantic/operations) (mapv #(get % "name") (drop 11 tools))))
+    (is (= (mapv :id (filter semantic/mcp-operation? semantic/operations))
+           (mapv #(get % "name") (drop 11 tools))))
     (is (every? #(get-in % ["inputSchema" "type"]) tools))
     (is (not-any? #(contains? % "run") tools))))
 
