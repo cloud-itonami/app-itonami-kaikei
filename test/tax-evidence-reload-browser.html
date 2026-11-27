@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Tax evidence and year-switch regression</title>
+<p id="result" role="status">RUNNING</p>
+<iframe id="app" title="Local Kaikei fixture"></iframe>
+<script>
+  const result = document.querySelector("#result");
+  const frame = document.querySelector("#app");
+  const storageKey = "itonami.kaikei.v1";
+  const fixture = new TextEncoder().encode("Synthetic source evidence for 2025");
+  const missingHash = "1".repeat(64);
+  const unrelatedHash = "2".repeat(64);
+  const assert = (condition, message) => { if (!condition) throw new Error(message); };
+  const request = req => new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+
+  function transaction(db, names, mode, work) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(names, mode);
+      const value = work(tx);
+      tx.oncomplete = () => resolve(value);
+      tx.onabort = () => reject(tx.error || new Error("Transaction aborted"));
+    });
+  }
+
+  async function eventually(read) {
+    const deadline = performance.now() + 5000;
+    while (performance.now() < deadline) {
+      const value = await read();
+      if (value) return value;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    throw new Error("Timed out waiting for " + read.toString());
+  }
+
+  const select = selector => frame.contentDocument?.querySelector(selector);
+  const state = () => JSON.parse(select("[data-semantic-state]").textContent).state;
+  const button = label => [...(frame.contentDocument?.querySelectorAll("button") || [])].find(item => item.textContent === label);
+  const operation = id => select(`[data-operation="${id}"]`);
+  async function openTax() {
+    (await eventually(() => button("確定申告を開く"))).click();
+    await eventually(() => select("[data-semantic-state]"));
+  }
+  async function click(label) { (await eventually(() => button(label))).click(); }
+  async function chooseYear(year) {
+    const yearInput = select("#tax-year");
+    yearInput.value = String(year);
+    yearInput.dispatchEvent(new frame.contentWindow.Event("change", { bubbles: true }));
+    await eventually(() => state()["selected-year"] === year);
+  }
+
+  async function test() {
+    assert(location.hostname === "127.0.0.1" || location.hostname === "localhost", "Use an isolated loopback origin");
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", fixture))]
+      .map(byte => byte.toString(16).padStart(2, "0")).join("");
+    const key = "tax-original:" + hash;
+    const book = indexedDB.open("itonami.kaikei", 2);
+    let created = false;
+    book.onupgradeneeded = event => {
+      created = event.oldVersion === 0;
+      if (!created) {
+        book.transaction.abort();
+        return;
+      }
+      book.result.createObjectStore("state");
+      book.result.createObjectStore("files");
+    };
+    const db = await request(book);
+    assert(created, "Use a fresh loopback port for this synthetic fixture");
+    const metadata = (id, name, digest) => `{:id "${id}" :name "${name}" :sha256 "${digest}"}`;
+    const saved = metadata("f1", "synthetic-available.csv", hash);
+    const missing = metadata("f2", "synthetic-missing.csv", missingHash);
+    const unrelated = metadata("f2", "synthetic-unrelated.csv", unrelatedHash);
+    const revision = (id, metadata) => `{:target :evidence :record-id "${id}" :revision 1 :kind :original
+      :actor-id "synthetic-author" :actor-kind :human :at "2025-12-31T09:00:00Z" :value ${metadata}}`;
+    const legacy = `{:data {:currency "JPY" :entries [] :accounts {} :invoices []
+      :files [${saved} ${unrelated}] :taxreturn {:year 2025 :audit [] :classifications {}
+      :adjustments [] :registry {} :checklist {} :next-card 1
+      :revisions [${revision("f1", saved)} ${revision("f2", missing)}]}}}`;
+    await transaction(db, ["state", "files"], "readwrite", tx => {
+      tx.objectStore("state").add(legacy, storageKey);
+      tx.objectStore("state").add(1, storageKey + ".revision");
+      tx.objectStore("files").add(fixture, "f1");
+      tx.objectStore("files").add(Uint8Array.of(8, 9), "f2");
+    });
+
+    frame.src = "./index.html";
+    await openTax();
+    assert(state().year === 2025, "Select the legacy workspace's year");
+    await click("会計帳簿に戻る");
+    await click("すべて消去");
+    await eventually(() => frame.contentDocument.body.textContent.includes("参照先の証憑原本を残します"));
+    await click("会計帳簿を消去する");
+    await eventually(async () => {
+      const version = await request(db.transaction("state", "readonly").objectStore("state").get(storageKey + ".revision"));
+      return version > 1;
+    });
+    await eventually(() => button("確定申告を開く"));
+    await new Promise(resolve => {
+      frame.addEventListener("load", resolve, { once: true });
+      frame.contentWindow.location.reload();
+    });
+    await openTax();
+    const evidence = state().evidence;
+    assert(evidence.map(item => item["original-status"]).join(",") === "available,missing", "Display verified availability after reload");
+    assert(state()["revision-count"] === 2, "Retain both historical revisions");
+    [...frame.contentDocument.querySelectorAll("summary")].find(item => item.textContent.includes("訂正・取消履歴")).click();
+    operation("revision.search").click();
+    await eventually(() => select('[data-original-status="available"]'));
+    assert(select('[data-original-status="missing"]').textContent.includes("証憑の履歴は確認できます"), "Explain the missing original");
+    assert(operation("evidence.download_original"), "Offer an original download for the retained file");
+
+    const files = db.transaction("files", "readonly").objectStore("files");
+    const [keys, bytes] = await Promise.all([request(files.getAllKeys()), request(files.get(key))]);
+    assert(keys.length === 1 && keys[0] === key, "Remove ledger file IDs, preserve only the referenced bytes");
+    assert(new TextDecoder().decode(bytes) === new TextDecoder().decode(fixture), "The exact original bytes survive");
+
+    await click("会計帳簿に戻る");
+    await click("サンプルを読み込む");
+    await openTax();
+    await chooseYear(2026);
+    assert(state().step === "ledger", "Open a separate 2026 workspace");
+    const actor = select("#tax-actor");
+    const setter = Object.getOwnPropertyDescriptor(frame.contentWindow.HTMLInputElement.prototype, "value").set;
+    setter.call(actor, "synthetic-2026-author");
+    actor.dispatchEvent(new frame.contentWindow.Event("input", { bubbles: true }));
+    await eventually(() => select("#tax-actor").getAttribute("value") === "synthetic-2026-author");
+    operation("ledger.import").click();
+    await eventually(() => state().year === 2026);
+    assert(state().entries.length > 0, "Import the 2026 synthetic ledger");
+    await chooseYear(2025);
+    assert(state()["available-years"].join(",") === "2025,2026", "List both workspaces");
+    assert(state()["revision-count"] === 2 && state().evidence[0]["original-status"] === "available",
+      "Keep earlier history and original when switching back");
+    await eventually(async () => {
+      const record = await request(db.transaction("state", "readonly").objectStore("state").get(storageKey));
+      return record.includes(":selected-year 2025") && record.includes(":year 2026");
+    });
+    await new Promise(resolve => {
+      frame.addEventListener("load", resolve, { once: true });
+      frame.contentWindow.location.reload();
+    });
+    await openTax();
+    assert(state().year === 2025 && state()["available-years"].join(",") === "2025,2026",
+      "Recover both saved years after another reload");
+    db.close();
+  }
+
+  test().then(() => { result.textContent = "PASS tax evidence and year-switch regression"; },
+              error => { result.textContent = "FAIL " + error.message; });
+</script>

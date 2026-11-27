@@ -1,0 +1,38 @@
+(ns kaikei.tax-mcp
+  "MCP representation of the shared tax operation and view contract."
+  (:require [kaikei.tax-semantic :as semantic]
+            [kaikei.taxreturn :as tax]))
+
+(def resource-mime "text/html;profile=mcp-app")
+(def resource-uri "ui://kaikei/taxreturn.html")
+(def extension-id "io.modelcontextprotocol/ui")
+(def ^:private app-tools #{"taxreturn.read_state" "taxreturn.preview_draft"})
+
+(defn app-capable? [capabilities]
+  (boolean (some #{resource-mime} (get-in capabilities ["extensions" extension-id "mimeTypes"]))))
+
+(def resource
+  {"uri" resource-uri "name" "kaikei-taxreturn" "title" "確定申告の下書き" "mimeType" resource-mime})
+
+(defn resource-content [html]
+  (assoc resource "text" html
+         "_meta" {"ui" {"csp" {"connectDomains" [] "resourceDomains" [] "frameDomains" [] "baseUriDomains" []}}}))
+
+(defn tools [apps?]
+  (mapv (fn [{:keys [id label mode input-schema]}]
+          (cond-> {"name" id "description" (str label " (" mode "). Local workspace; use synthetic data.")
+                   "inputSchema" (cond-> input-schema
+                                   (= "ledger.import" id) (update "required" conj "ledger"))
+                   "annotations" {"readOnlyHint" (= "read" mode)
+                                  "destructiveHint" false "openWorldHint" false}}
+            (and apps? (app-tools id)) (assoc "_meta" {"ui" {"resourceUri" resource-uri}})))
+        (filter semantic/mcp-operation? semantic/operations)))
+
+(defn call [workspace operation arguments actor ledger]
+  (let [{:keys [output] updated :workspace}
+        (semantic/invoke-years workspace operation arguments
+                               {:actor actor :ledger ledger :registry-lookup tax/manual-registry})]
+    {:workspace updated
+     :payload (semantic/wire (cond-> (update (semantic/snapshot-years updated #{}) :operations
+                                             #(filterv semantic/mcp-operation? %))
+                               (some? output) (assoc :output output)))}))

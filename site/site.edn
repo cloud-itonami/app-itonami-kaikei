@@ -52,5 +52,8 @@
            {:from "src/kaikei/compat/bill.cljk" :to "kaikei/compat/bill.cljs"}
            {:from "src/kaikei/ingest.cljk" :to "kaikei/ingest.cljs"}
            {:from "src/kaikei/export.cljk" :to "kaikei/export.cljs"}
+           {:from "src/kaikei/taxreturn.cljk" :to "kaikei/taxreturn.cljs"}
+           {:from "src/kaikei/tax_semantic.cljk" :to "kaikei/tax_semantic.cljs"}
+           {:from "src/kaikei/tax_view.cljk" :to "kaikei/tax_view.cljs"}
            {:from "src/kaikei/view.cljk" :to "kaikei/view.cljs"}
            {:from "site/app.cljk" :to "app.cljs"}]}

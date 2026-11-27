@@ -5,6 +5,7 @@
             [kaikei.encoding :as enc]
             [kaikei.ingest :as ingest]
             [kaikei.mcp :as mcp]
+            [kaikei.tax-semantic :as semantic]
             [kaikei.core]
             [kaikei.compat.native]))
 
@@ -24,12 +25,14 @@
 (defn- fixture-text [f] (str (fs/readFileSync (str "test/fixtures/" f) "utf8")))
 (defn- fixture-base64 [f] (enc/bytes->base64 (js/Uint8Array. (fs/readFileSync (str "test/fixtures/" f)))))
 
-(deftest lists-eleven-tools
+(deftest lists-legacy-and-semantic-tools
   (let [tools (get-in (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "tools/list"}) ["result" "tools"])]
     (is (= ["kaikei_import" "kaikei_validate" "kaikei_report" "kaikei_export" "kaikei_convert"
             "kaikei_invoice_totals" "kaikei_invoice_check" "kaikei_invoice_post"
             "kaikei_statement_check" "kaikei_statement_suggest" "kaikei_statement_post"]
-           (map #(get % "name") tools)))
+           (map #(get % "name") (take 11 tools))))
+    (is (= (mapv :id (filter semantic/mcp-operation? semantic/operations))
+           (mapv #(get % "name") (drop 11 tools))))
     (is (every? #(get-in % ["inputSchema" "type"]) tools))
     (is (not-any? #(contains? % "run") tools))))
 

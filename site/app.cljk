@@ -24,6 +24,8 @@
             [kaikei.export :as export]
             [kaikei.invoice :as invoice]
             [kaikei.statement :as statement]
+            [kaikei.taxreturn :as tax]
+            [kaikei.tax-semantic :as semantic]
             [kaikei.compat.statement-csv :as statement-csv]
             [kaikei.view :as view]))
 
@@ -67,8 +69,9 @@
        (.then (fn [idb]
                 (js/Promise.
                  (fn [resolve reject]
-                   (let [tx (.transaction idb store mode)
-                         req (f (.objectStore tx store))]
+                   (let [stores (if (vector? store) store [store])
+                         tx (.transaction idb (clj->js stores) mode)
+                         req (apply f (map #(.objectStore tx %) stores))]
                      (set! (.-oncomplete tx) (fn [_] (.close idb) (resolve (if (vector? req) (mapv #(.-result %) req) (.-result req)))))
                      (set! (.-onerror tx) (fn [_] (.close idb) (reject (.-error tx))))
                      ;; 明示的な abort は error event を伴わない場合がある。
@@ -91,23 +94,48 @@
  (fn [_]
    ;; IndexedDB に無く localStorage にだけあるもの（前の版の保存）は、そちらを読む。
    ;; 次の保存で IndexedDB へ移り、localStorage の分は消える。
-   (-> (idb-request "readonly" #(vector (.get % storage-key) (.get % revision-key)))
+   (-> (idb-request [idb-store files-store] "readonly"
+                    (fn [state files] [(.get state storage-key) (.get state revision-key) (.getAllKeys files)]))
        ;; 旧保存領域が読めない場合は「旧データなし」と判断しない。
        ;; 既存 IndexedDB がある場合は旧領域を読む必要はない。
-       (.then (fn [[v revision]]
+       (.then (fn [[v revision keys]]
                 (when-not (valid-revision? revision) (throw (js/Error. "invalid ledger revision")))
-                (let [legacy (if (some? v) (local-get) (.getItem js/localStorage storage-key))]
+                (let [legacy (if (some? v) (local-get) (.getItem js/localStorage storage-key))
+                      originals (into #{} (filter tax/original-storage-key?)
+                                      (array-seq (or keys #js [])))]
                   (reset! idb-expected (when (some? v) v))
                   (reset! idb-revision revision)
                   (reset! legacy-migration-source (when (nil? v) legacy))
-                  (rf/dispatch [::loaded (if (some? v) v legacy) :indexeddb (and (some? v) (some? legacy))]))))
+                  (rf/dispatch [::loaded (if (some? v) v legacy) :indexeddb (and (some? v) (some? legacy))
+                                originals]))))
        (.catch (fn [e] (rf/dispatch [::load-failed (and (some? e) (= (.-message e) "storage-upgrade-blocked"))]))))))
 
 (def ^:private store-tail (atom (js/Promise.resolve nil)))
 ;; 元ファイルを含む保存が失敗した後は、欠けたデータを後続の帳簿だけの保存で確定しない。
 (def ^:private file-write-failed? (atom false))
 
-(defn- idb-write-with-file [text {:keys [put delete clear?]} clear-snapshot]
+(defn- retain-original! [store archived [key id]]
+  (let [existing (.getKey store key)
+        source (.get store id)]
+    (set! (.-onsuccess source)
+          (fn [_]
+            (if (some? (.-result existing))
+              (swap! archived conj key)
+              (when-some [bytes (.-result source)]
+                (.put store bytes key)
+                (swap! archived conj key)))))))
+
+(defn- clear-ledger-files! [store]
+  (let [request (.openKeyCursor store)]
+    (set! (.-onsuccess request)
+          (fn [_]
+            (when-let [cursor (.-result request)]
+              (let [key (.-key cursor)]
+                (when-not (tax/original-storage-key? key)
+                  (.delete store key))
+                (.continue cursor)))))))
+
+(defn- idb-write-with-file [text {:keys [put delete clear? retain]} clear-snapshot]
   (-> (idb-open)
       (.then (fn [idb]
                (js/Promise.
@@ -122,6 +150,7 @@
                           conflict? (atom false)
                           overflow? (atom false)
                           next-revision (atom nil)
+                          archived (atom #{})
                           cleanup (fn [] (when clear-snapshot (remove-watch rf-db/app-db ::clear-guard)) (.close idb))]
                       (when clear-snapshot
                         (add-watch rf-db/app-db ::clear-guard
@@ -129,7 +158,7 @@
                                      (when (not= clear-snapshot (:data next-db))
                                        (reset! changed? true)
                                        (try (.abort tx) (catch :default _ nil))))))
-                      (set! (.-oncomplete tx) (fn [_] (cleanup) (reset! idb-expected text) (reset! idb-revision @next-revision) (resolve nil)))
+                      (set! (.-oncomplete tx) (fn [_] (cleanup) (reset! idb-expected text) (reset! idb-revision @next-revision) (resolve @archived)))
                       (set! (.-onabort tx) (fn [_] (cleanup)
                                               (reject (cond @changed? (js/Error. "消去中に帳簿が変更されました。消去を中止しました")
                                                             @overflow? (js/Error. "帳簿の更新番号が上限に達しました。控えを保存して復旧方法を確認してください")
@@ -155,8 +184,12 @@
                                         (reset! next-revision (if revision (inc revision) 1))
                                         (.put state @next-revision revision-key)
                                         (if text (.put state text storage-key) (.delete state storage-key))
-                                        (cond put (.put files (:bytes put) (:id put))
-                                              delete (.delete files delete)
+                                        (when put (.put files (:bytes put) (:id put)))
+                                        ;; The source reads must precede deletion, including for a
+                                        ;; workspace saved before originals were archived.
+                                        (doseq [ref retain] (retain-original! files archived ref))
+                                        (cond delete (.delete files delete)
+                                              (and clear? (:taxreturn clear-snapshot)) (clear-ledger-files! files)
                                               clear? (.clear files))
                                         (catch :default _ (try (.abort tx) (catch :default _ nil))))))))))
                         (catch :default e (.abort tx) (reject e))))
@@ -183,7 +216,7 @@
                           (if (= backend :local-storage)
                             (if file-op (throw (js/Error. "元ファイルを含む帳簿は IndexedDB に保存する必要があります")) (local!))
                             (-> (idb-write-with-file text file-op clear-snapshot)
-                                (.then (fn [_]
+                                (.then (fn [archived]
                                          (when (some? @legacy-migration-source)
                                            (try
                                              (when (= @legacy-migration-source (.getItem js/localStorage storage-key))
@@ -191,8 +224,8 @@
                                              (catch :default _ nil))
                                            (reset! legacy-migration-source nil))
                                          (if clear-snapshot
-                                           (rf/dispatch-sync [::clear-committed clear-snapshot])
-                                           (rf/dispatch [::stored-ok]))))))))
+                                           (rf/dispatch-sync [::clear-committed clear-snapshot archived])
+                                           (rf/dispatch [::stored-ok archived]))))))))
                  ;; 失敗後も次の snapshot を処理できるよう、拒否をここで解消する。
                  (.catch (fn [e]
                            (when file-op (reset! file-write-failed? true))
@@ -299,14 +332,15 @@
 
 (rf/reg-event-db
  ::loaded
- (fn [db [_ text backend legacy-extra?]]
+ (fn [db [_ text backend legacy-extra? originals]]
    (try
      (let [stored (when (some? text) (edn/read-string text))]
        (when (and (some? text) (not (and (map? stored) (map? (:data stored)))))
          (throw (js/Error. "保存データの形式が正しくありません")))
        {:data (if stored (merge core/empty-db (:data stored)) core/empty-db)
         :backend backend
-        :ui (merge (:ui db) {:booting? false :legacy-extra? (or legacy-extra? (get-in db [:ui :legacy-extra?]))}
+        :ui (merge (:ui db) {:booting? false :legacy-extra? (or legacy-extra? (get-in db [:ui :legacy-extra?]))
+                            :tax-originals originals}
                    (select-keys (:settings stored) [:fy-start :pl-style]))})
      (catch :default _
        (assoc-in db [:ui :load-error] "保存済みの帳簿を読み取れませんでした。データを保護するため編集を停止しました。ブラウザの保存データを消去せず、復旧方法を確認してください。")))))
@@ -314,14 +348,17 @@
 (defn- with-store
   "db → db' の effect に、変更した帳簿と設定を保存する ::store を足す。"
   [db db' fx]
-  (let [file-op (cond (::store-file fx) {:put (::store-file fx)}
-                      (::delete-file fx) {:delete (::delete-file fx)}
-                      (::clear-files fx) {:clear? true})]
-    (cond-> (assoc (dissoc fx ::store-file ::delete-file ::clear-files) :db db')
-    (or file-op (not= (:data db) (:data db'))
-        (not= (saved-state db) (saved-state db')))
-    (assoc ::store {:backend (:backend db') :file-op file-op
-                    :saved (saved-state db')}))))
+  (let [retain (cond (::archive-tax fx) (tax/original-file-plan (:data db'))
+                     (::delete-file fx) (tax/original-file-plan (:data db)))
+        file-op (cond-> {}
+                  (::store-file fx) (assoc :put (::store-file fx))
+                  (::delete-file fx) (assoc :delete (::delete-file fx))
+                  (seq retain) (assoc :retain retain))]
+    (cond-> (assoc (dissoc fx ::store-file ::delete-file ::archive-tax) :db db')
+      (or (seq file-op) (not= (:data db) (:data db'))
+          (not= (saved-state db) (saved-state db')))
+      (assoc ::store {:backend (:backend db') :file-op (not-empty file-op)
+                      :saved (saved-state db')}))))
 
 (defn- reg-data-event
   "data を変える event。handler は (fn [db event] db')。変えた data を ::store
@@ -335,7 +372,11 @@
 (defn- reg-ui-event [id f]
   (rf/reg-event-db id (fn [db event] (f db event))))
 
-(rf/reg-event-db ::stored-ok (fn [db _] (assoc-in db [:ui :store-error] nil)))
+(rf/reg-event-db ::stored-ok
+                (fn [db [_ archived]]
+                  (-> db
+                      (assoc-in [:ui :store-error] nil)
+                      (update-in [:ui :tax-originals] (fnil into #{}) archived))))
 (rf/reg-event-db ::store-failed (fn [db [_ msg]] (assoc-in db [:ui :store-error] msg)))
 
 (rf/reg-event-db
@@ -408,6 +449,43 @@
         p2 #(text/pad-left (str %) 2 "0")]
     (str (.getFullYear d) "-" (p2 (inc (.getMonth d))) "-" (p2 (.getDate d)) "T" (p2 (.getHours d)) ":" (p2 (.getMinutes d))
          ":" (p2 (.getSeconds d)) (if (neg? off) "-" "+") (p2 (quot (js/Math.abs off) 60)) ":" (p2 (mod (js/Math.abs off) 60)))))
+
+(reg-ui-event :tax-field
+              (fn [db [_ field value]] (assoc-in db [:ui :tax-fields field] value)))
+
+(rf/reg-event-fx
+ :tax-select-year
+ (fn [_ [_ year]]
+   {:dispatch [:tax-operation "taxreturn.select_year" {"year" (parse-long year)} nil]}))
+
+(rf/reg-event-fx
+ :tax-operation
+ (fn [{:keys [db]} [_ operation arguments actor-id]]
+   (try
+     (let [workspace (tax/tax-years (get-in db [:data :taxreturn]))
+           {:keys [output] updated :workspace}
+           (semantic/invoke-years workspace operation arguments
+                                  {:ledger (:data db)
+                                   :originals (get-in db [:ui :tax-originals])
+                                   :browser? true
+                                   :actor {:actor-id actor-id :actor-kind :human :at (now-iso)}
+                                   :registry-lookup tax/manual-registry})
+           changed-year? (not= (:selected-year workspace) (:selected-year updated))
+           next-db (cond-> (update db :ui dissoc :tax-error)
+                     (not= workspace updated) (assoc-in [:data :taxreturn] updated)
+                     (not= workspace updated) (update :ui dissoc :tax-history :tax-preview)
+                     changed-year? (update :ui dissoc :tax-registry)
+                     changed-year? (update-in [:ui :tax-fields] select-keys [:actor])
+                     (= operation "revision.search") (assoc-in [:ui :tax-history] output)
+                     (= operation "invoice.verify_registry") (assoc-in [:ui :tax-registry] output)
+                     (= operation "taxreturn.preview_draft") (assoc-in [:ui :tax-preview] output)
+                     (= "approve" (get arguments "phase")) (assoc-in [:ui :tax-fields :approver] ""))]
+       (with-store db next-db
+                   (cond-> {}
+                     (= operation "ledger.import") (assoc ::archive-tax true)
+                     (= operation "evidence.download_original") (assoc ::download-file output))))
+     (catch :default e
+       {:db (assoc-in db [:ui :tax-error] (get (ex-data e) :taxreturn/error :internal-error))}))))
 
 (defn- import-opts [ui]
   {:format (:import-format ui) :currency (:import-currency ui) :encoding (:import-encoding ui)})
@@ -509,12 +587,21 @@
  (fn [db [_ account v]]
    (update db :data core/set-class account (keyword v))))
 
+(defn- cleared-db [db]
+  (assoc db :data (merge core/empty-db (select-keys (:data db) [:taxreturn]))
+            :ui (merge view/initial-ui (select-keys (:ui db) [:legacy-extra? :tax-originals]))))
+
 (rf/reg-event-fx
  :clear-all
  (fn [{:keys [db]} _]
    (when-not (get-in db [:ui :clear-pending?])
-     {:db (assoc-in db [:ui :clear-pending?] true)
-      ::store {:backend (:backend db) :saved nil :file-op {:clear? true} :clear-snapshot (:data db)}})))
+     (let [snapshot (:data db)]
+       {:db (assoc-in db [:ui :clear-pending?] true)
+        ::store {:backend (:backend db)
+                 :saved (when (:taxreturn snapshot)
+                          (saved-state (cleared-db db)))
+                 :file-op {:clear? true :retain (tax/original-file-plan snapshot)}
+                 :clear-snapshot snapshot}}))))
 
 (rf/reg-event-db
  ::clear-failed
@@ -522,10 +609,9 @@
 
 (rf/reg-event-db
  ::clear-committed
- (fn [db [_ snapshot]]
+ (fn [db [_ snapshot archived]]
    (if (= snapshot (:data db))
-     (assoc db :data core/empty-db
-               :ui (assoc view/initial-ui :legacy-extra? (get-in db [:ui :legacy-extra?])))
+     (update-in (cleared-db db) [:ui :tax-originals] (fnil into #{}) archived)
      (do
        ;; 消去待ちの間に非同期処理が内容を変えた場合、画面の内容を消さない。
        (reset! file-write-failed? true)

@@ -7,20 +7,22 @@
             ["child_process" :as cp]
             ["fs" :as fs]
             ["path" :as path]
+            [kaikei.tax-mcp :as tax-mcp]
+            [kaikei.tax-semantic :as semantic]
             [kotoba.lang.text :as text]))
 
 (def server (fs/realpathSync "bin/kaikei-mcp"))
 
 (defn- line [m] (str (.stringify js/JSON (clj->js m)) "\n"))
 
-(defn- exchange
-  "agent と同じ 3 行を流して {:status :responses :stderr} を返す。"
-  [cwd method params]
-  (let [input (str (line {"jsonrpc" "2.0" "id" 1 "method" "initialize"
-                          "params" {"protocolVersion" "2024-11-05" "capabilities" {}
-                                    "clientInfo" {"name" "itonami-agent" "version" "0.1"}}})
-                   (line {"jsonrpc" "2.0" "method" "notifications/initialized" "params" {}})
-                   (line {"jsonrpc" "2.0" "id" 2 "method" method "params" params}))
+(defn- conversation [cwd capabilities requests]
+  (let [input (apply str (line {"jsonrpc" "2.0" "id" 1 "method" "initialize"
+                                "params" {"protocolVersion" "2024-11-05" "capabilities" capabilities
+                                          "clientInfo" {"name" "test-host" "version" "0.1"}}})
+                     (line {"jsonrpc" "2.0" "method" "notifications/initialized" "params" {}})
+                     (map-indexed (fn [i [method params]]
+                                    (line {"jsonrpc" "2.0" "id" (+ 2 i) "method" method "params" params}))
+                                  requests))
         r (cp/spawnSync "kbb" #js [server]
                         #js {:cwd cwd :input input :encoding "utf8" :timeout 30000
                              :env (js/Object.assign #js {} js/process.env)})]
@@ -32,6 +34,8 @@
                      vec)
      :stdout (str (.-stdout r))}))
 
+(defn- exchange [cwd method params] (conversation cwd {} [[method params]]))
+
 (defn- by-id [{:keys [responses]} id]
   (first (filter #(= id (get % "id")) responses)))
 
@@ -41,7 +45,8 @@
       (let [r (exchange cwd "tools/list" {})]
         (is (= 0 (:status r)) (:stderr r))
         (is (= "kaikei" (get-in (by-id r 1) ["result" "serverInfo" "name"])))
-        (is (= 11 (count (get-in (by-id r 2) ["result" "tools"]))))
+        (is (= (+ 11 (count (filter semantic/mcp-operation? semantic/operations)))
+               (count (get-in (by-id r 2) ["result" "tools"]))))
         (testing "stdout は JSON-RPC の行だけ（通知への応答も無い）"
           (is (= 2 (count (:responses r))))
           (is (every? #(= "2.0" (get % "jsonrpc")) (:responses r))))))))
@@ -76,3 +81,58 @@
     (is (= 0 (:status r)))
     (is (true? (get result "isError")))
     (is (= "invalid-argument" (get (js->clj (.parse js/JSON (get-in result ["content" 0 "text"]))) "error")))))
+
+(defn- tool-call [name arguments]
+  ["tools/call" {"name" name "arguments" arguments}])
+
+(deftest tax-stdio-session-and-fallback
+  (let [ledger {"format" "kaikei.ledger.v1" "currency" "JPY"
+                "entries" [{"id" "synthetic-entry" "date" "2026-04-01"
+                            "lines" [{"account" "普通預金" "debit" 3000000}
+                                     {"account" "売上高" "credit" 3000000}]}]}
+        client (conversation "/"
+                             {}
+                             [["tools/list" {}]
+                              (tool-call "ledger.import" {"ledger" ledger "year" 2026})
+                              (tool-call "income.classify" {"entry-id" "synthetic-entry" "category" "business"})
+                              (tool-call "taxreturn.preview_draft" {"salary-income" 0 "resident-standard-only" true "blue-amount" 0})
+                              (tool-call "closing.finalize" {"phase" "preview" "salary-income" 0})
+                              (tool-call "closing.finalize" {"phase" "approve" "card-id" 1})
+                              (tool-call "taxreturn.read_state" {})])
+        preview (get (by-id client 5) "result")
+        structured (get preview "structuredContent")
+        tool (some #(when (= "taxreturn.preview_draft" (get % "name")) %) (get-in (by-id client 2) ["result" "tools"]))
+        single (exchange "/" "tools/call"
+                         {"name" "taxreturn.preview_draft"
+                          "arguments" {"year" 2026 "ledger" ledger
+                                       "classifications" [{"entry-id" "synthetic-entry" "category" "business"}]
+                                       "salary-income" 0 "resident-standard-only" true "blue-amount" 0}})
+        single-preview (get-in (by-id single 2) ["result" "structuredContent"])]
+    (is (= 0 (:status client)) (:stderr client))
+    (is (nil? (get tool "_meta")))
+    (is (= structured (js->clj (.parse js/JSON (get-in preview ["content" 0 "text"])))))
+    (is (= "agent" (get-in structured ["state" "audit" 0 "actor-kind"])))
+    (is (= 100568 (get-in structured ["output" "estimate"])))
+    (is (= "user-manual-required" (get-in structured ["output" "submission-status"])))
+    (is (= 0 (:status single)) (:stderr single))
+    (is (= (get structured "output") (get single-preview "output")))
+    (is (= "ledger" (get-in single-preview ["state" "step"])))
+    (is (= "human-approval-required" (get-in (by-id client 7) ["result" "structuredContent" "error"])))
+    (is (nil? (get-in (by-id client 8) ["result" "structuredContent" "state" "closing"])))))
+
+(deftest negotiated-app-resource
+  (let [client (conversation "/" {"extensions" {tax-mcp/extension-id {"mimeTypes" [tax-mcp/resource-mime]}}}
+                             [["tools/list" {}] ["resources/list" {}]
+                              ["resources/read" {"uri" tax-mcp/resource-uri}]
+                              (tool-call "taxreturn.read_state" {})])
+        tools (get-in (by-id client 2) ["result" "tools"])
+        read (some #(when (= "taxreturn.read_state" (get % "name")) %) tools)
+        resource (get-in (by-id client 4) ["result" "contents" 0])]
+    (is (= 0 (:status client)) (:stderr client))
+    (is (= {} (get-in (by-id client 1) ["result" "capabilities" "resources"])))
+    (is (= tax-mcp/resource-uri (get-in read ["_meta" "ui" "resourceUri"])))
+    (is (= tax-mcp/resource-uri (get-in (by-id client 3) ["result" "resources" 0 "uri"])))
+    (is (= tax-mcp/resource-mime (get resource "mimeType")))
+    (is (= [] (get-in resource ["_meta" "ui" "csp" "connectDomains"])))
+    (is (text/includes? (get resource "text") "connect-src 'none'"))
+    (is (= "ledger" (get-in (by-id client 5) ["result" "structuredContent" "state" "step"])))))

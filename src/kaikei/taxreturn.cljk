@@ -1,0 +1,428 @@
+(ns kaikei.taxreturn
+  "Local personal income tax worksheet. All amounts are whole yen."
+  (:require [kaikei.core :as core]
+            [kotoba.lang.text :as text]))
+
+(def unsupported "未対応")
+(def supported-years [2025 2026])
+(def registry-url "https://www.invoice-kohyo.nta.go.jp/")
+(def categories ["business" "miscellaneous" "salary"])
+(def adjustment-kinds ["depreciation" "household-allocation" "inventory" "other"])
+
+(def jurisdiction
+  {:pack/id :jp/personal-income-tax-estimate
+   :pack/jurisdiction [:jp]
+   :pack/version "2026.11.26-1"
+   :pack/checked-on "2026-11-26"
+   :review/status :unreviewed
+   :pack/sources
+   {:jp.nta/shotoku-1199 {:url "https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/1199.htm"
+                         :version "令和8年4月1日現在法令等" :retrieved-on "2026-11-26"}
+    :jp.nta/shotoku-2072 {:url "https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/2072.htm"
+                         :version "令和8年4月1日現在法令等" :retrieved-on "2026-11-26"}
+    :jp.nta/shotoku-2260 {:url "https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/2260.htm"
+                         :version "令和8年4月1日現在法令等" :retrieved-on "2026-11-26"}}
+   :pack/procedure-ref
+   {:repository "cloud-itonami/app-itonami-egov"
+    :revision "54e55c2ee5f594994c46117f8743504a06d43ade"
+    :file "seido/jp.edn"
+    :pack/id :jp/residence-and-corporate-address
+    :pack/version "2026.11.26-1"
+    :pack/checked-on "2026-11-23"
+    :review/status :unreviewed
+    :events [:tax-return :kakutei-shinkoku]
+    :procedures [:jp/shotoku-kakutei-shinkoku-aoiro :jp/shotoku-kakutei-shinkoku-shiroiro]}})
+
+(defn pack-field [field] (get jurisdiction field unsupported))
+
+(def checklist
+  [{:id "confirm" :label "所得区分・控除の要件と金額を確認する"}
+   {:id "documents" :label "対象年の正式な様式と添付書類を確認する"}
+   {:id "destination" :label "提出期限と提出先を自分で確認する"}
+   {:id "manual" :label "本人が署名・提出し、受付の控えを保管する"}])
+
+(def empty-workspace
+  {:revisions [] :audit [] :adjustments [] :classifications {}
+   :registry {} :checklist {} :next-card 1})
+
+(def default-year (peek supported-years))
+
+(defn tax-years
+  "Normalize the first version's single workspace without changing its history."
+  [stored]
+  (if (contains? stored :workspaces)
+    stored
+    (let [year (or (:year stored) default-year)]
+      {:selected-year year :workspaces (if stored {year stored} {})})))
+
+(defn selected-workspace [tax-years]
+  (get-in tax-years [:workspaces (:selected-year tax-years)] empty-workspace))
+
+(def ^:private original-prefix "tax-original:")
+
+(defn original-storage-key? [key]
+  (and (string? key) (text/starts-with? key original-prefix)))
+
+(defn original-key [sha256]
+  (when (and (string? sha256) (re-matches #"[0-9a-f]{64}" sha256))
+    (str original-prefix sha256)))
+
+(defn original-file-plan
+  "Match historical evidence to the current ledger by both record ID and hash."
+  [{:keys [taxreturn files]}]
+  (let [referenced (into #{} (comp (mapcat :revisions)
+                                   (filter #(= :evidence (:target %)))
+                                   (map (fn [revision] [(:record-id revision) (get-in revision [:value :sha256])])))
+                         (vals (:workspaces (tax-years taxreturn))))]
+    (into {} (keep (fn [{:keys [id sha256]}]
+                     (when (referenced [id sha256])
+                       (when-let [key (original-key sha256)] [key id]))))
+          files)))
+
+(defn original-status [evidence originals]
+  (if (contains? originals (original-key (:sha256 evidence))) "available" "missing"))
+
+(defn- require! [valid? code]
+  (when-not valid? (throw (ex-info (name code) {:taxreturn/error code}))))
+
+(defn- present? [s] (and (string? s) (not (text/blank? s))))
+(defn- yen? [n] (and (integer? n) (<= 0 n 999999999999)))
+(defn- journal-date [d] (when (string? d) (core/parse-date d)))
+(defn- year-of [d] (some-> (journal-date d) (subs 0 4) parse-long))
+
+(defn- actor! [{:keys [actor-id actor-kind at] :as actor}]
+  (require! (and (present? actor-id) (#{:human :agent} actor-kind)
+                 (string? at) (re-matches #"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)" at))
+            :invalid-actor)
+  (assoc actor :actor-id (text/lower (text/trim actor-id))))
+
+(defn- audit [workspace operation actor detail]
+  (update workspace :audit conj (merge actor {:operation operation :detail detail})))
+
+(defn- invalidate [workspace]
+  (dissoc (assoc workspace :checklist {}) :closing :deduction :approval :card))
+
+(defn- valid-line? [{:keys [account debit credit] :or {debit 0 credit 0}}]
+  (and (present? account) (yen? debit) (yen? credit)))
+
+(defn- valid-entry? [entry year]
+  (and (present? (:id entry)) (= year (year-of (:date entry)))
+       (vector? (:lines entry)) (every? valid-line? (:lines entry))
+       (empty? (core/entry-problems entry))))
+
+(defn- original [target value actor]
+  (merge actor {:target target :record-id (:id value) :revision 1 :kind :original :value value}))
+
+(defn- heads [workspace target]
+  (reduce (fn [records r] (assoc records (:record-id r) r))
+          {} (filter #(= target (:target %)) (:revisions workspace))))
+
+(defn- active [workspace target]
+  (->> (vals (heads workspace target))
+       (remove #(= :void (:kind %)))
+       (map :value)
+       (sort-by :id)
+       vec))
+
+(defn- new-originals [workspace target values actor]
+  (let [by-id (into {} (map (juxt :record-id :value))
+                    (filter #(and (= target (:target %)) (= :original (:kind %))) (:revisions workspace)))]
+    (require! (= (count values) (count (set (map :id values)))) :duplicate-record-id)
+    (doseq [value values :when (contains? by-id (:id value))]
+      (require! (= value (get by-id (:id value))) :requires-correction))
+    (mapv #(original target % actor) (remove #(contains? by-id (:id %)) values))))
+
+(defn import-ledger [workspace ledger year actor]
+  (let [actor (actor! actor)]
+    (require! (some #{year} supported-years) :unsupported-year)
+    (require! (= "JPY" (:currency ledger)) :unsupported-currency)
+    (require! (or (nil? (:year workspace)) (= year (:year workspace))) :year-already-selected)
+    (require! (every? #(journal-date (:date %)) (:entries ledger)) :invalid-entry)
+    (let [entries (filterv #(= year (year-of (:date %))) (:entries ledger))
+          files (mapv #(select-keys % [:id :name :size :sha256 :imported-at :format :account-ids])
+                      (:files ledger))
+          accounts (into {} (map (fn [account] [account (core/account-class ledger account)]))
+                         (core/used-accounts {:entries entries}))
+          class-changes (into {} (keep (fn [[account class]]
+                                         (let [previous (get-in workspace [:accounts account])]
+                                           (when (and previous (not= class previous))
+                                             [account {:before previous :after class}]))))
+                              accounts)]
+      (require! (every? #(valid-entry? % year) entries) :invalid-entry)
+      (require! (every? #(present? (:id %)) files) :invalid-evidence)
+      (let [revisions (into (new-originals workspace :entry entries actor)
+                            (new-originals workspace :evidence files actor))]
+        (if (and (:year workspace) (empty? revisions) (empty? class-changes))
+          workspace
+          (-> workspace invalidate
+              (assoc :year year)
+              (update :accounts merge accounts)
+              (update :revisions into revisions)
+              (audit "ledger.import" actor {:year year :new-records (count revisions)
+                                            :account-class-changes class-changes})))))))
+
+(defn- entry-amount [workspace entry]
+  (reduce (fn [{:keys [amount relevant? unknown?]} {:keys [account debit credit] :or {debit 0 credit 0}}]
+            (let [class (or (get-in workspace [:accounts account]) (core/default-class account))]
+              {:amount (if (and (core/pl-class? class) (not= :income-tax class))
+                         (+ amount (- credit debit)) amount)
+               :relevant? (or relevant? (and (core/pl-class? class) (not= :income-tax class)))
+               :unknown? (or unknown? (not (contains? core/class-code class)))}))
+          {:amount 0 :relevant? false :unknown? false} (:lines entry)))
+
+(defn- income-entries [workspace]
+  (mapv (fn [entry] (merge (select-keys entry [:id :date :memo :lines])
+                          (entry-amount workspace entry)
+                          {:category (get-in workspace [:classifications (:id entry)])}))
+        (active workspace :entry)))
+
+(defn- classify [workspace entry-id category actor]
+  (require! (some #{category} categories) :unsupported-category)
+  (require! (some #(and (= entry-id (:id %)) (:relevant? %)) (income-entries workspace)) :unknown-entry)
+  (-> workspace invalidate
+      (assoc-in [:classifications entry-id] category)
+      (audit "income.classify" (actor! actor) {:entry-id entry-id :category category})))
+
+(defn- draft-adjustment [workspace {:keys [category kind entry]} actor]
+  (require! (some #{kind} adjustment-kinds) :unsupported-adjustment)
+  (require! (#{"business" "miscellaneous"} category) :unsupported-category)
+  (require! (valid-entry? entry (:year workspace)) :invalid-entry)
+  (require! (not (:unknown? (entry-amount workspace entry))) :unclassified-account)
+  (require! (not-any? #(= (:id entry) (get-in % [:entry :id])) (:adjustments workspace)) :duplicate-record-id)
+  (-> workspace invalidate
+      (update :adjustments conj {:kind kind :category category :entry entry})
+      (audit "adjustment.draft" (actor! actor) {:entry-id (:id entry) :kind kind})))
+
+(defn- closing-preview [workspace {:keys [salary-income]}]
+  (require! (:year workspace) :ledger-required)
+  (require! (yen? salary-income) :invalid-amount)
+  (let [entries (income-entries workspace)
+        adjustments (mapv (fn [{:keys [category entry]}]
+                            (assoc (entry-amount workspace entry) :category category))
+                          (:adjustments workspace))
+        issues (filterv #(or (:unknown? %) (and (:relevant? %) (nil? (:category %)))) entries)
+        totals (reduce (fn [m {:keys [category amount]}]
+                         (if category (update m category + amount) m))
+                       {"business" 0 "miscellaneous" 0 "salary" salary-income}
+                       (concat entries adjustments))]
+    (require! (empty? issues) :income-classification-required)
+    (require! (every? yen? (vals totals)) :unsupported-income-total)
+    (require! (<= (reduce + (vals totals)) 330000000) :unsupported-income-total)
+    {:income totals :salary-income-input salary-income :adjustments (:adjustments workspace)}))
+
+(defn basic-deduction [year income]
+  (if-let [bands ({2025 [[1320000 950000] [3360000 880000] [4890000 680000] [6550000 630000] [23500000 580000]]
+                   2026 [[4890000 1040000] [6550000 670000] [23500000 620000]]} year)]
+    (or (some (fn [[limit amount]] (when (<= income limit) amount))
+              (into bands [[24000000 480000] [24500000 320000] [25000000 160000]]))
+        0)
+    unsupported))
+
+(defn- estimated-income-tax [taxable]
+  (let [[_ rate offset] (last (filter #(<= (first %) taxable)
+                                          [[0 5 0] [1950000 10 97500] [3300000 20 427500]
+                                           [6950000 23 636000] [9000000 33 1536000]
+                                           [18000000 40 2796000] [40000000 45 4796000]]))]
+    (- (quot (* taxable rate) 100) offset)))
+
+(def blue-choices [0 100000 550000 650000])
+
+(defn- deduction-input [workspace {:keys [blue-amount resident-standard-only]}]
+  (require! (:closing workspace) :closing-required)
+  (require! (true? resident-standard-only) :unsupported-tax-situation)
+  (require! (some #{blue-amount} blue-choices) :invalid-blue-amount)
+  {:blue-selected blue-amount})
+
+(defn- deduction-apply [workspace args actor]
+  (let [actor (actor! actor)]
+    (-> workspace
+        (dissoc :approval :card)
+        (assoc :deduction (assoc (deduction-input workspace args) :creator actor) :checklist {})
+        (audit "deduction.apply" actor {:blue-selected (:blue-amount args)}))))
+
+(defn draft [workspace]
+  (or (get-in workspace [:approval :draft])
+      (when (and (:closing workspace) (:deduction workspace))
+        (let [year (:year workspace)
+              income (get-in workspace [:closing :income])
+              blue-selected (get-in workspace [:deduction :blue-selected])
+              blue (min blue-selected (get income "business"))
+              net (- (reduce + (vals income)) blue)
+              basic (basic-deduction year net)
+              taxable (* 1000 (quot (max 0 (- net basic)) 1000))
+              tax (estimated-income-tax taxable)
+              surtax (quot (* tax 21) 1000)]
+          {:year year :scope "resident-general-income-estimate" :pack-version (pack-field :pack/version)
+           :adjudicating false :submission-status :user-manual-required :approval-status :draft
+           :income income :total-income net :blue-deduction blue :blue-selected blue-selected
+           :basic-deduction basic :taxable-income taxable
+           :income-tax tax :reconstruction-surtax surtax :estimate (+ tax surtax)
+           :withholding-and-credits unsupported :final-tax-due unsupported
+           :official-form (pack-field :forms) :deadline (pack-field :deadline)
+           :destination (pack-field :submit-to)}))))
+
+(defn valid-invoice-number? [number]
+  (and (string? number) (= 1 (core/registration-format? (text/codepoints number)))))
+
+(defn offline-registry [_] {:status :offline :source registry-url})
+
+(defn verify-registry
+  "Adapter port. The default is offline. An observation adapter may supply the user's
+   comparison of the free public listing. Only an exact match can be recorded."
+  [lookup number observed-number]
+  (require! (valid-invoice-number? number) :invalid-invoice-number)
+  (when (some? observed-number)
+    (require! (valid-invoice-number? observed-number) :invalid-invoice-number))
+  (let [result (lookup {:number number :observed-number observed-number})]
+    (require! (= registry-url (:source result)) :unsupported-registry-source)
+    (case (:status result)
+      :offline (assoc result :number number)
+      :observed (assoc result :number number :status (if (= number (:listed-number result)) :match :mismatch))
+      (throw (ex-info "invalid registry observation" {:taxreturn/error :invalid-registry-observation})))))
+
+(defn manual-registry [{:keys [observed-number] :as request}]
+  (if (some? observed-number)
+    {:status :observed :source registry-url :listed-number observed-number :method :manual-observation}
+    (offline-registry request)))
+
+(defn history [workspace {:keys [record-id target query from to min-amount max-amount]}]
+  (require! (and (or (nil? from) (= from (journal-date from)))
+                 (or (nil? to) (= to (journal-date to)))
+                 (or (nil? from) (nil? to) (not (pos? (compare from to))))
+                 (or (nil? min-amount) (nil? max-amount) (<= min-amount max-amount)))
+            :invalid-history-range)
+  (filterv (fn [{:keys [value] :as revision}]
+             (let [date (or (journal-date (:date value)) (journal-date (:imported-at value))
+                            (some-> (:at revision) (subs 0 10)))
+                   amount (if (= :entry (:target revision)) (:debit (core/entry-totals value)) 0)]
+               (and (or (nil? record-id) (= record-id (:record-id revision)))
+                    (or (nil? target) (= target (name (:target revision))))
+                    (or (not (present? query)) (text/includes? (text/lower (pr-str revision)) (text/lower query)))
+                    (or (nil? from) (not (neg? (compare date from))))
+                    (or (nil? to) (not (pos? (compare date to))))
+                    (or (nil? min-amount) (<= min-amount amount))
+                    (or (nil? max-amount) (<= amount max-amount)))))
+           (:revisions workspace)))
+
+(defn- revision-preview [workspace {:keys [target record-id kind value reason]}]
+  (let [target ({"entry" :entry "evidence" :evidence} target)
+        previous (get (heads workspace target) record-id)]
+    (require! (and previous (not= :void (:kind previous))) :unknown-active-record)
+    (require! (present? reason) :reason-required)
+    (require! (#{"correction" "void"} kind) :invalid-revision-kind)
+    (let [next-value (if (= kind "void") (:value previous)
+                         (assoc (merge (:value previous) value) :id record-id))]
+      (when (= kind "correction")
+        (require! (and (map? value)
+                       (every? (if (= target :entry) #{:memo :date :lines} #{:name}) (keys value))
+                       (not= next-value (:value previous))
+                       (if (= target :entry)
+                         (and (valid-entry? next-value (:year workspace))
+                              (not (:unknown? (entry-amount workspace next-value))))
+                         (present? (:name next-value))))
+                  :invalid-correction))
+      {:previous previous :change {:target target :record-id record-id :reason reason
+                                    :revision (inc (:revision previous))
+                                    :kind (keyword kind) :value next-value}})))
+
+(defn- preview-card [workspace operation preview actor]
+  (let [actor (actor! actor)
+        creator (or (when (= operation "taxreturn.approve_draft") (get-in workspace [:deduction :creator])) actor)
+        card {:id (:next-card workspace) :operation operation
+              :creator creator :preview preview}]
+    (-> workspace
+        (assoc :card card)
+        (update :next-card inc))))
+
+(defn- approve-card [workspace operation card-id actor]
+  (let [actor (actor! actor)
+        {:keys [id creator preview] :as card} (:card workspace)]
+    (require! (and card (= card-id id) (= operation (:operation card))) :stale-approval-card)
+    (require! (= :human (:actor-kind actor)) :human-approval-required)
+    (require! (not= (:actor-id creator) (:actor-id actor)) :different-approver-required)
+    (let [updated (case operation
+                    "closing.finalize" (assoc (invalidate workspace) :closing preview)
+                    "taxreturn.approve_draft" (assoc workspace :approval
+                                                    {:actor actor :card-id id
+                                                     :draft (assoc preview :approval-status :approved)})
+                    "revision.append_correction" (-> workspace invalidate
+                                                     (update :revisions conj (merge (:change preview) actor))))]
+      (-> updated
+          (dissoc :card)
+          (audit operation actor {:card-id id :creator creator :preview preview})))))
+
+(defn- scenario-draft [workspace {:keys [year classifications adjustments] :as args} ledger actor]
+  (let [base (if year
+               (let [imported (import-ledger empty-workspace ledger year actor)
+                     classified (reduce (fn [snapshot {:keys [entry-id category]}]
+                                          (classify snapshot entry-id category actor))
+                                        imported classifications)]
+                 (reduce #(draft-adjustment %1 %2 actor) classified adjustments))
+               workspace)
+        ready (assoc (invalidate base) :closing (closing-preview base args))]
+    (draft (assoc ready :deduction (deduction-input ready args)))))
+
+(defn run
+  "Dispatch a previously validated semantic operation. Returns the proposed workspace
+   and output as values. Storage, identity and timestamps belong to the caller."
+  [workspace operation args {:keys [actor ledger registry-lookup]}]
+  (let [card-action (fn [calculate]
+                      (if (= "preview" (:phase args))
+                        (preview-card workspace operation (calculate) actor)
+                        (approve-card workspace operation (:card-id args) actor)))]
+    (case operation
+      "ledger.import" {:workspace (import-ledger workspace ledger (:year args) actor)}
+      "income.classify" {:workspace (classify workspace (:entry-id args) (:category args) actor)}
+      "adjustment.draft" {:workspace (draft-adjustment workspace args actor)}
+      "closing.finalize" {:workspace (card-action #(closing-preview workspace args))}
+      "deduction.apply" {:workspace (deduction-apply workspace args actor)}
+      "taxreturn.preview_draft"
+      (let [draft-output (if (contains? args :salary-income)
+                           (scenario-draft workspace args ledger actor)
+                           (draft workspace))]
+        (require! draft-output :deduction-required)
+        {:workspace workspace :output draft-output})
+      "taxreturn.approve_draft" {:workspace (card-action #(or (draft workspace)
+                                                             (throw (ex-info "deduction required" {:taxreturn/error :deduction-required}))))}
+      "revision.append_correction" {:workspace (card-action #(revision-preview workspace args))}
+      "revision.search" {:workspace workspace :output (history workspace args)}
+      "invoice.verify_registry" (let [result (verify-registry (or registry-lookup offline-registry)
+                                                             (:number args) (:observed-number args))]
+                                  (when (:save args)
+                                    (require! (= :match (:status result)) :registry-match-required))
+                                  {:workspace (if (:save args)
+                                                (-> workspace
+                                                    (assoc-in [:registry (:number args)] result)
+                                                    (audit operation (actor! actor) result))
+                                                workspace)
+                                   :output result})
+      "checklist.mark" (do (require! (:approval workspace) :draft-approval-required)
+                           (require! (some #(= (:id %) (:item args)) checklist) :unknown-checklist-item)
+                           (let [actor (actor! actor)]
+                             (require! (= :human (:actor-kind actor)) :human-check-required)
+                             {:workspace (-> workspace
+                                             (assoc-in [:checklist (:item args)] (:checked args))
+                                             (audit operation actor args))}))
+      "taxreturn.read_state" {:workspace workspace})))
+
+(defn state [workspace]
+  {:year (:year workspace)
+   :step (cond (:approval workspace) "manual"
+               (draft workspace) "review"
+               (:closing workspace) "deduction"
+               (:year workspace) "closing"
+               :else "ledger")
+   :adjudicating false :submission-status :user-manual-required
+   :entries (income-entries workspace)
+   :evidence (active workspace :evidence)
+   :adjustments (:adjustments workspace)
+   :closing (:closing workspace)
+   :draft (draft workspace)
+   :approval-card (:card workspace)
+   :audit (:audit workspace)
+   :revision-count (count (:revisions workspace))
+   :registry (vec (vals (:registry workspace)))
+   :checklist (mapv #(assoc % :checked (true? (get-in workspace [:checklist (:id %)]))) checklist)
+   :jurisdiction (assoc jurisdiction :fields (into {} (map (juxt identity pack-field))
+                                                  [:pack/regulated-professions :pack/electronic-preservation-requirements
+                                                   :forms :deadline :submit-to :unknowns]))})

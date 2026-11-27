@@ -1,0 +1,7 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "kaikei-kakutei",
+  "version": "0.1.0",
+  "description": "Prepare a local Japanese personal income tax draft using a synthetic ledger.",
+  "repository": "https://github.com/cloud-itonami/app-itonami-kaikei"
+}

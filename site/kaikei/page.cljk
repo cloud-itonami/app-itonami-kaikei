@@ -1,9 +1,7 @@
 (ns kaikei.page
   "itonami.cloud/sites/app/kaikei/ のページの殻（SSR）。
 
-  UI は DADS（デジタル庁デザインシステム、`kotoba-lang/jp-go-digital-design-system`）
-  の class と、下の app-css だけで作る —— app org の他の道具（mihari・dandori）と
-  同じ design system に載せる。
+  既存の帳簿の画面は DADS の class を使い、確定申告の画面は独自の部品を使う。
 
   ## このページは何も送信しない
 
@@ -16,7 +14,9 @@
 
   `<div id=\"app\">` の中身は `kaikei.view/root` を空の状態で描いたもの。
   ブラウザでは site/app.cljk が同じ関数を Reagent で描き直す。"
-  (:require [jp-go-dds.page :as dds-page]
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [jp-go-dds.page :as dds-page]
             [kaikei.core :as core]
             [kaikei.view :as view]))
 
@@ -26,7 +26,7 @@
   "会計ソフトから書き出した仕訳を取り込み、試算表・損益計算書・貸借対照表をブラウザの中だけで作ります。請求書を作り、適格請求書の記載事項を確かめて計上できます。自分で落とした銀行・カードの明細を取り込み、請求書の消込と仕訳の候補を確かめてから計上できます。データは送信されません。")
 
 (def app-css
-  "DADS の上に載せる配置だけ。色は DADS の custom property から引く。"
+  "帳簿と確定申告のスタイル。"
   ".kk-app{max-width:80rem;margin:0 auto;padding:1.5rem 1rem 3rem;}
 .kk-title{font-size:1.75rem;font-weight:700;margin:0;}
 .kk-title-sub{font-size:1rem;font-weight:400;margin-left:.5rem;color:var(--color-neutral-solid-gray-600,#666);}
@@ -95,6 +95,41 @@
 .kk-invoice-rates{max-width:36rem;margin-top:1rem;}
 .kk-invoice-rates caption{text-align:left;font-weight:700;padding:.25rem 0;}
 .kk-invoice-lines .dads-input-text,.kk-invoice-lines .dads-input-text__input{min-width:5rem;max-width:100%;}
+.tax-screen,.tax-button{--tax-text:#152b29;--tax-muted:#496460;--tax-border:#a9c2bd;--tax-accent:#005d51;--tax-surface:#f1f7f5;--tax-card:#fff;--tax-focus:#935800;color:var(--tax-text);font-family:system-ui,-apple-system,sans-serif;}
+.tax-screen{box-sizing:border-box;max-width:65rem;min-height:100vh;margin:auto;padding:clamp(1rem,4vw,3rem);background:var(--tax-surface);line-height:1.55;}
+.tax-topbar,.tax-checklist li{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.75rem;}
+.tax-screen h1{font-size:clamp(1.8rem,4vw,2.7rem);line-height:1.2;margin:0;}
+.tax-screen h2,.tax-screen h3{margin:0 0 .6rem;line-height:1.35;}
+.tax-lead,.tax-muted{color:var(--tax-muted);}
+.tax-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(6rem,1fr));gap:.4rem;list-style:none;padding:0;margin:1.5rem 0;}
+.tax-steps li{border-block-end:3px solid var(--tax-border);padding:.55rem 0;text-align:center;color:var(--tax-muted);}
+.tax-steps [aria-current=step]{border-color:var(--tax-accent);color:var(--tax-accent);font-weight:750;}
+.tax-card,.tax-detail{border:1px solid var(--tax-border);background:var(--tax-card);padding:clamp(1rem,3vw,1.6rem);border-radius:1rem;margin:1rem 0;overflow-wrap:anywhere;}
+.tax-approval{border:2px solid var(--tax-accent);}
+.tax-detail summary{font-weight:680;cursor:pointer;}
+.tax-detail[open]>summary{margin-bottom:.75rem;}
+.tax-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,13rem),1fr));gap:.1rem 1rem;}
+.tax-field{display:grid;justify-items:start;gap:.25rem;min-width:0;margin:.65rem 0;}
+.tax-field label{font-weight:650;}
+.tax-screen input,.tax-screen select{box-sizing:border-box;max-width:100%;min-height:2.75rem;background:var(--tax-card);color:var(--tax-text);border:1px solid var(--tax-border);border-radius:.45rem;padding:.35rem .55rem;font:inherit;}
+.tax-screen input[type=checkbox]{min-height:0;inline-size:1.4rem;block-size:1.4rem;accent-color:var(--tax-accent);}
+.tax-button{min-height:2.75rem;border:2px solid var(--tax-accent);border-radius:.55rem;background:var(--tax-accent);color:#fff;padding:.35rem .75rem;font:600 .95rem/1.3 system-ui,-apple-system,sans-serif;cursor:pointer;}
+.tax-button-secondary{background:var(--tax-card);color:var(--tax-accent);}
+.tax-button:hover{box-shadow:inset 0 0 0 100px #00000012;}
+.tax-screen :focus-visible,.tax-button:focus-visible{outline:3px solid var(--tax-focus);outline-offset:2px;}
+.tax-scroll{overflow-x:auto;}
+.tax-table{width:100%;border-collapse:collapse;text-align:left;}
+.tax-table :is(td,th){border-bottom:1px solid var(--tax-border);vertical-align:top;padding:.5rem;}
+.tax-table :is(select,button,small){display:block;margin:.2rem 0;}
+.tax-totals{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,9rem),1fr));gap:.5rem;}
+.tax-totals>div{padding:.65rem;background:var(--tax-surface);border-radius:.5rem;}
+.tax-screen dd{margin:0;font-weight:700;font-variant-numeric:tabular-nums;}
+.tax-breakdown{display:grid;grid-template-columns:minmax(0,1fr) max-content;gap:.3rem 1rem;}
+.tax-estimate,.tax-check-status{color:var(--tax-accent);}
+.tax-checklist{list-style:none;padding:0;}
+.tax-checklist li{border-block-end:1px solid var(--tax-border);padding:.55rem 0;}
+.tax-error{border-inline-start:4px solid #8a2622;padding:.55rem;margin:1rem 0;color:#8a2622;background:#fff4f3;}
+.tax-sr{position:absolute;width:1px;height:1px;clip-path:inset(50%);overflow:hidden;}
 @media print{
 body *{visibility:hidden;}
 .kk-invoice,.kk-invoice *{visibility:visible;}
@@ -107,19 +142,28 @@ body *{visibility:hidden;}
   「仕訳がありません」ではなく読み込み中（:booting?）を描く。"
   {:data core/empty-db :ui (assoc view/initial-ui :booting? true)})
 
+(defn- inline-source [root source]
+  (let [body (fs/readFileSync (path/join root source) "utf8")]
+    (when (re-find #"(?i)</script" body)
+      (throw (js/Error. (str "Scittle source contains a closing script tag: " source))))
+    [:script {:type "application/x-scittle"} body]))
+
 (defn document
   "完全な HTML 文書。opts（生成器が渡す。site/site.edn の契約）:
   :css             vendored dds.css の中身（jp-go-dds.page は I/O を持たない）
   :vendor-scripts  [\"vendor/react.production.min.js\" …]（この順で <script src>）
-  :scittle-scripts [\"kotoba/lang/text.cljs\" … \"app.cljs\"]（この順で scittle）"
-  [{:keys [css vendor-scripts scittle-scripts]}]
-  (dds-page/->page
-   {:title site-title
-    :description site-description
-    :css css
-    :app-css app-css
-    :head (vec (concat
-                (map (fn [src] [:script {:src (str "./" src)}]) vendor-scripts)
-                (map (fn [src] [:script {:type "application/x-scittle" :src (str "./" src)}])
-                     scittle-scripts)))}
-   [:div {:id "app"} (view/root ssr-state nil view/ssr-handlers)]))
+  :scittle-scripts [\"kotoba/lang/text.cljs\" … \"app.cljs\"]（この順で scittle）
+  :scittle-root  コピー済みのソースの場所。公開生成器では SCITTLE_APP_OUT。"
+  [{:keys [css vendor-scripts scittle-scripts scittle-root]}]
+  (let [root (or scittle-root (aget js/process.env "SCITTLE_APP_OUT"))]
+    (dds-page/->page
+     {:title site-title
+      :description site-description
+      :css css
+      :app-css app-css
+      :head (into [[:meta {:http-equiv "Content-Security-Policy"
+                           :content "connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"}]]
+                  (map (fn [src] [:script {:src (str "./" src)}]) vendor-scripts))}
+     [:div {:id "app"} (view/root ssr-state nil view/ssr-handlers)]
+     ;; Scittle reads inline sources without its XHR loader.
+     (mapv #(inline-source root %) scittle-scripts))))
